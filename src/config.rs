@@ -45,7 +45,6 @@ fn default_listen_backlog() -> u32 {
     1024
 }
 
-/// Placeholder secret shipped by earlier versions; configs still using it are rejected.
 const LEGACY_PLACEHOLDER_SECRET: &str = "vine-velocity-secret-change-me";
 
 fn generate_forwarding_secret() -> String {
@@ -161,8 +160,7 @@ pub struct NetworkConfig {
     #[serde(default)]
     pub proxy_protocol: bool,
 
-    /// Upstream addresses allowed to send PROXY protocol headers (IPs or CIDR ranges, e.g. "10.0.0.0/8").
-    /// When empty, PROXY headers are accepted from any peer, which allows client IP spoofing.
+    /// IPs or CIDR ranges allowed to send PROXY headers; empty accepts any peer
     #[serde(default)]
     pub proxy_protocol_trusted_proxies: Vec<String>,
 
@@ -420,7 +418,6 @@ impl Config {
         }
     }
 
-    /// Rejects configurations whose forwarding secrets are missing or publicly known
     pub fn validate(&self) -> Result<(), String> {
         for entry in &self.network.proxy_protocol_trusted_proxies {
             if crate::network::IpRange::parse(entry).is_none() {

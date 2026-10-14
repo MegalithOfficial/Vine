@@ -6,7 +6,6 @@ pub const PROXY_V2_MAGIC: [u8; 12] = [
     0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
 ];
 
-/// An IP address or CIDR range describing upstream peers trusted to send PROXY headers
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IpRange {
     network: IpAddr,
@@ -14,7 +13,6 @@ pub struct IpRange {
 }
 
 impl IpRange {
-    /// Parses a plain IP address (`10.0.0.1`) or a CIDR range (`10.0.0.0/8`, `fd00::/8`)
     pub fn parse(s: &str) -> Option<Self> {
         let s = s.trim();
         let (network, prefix_len) = match s.split_once('/') {

@@ -120,7 +120,6 @@ impl Authenticator {
         Self { client }
     }
 
-    /// Builds the `hasJoined` URL with every query parameter percent-encoded
     fn has_joined_url(
         username: &str,
         server_hash: &str,

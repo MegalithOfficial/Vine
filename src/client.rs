@@ -511,7 +511,6 @@ impl ClientHandler {
     }
 }
 
-/// Builds the JSON chat component used for proxy-generated kick messages
 pub(crate) fn kick_reason_json(reason: &str) -> String {
     serde_json::json!({
         "text": format!("[Vine Proxy] {reason}"),
