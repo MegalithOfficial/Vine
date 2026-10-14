@@ -71,6 +71,8 @@ pub enum TunnelExit {
     Transfer { host: String, port: u16 },
     /// Backend server closed connection or sent disconnect/kick
     BackendDisconnected { reason: Option<String> },
+    /// The proxy kicked the player
+    Kicked { reason: String },
 }
 
 type BackendReader = PacketReader<OwnedReadHalf>;
@@ -469,6 +471,17 @@ impl BackendBridge {
             };
 
             match exit {
+                TunnelExit::Kicked { reason } => {
+                    info!("Kicking player '{}': {}", self.player.username, reason);
+                    Self::disconnect_client(
+                        &mut client_writer,
+                        self.client_version,
+                        false,
+                        &reason,
+                    )
+                    .await;
+                    break;
+                }
                 TunnelExit::ClientDisconnected => {
                     debug!(
                         "Player '{}' disconnected from client side",
@@ -1155,18 +1168,7 @@ impl BackendBridge {
                         }
                     }
                     PlayerAction::Disconnect(reason) => {
-                        let disconnect = PlayDisconnect {
-                            reason: component_json(
-                                &TextComponent::text(reason.clone()),
-                                client_version,
-                            ),
-                        };
-                        if let Ok(bytes) = encode_packet(&disconnect, client_version) {
-                            let _ = client_tx.send(bytes);
-                        }
-                        return TunnelExit::BackendDisconnected {
-                            reason: Some(reason),
-                        };
+                        return TunnelExit::Kicked { reason };
                     }
                     PlayerAction::PluginMessage { channel, data } => {
                         let custom_payload = ClientboundPluginMessage { channel, data };
