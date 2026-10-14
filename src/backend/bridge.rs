@@ -10,7 +10,7 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
@@ -779,9 +779,35 @@ async fn send_best_effort<P: Packet, W: AsyncWrite + Unpin>(
 ) {
     match encode_packet(packet, version) {
         Ok(bytes) => {
-            let _ = writer.send(bytes).await;
+            let _ = timeout(CLIENT_WRITE_TIMEOUT, writer.send(bytes)).await;
         }
         Err(e) => debug!("Skipping {:?} for {}: {}", P::KIND, version, e),
+    }
+}
+
+// Caps memory buffered for a slow client; once full, reading from the backend pauses
+const CLIENT_QUEUE_BYTES: usize = 8 * 1024 * 1024;
+const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Clone)]
+struct ClientQueue {
+    tx: mpsc::UnboundedSender<(Bytes, OwnedSemaphorePermit)>,
+    budget: Arc<Semaphore>,
+}
+
+impl ClientQueue {
+    fn new() -> (Self, mpsc::UnboundedReceiver<(Bytes, OwnedSemaphorePermit)>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let budget = Arc::new(Semaphore::new(CLIENT_QUEUE_BYTES));
+        (Self { tx, budget }, rx)
+    }
+
+    async fn send(&self, bytes: Bytes) -> bool {
+        let cost = bytes.len().clamp(1, CLIENT_QUEUE_BYTES) as u32;
+        match Arc::clone(&self.budget).acquire_many_owned(cost).await {
+            Ok(permit) => self.tx.send((bytes, permit)).is_ok(),
+            Err(_) => false,
+        }
     }
 }
 
@@ -824,13 +850,20 @@ impl BackendBridge {
             tokio::sync::Mutex<std::collections::HashMap<i32, PendingSuggestion>>,
         > = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
-        let (client_tx, mut client_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+        let (client_tx, mut client_rx) = ClientQueue::new();
 
         let client_writer = async {
-            while let Some(packet_bytes) = client_rx.recv().await {
-                if let Err(e) = client_writer.send(packet_bytes).await {
-                    debug!("Client write failed for '{}': {:?}", username, e);
-                    return TunnelExit::ClientDisconnected;
+            while let Some((packet_bytes, _permit)) = client_rx.recv().await {
+                match timeout(CLIENT_WRITE_TIMEOUT, client_writer.send(packet_bytes)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        debug!("Client write failed for '{}': {:?}", username, e);
+                        return TunnelExit::ClientDisconnected;
+                    }
+                    Err(_) => {
+                        warn!("Client '{}' stopped reading, disconnecting", username);
+                        return TunnelExit::ClientDisconnected;
+                    }
                 }
             }
             TunnelExit::ClientDisconnected
@@ -975,7 +1008,7 @@ impl BackendBridge {
                                         .collect(),
                                 };
                                 if let Ok(bytes) = encode_packet(&response, client_version) {
-                                    let _ = client_tx.send(bytes);
+                                    client_tx.send(bytes).await;
                                 }
                                 continue;
                             }
@@ -1034,7 +1067,7 @@ impl BackendBridge {
                                             if let Ok(bytes) =
                                                 encode_packet(&response, client_version)
                                             {
-                                                let _ = client_tx_clone.send(bytes);
+                                                client_tx_clone.send(bytes).await;
                                             }
                                         }
                                     });
@@ -1090,7 +1123,7 @@ impl BackendBridge {
                                 client_version,
                             );
                             if let Ok(bytes) = encode_packet(&backend_suggestions, client_version) {
-                                if client_tx.send(bytes).is_err() {
+                                if !client_tx.send(bytes).await {
                                     return TunnelExit::ClientDisconnected;
                                 }
                                 continue;
@@ -1123,14 +1156,14 @@ impl BackendBridge {
                                     id: raw_packet.id,
                                     payload: modified_payload.into(),
                                 };
-                                if client_tx.send(packet.to_bytes()).is_err() {
+                                if !client_tx.send(packet.to_bytes()).await {
                                     return TunnelExit::ClientDisconnected;
                                 }
                                 continue;
                             }
                         }
 
-                        if client_tx.send(raw_packet.to_bytes()).is_err() {
+                        if !client_tx.send(raw_packet.to_bytes()).await {
                             return TunnelExit::ClientDisconnected;
                         }
                     }
@@ -1159,7 +1192,7 @@ impl BackendBridge {
                             overlay: false,
                         };
                         if let Ok(bytes) = encode_packet(&chat_msg, client_version) {
-                            let _ = client_tx.send(bytes);
+                            client_tx.send(bytes).await;
                         }
                     }
                     PlayerAction::Disconnect(reason) => {
@@ -1168,7 +1201,7 @@ impl BackendBridge {
                     PlayerAction::PluginMessage { channel, data } => {
                         let custom_payload = ClientboundPluginMessage { channel, data };
                         if let Ok(bytes) = encode_packet(&custom_payload, client_version) {
-                            let _ = client_tx.send(bytes);
+                            client_tx.send(bytes).await;
                         }
                     }
                 }
@@ -1209,6 +1242,31 @@ fn merge_suggestions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_client_queue_applies_backpressure() {
+        let (queue, mut rx) = ClientQueue::new();
+        assert!(
+            queue
+                .send(Bytes::from(vec![0u8; CLIENT_QUEUE_BYTES - 1]))
+                .await
+        );
+        assert!(queue.send(Bytes::from_static(b"x")).await);
+
+        let blocked = timeout(
+            Duration::from_millis(50),
+            queue.send(Bytes::from_static(b"y")),
+        );
+        assert!(blocked.await.is_err());
+
+        let (first, permit) = rx.recv().await.unwrap();
+        assert_eq!(first.len(), CLIENT_QUEUE_BYTES - 1);
+        drop(permit);
+        assert!(queue.send(Bytes::from_static(b"y")).await);
+
+        drop(rx);
+        assert!(!queue.send(Bytes::from_static(b"z")).await);
+    }
 
     #[test]
     fn test_merge_suggestions_dedupes_and_sorts() {
