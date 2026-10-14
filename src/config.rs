@@ -45,6 +45,13 @@ fn default_listen_backlog() -> u32 {
     1024
 }
 
+/// Placeholder secret shipped by earlier versions; configs still using it are rejected.
+const LEGACY_PLACEHOLDER_SECRET: &str = "vine-velocity-secret-change-me";
+
+fn generate_forwarding_secret() -> String {
+    hex::encode(rand::random::<[u8; 32]>())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
     pub server: ServerConfig,
@@ -310,7 +317,7 @@ impl Default for Config {
             BackendConfig {
                 address: "127.0.0.1:25566".to_string(),
                 forwarding: ForwardingMode::Velocity,
-                secret: Some("vine-velocity-secret-change-me".to_string()),
+                secret: Some(generate_forwarding_secret()),
                 icon_path: None,
                 motd_line1: None,
                 motd_line2: None,
@@ -397,6 +404,7 @@ impl Config {
         if path.exists() {
             let content = std::fs::read_to_string(path)?;
             let config: Config = toml::from_str(&content)?;
+            config.validate()?;
             Ok(config)
         } else {
             let default_config = Config::default();
@@ -405,11 +413,61 @@ impl Config {
             Ok(default_config)
         }
     }
+
+    /// Rejects configurations whose forwarding secrets are missing or publicly known
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, server) in &self.servers {
+            if !matches!(
+                server.forwarding,
+                ForwardingMode::Velocity | ForwardingMode::Vine
+            ) {
+                continue;
+            }
+            let secret = server.secret.as_deref().map(str::trim).unwrap_or_default();
+            if secret.is_empty() {
+                return Err(format!(
+                    "server '{name}' uses {:?} forwarding but has no secret configured",
+                    server.forwarding
+                ));
+            }
+            if secret == LEGACY_PLACEHOLDER_SECRET {
+                return Err(format!(
+                    "server '{name}' still uses the default placeholder forwarding secret; replace it with a random value"
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_default_config_generates_unique_secrets() {
+        let a = Config::default();
+        let b = Config::default();
+        assert!(a.validate().is_ok());
+        assert_ne!(a.servers["lobby"].secret, b.servers["lobby"].secret);
+    }
+
+    #[test]
+    fn test_validate_rejects_placeholder_and_missing_secrets() {
+        let mut config = Config::default();
+        config.servers.get_mut("lobby").unwrap().secret =
+            Some(LEGACY_PLACEHOLDER_SECRET.to_string());
+        assert!(config.validate().is_err());
+
+        config.servers.get_mut("lobby").unwrap().secret = Some("  ".to_string());
+        assert!(config.validate().is_err());
+
+        config.servers.get_mut("lobby").unwrap().secret = None;
+        assert!(config.validate().is_err());
+
+        config.servers.get_mut("lobby").unwrap().forwarding = ForwardingMode::None;
+        assert!(config.validate().is_ok());
+    }
 
     #[test]
     fn test_telemetry_config_defaults() {
