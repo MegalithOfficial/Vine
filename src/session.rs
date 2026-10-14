@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -56,6 +56,23 @@ impl SessionManager {
         }
     }
 
+    /// Registers the session unless the username or UUID is already online.
+    /// The returned guard unregisters it when the connection ends.
+    pub fn try_register(self: &Arc<Self>, session: PlayerSession) -> Option<SessionGuard> {
+        let mut lock = self.sessions.write().ok()?;
+        let key = session.username.to_ascii_lowercase();
+        if lock.contains_key(&key) || lock.values().any(|s| s.uuid == session.uuid) {
+            return None;
+        }
+        let guard = SessionGuard {
+            manager: Arc::clone(self),
+            key: key.clone(),
+            uuid: session.uuid,
+        };
+        lock.insert(key, session);
+        Some(guard)
+    }
+
     /// Unregisters an active session by username
     pub fn unregister(&self, username: &str) -> Option<PlayerSession> {
         if let Ok(mut lock) = self.sessions.write() {
@@ -98,6 +115,22 @@ impl SessionManager {
             lock.len()
         } else {
             0
+        }
+    }
+}
+
+pub struct SessionGuard {
+    manager: Arc<SessionManager>,
+    key: String,
+    uuid: Uuid,
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        if let Ok(mut lock) = self.manager.sessions.write()
+            && lock.get(&self.key).is_some_and(|s| s.uuid == self.uuid)
+        {
+            lock.remove(&self.key);
         }
     }
 }
@@ -154,5 +187,30 @@ mod tests {
             manager.get_session("Alex").unwrap().current_server,
             "survival"
         );
+    }
+
+    #[test]
+    fn test_try_register_rejects_duplicates_until_guard_drops() {
+        let manager = Arc::new(SessionManager::new());
+        let session = |name: &str, uuid: u128| {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            PlayerSession {
+                username: name.to_string(),
+                uuid: Uuid::from_u128(uuid),
+                current_server: "lobby".to_string(),
+                action_tx: tx,
+                client_ip: "127.0.0.1".to_string(),
+                protocol_version: 769,
+            }
+        };
+
+        let guard = manager.try_register(session("Steve", 1)).unwrap();
+        assert!(manager.try_register(session("steve", 2)).is_none());
+        assert!(manager.try_register(session("Alex", 1)).is_none());
+        assert_eq!(manager.count(), 1);
+
+        drop(guard);
+        assert_eq!(manager.count(), 0);
+        assert!(manager.try_register(session("STEVE", 2)).is_some());
     }
 }

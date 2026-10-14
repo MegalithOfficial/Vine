@@ -27,7 +27,7 @@ use crate::protocol::{
     encode_packet,
 };
 use crate::security::Sanitizer;
-use crate::session::SessionManager;
+use crate::session::{PlayerSession, SessionManager};
 use crate::status::StatusHandler;
 
 #[derive(Error, Debug)]
@@ -446,6 +446,28 @@ impl ClientHandler {
             None
         };
 
+        let (action_tx, action_rx) = tokio::sync::mpsc::unbounded_channel();
+        let Some(_session_guard) = self.session_manager.try_register(PlayerSession {
+            username: authenticated_player.username.clone(),
+            uuid: authenticated_player.id,
+            current_server: server_name.clone(),
+            action_tx: action_tx.clone(),
+            client_ip: client_ip.to_string(),
+            protocol_version: client_version.0,
+        }) else {
+            warn!(
+                "[{}] Rejecting duplicate login for '{}' ({})",
+                self.peer_addr, authenticated_player.username, authenticated_player.id
+            );
+            Self::kick(
+                &mut writer,
+                client_version,
+                "You are already connected to this proxy.",
+            )
+            .await?;
+            return Ok(());
+        };
+
         let bridge = BackendBridge::new(
             server_name,
             backend_cfg,
@@ -464,7 +486,7 @@ impl ClientHandler {
             self.plugin_manager.clone(),
         );
 
-        bridge.run(reader, writer).await?;
+        bridge.run(reader, writer, action_tx, action_rx).await?;
         Ok(())
     }
 

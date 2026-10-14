@@ -10,6 +10,7 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
@@ -41,7 +42,7 @@ use crate::protocol::{
     encode_packet,
 };
 use crate::security::PacketRateLimiter;
-use crate::session::{PlayerAction, PlayerSession, SessionManager};
+use crate::session::{PlayerAction, SessionManager};
 
 #[derive(Error, Debug)]
 pub enum BridgeError {
@@ -333,6 +334,8 @@ impl BackendBridge {
         self,
         mut client_reader: PacketReader<R>,
         mut client_writer: PacketWriter<W>,
+        action_tx: mpsc::UnboundedSender<PlayerAction>,
+        mut action_rx: mpsc::UnboundedReceiver<PlayerAction>,
     ) -> Result<(), BridgeError>
     where
         R: AsyncRead + Unpin + Send + 'static,
@@ -427,15 +430,8 @@ impl BackendBridge {
         };
         self.plugin_manager.fire_player_join(&join_event).await;
 
-        let (action_tx, mut action_rx) = tokio::sync::mpsc::unbounded_channel();
-        self.session_manager.register(PlayerSession {
-            username: self.player.username.clone(),
-            uuid: self.player.id,
-            current_server: current_server_name.clone(),
-            action_tx: action_tx.clone(),
-            client_ip: self.client_ip.to_string(),
-            protocol_version: self.client_version.0,
-        });
+        self.session_manager
+            .update_server(&self.player.username, &current_server_name);
 
         loop {
             let tunnel_res = Self::bridge_tunnel(
@@ -746,7 +742,6 @@ impl BackendBridge {
             .fire_player_disconnect(&disconnect_event)
             .await;
 
-        self.session_manager.unregister(&self.player.username);
         self.online_players.fetch_sub(1, Ordering::Relaxed);
         info!(
             "Player '{}' disconnected from proxy. Online players: {}",
@@ -808,8 +803,8 @@ impl BackendBridge {
         backend_writer: &mut PacketWriter<W2>,
         max_packets_per_sec: u32,
         client_version: ProtocolVersion,
-        action_rx: &mut tokio::sync::mpsc::UnboundedReceiver<PlayerAction>,
-        action_tx: &tokio::sync::mpsc::UnboundedSender<PlayerAction>,
+        action_rx: &mut mpsc::UnboundedReceiver<PlayerAction>,
+        action_tx: &mpsc::UnboundedSender<PlayerAction>,
         command_dispatcher: Arc<CommandDispatcher>,
         proxy_config: Arc<Config>,
         session_manager: Arc<SessionManager>,
