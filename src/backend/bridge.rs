@@ -840,14 +840,34 @@ impl BackendBridge {
                             return TunnelExit::ClientDisconnected;
                         }
 
-                        if PacketKind::ChatCommand.matches(raw_packet.id, client_version)
-                            && let Ok(chat_cmd) =
+                        let chat_message =
+                            if PacketKind::ChatMessage.matches(raw_packet.id, client_version) {
+                                decode_packet::<ChatMessage>(&raw_packet.payload, client_version)
+                                    .ok()
+                                    .map(|m| m.message)
+                            } else {
+                                None
+                            };
+                        let command =
+                            if PacketKind::ChatCommand.matches(raw_packet.id, client_version) {
                                 decode_packet::<ChatCommand>(&raw_packet.payload, client_version)
-                        {
+                                    .ok()
+                                    .map(|c| c.command)
+                            } else if client_version < ProtocolVersion::V1_19 {
+                                // Before 1.19 commands arrive as chat messages starting with '/'
+                                chat_message
+                                    .as_deref()
+                                    .and_then(|m| m.strip_prefix('/'))
+                                    .map(str::to_owned)
+                            } else {
+                                None
+                            };
+
+                        if let Some(command) = command {
                             let mut cmd_event = PlayerCommandEvent {
                                 uuid: player_uuid.to_string(),
                                 username: username.to_string(),
-                                command: chat_cmd.command,
+                                command,
                                 cancelled: false,
                             };
                             plugin_manager.fire_player_command(&mut cmd_event).await;
@@ -872,16 +892,11 @@ impl BackendBridge {
                                 command_dispatcher.handle_command(&source, &cmd_event.command);
                                 continue;
                             }
-                        }
-
-                        if PacketKind::ChatMessage.matches(raw_packet.id, client_version)
-                            && let Ok(chat_msg) =
-                                decode_packet::<ChatMessage>(&raw_packet.payload, client_version)
-                        {
+                        } else if let Some(message) = chat_message {
                             let mut chat_event = PlayerChatEvent {
                                 uuid: player_uuid.to_string(),
                                 username: username.to_string(),
-                                message: chat_msg.message,
+                                message,
                                 cancelled: false,
                             };
                             plugin_manager.fire_player_chat(&mut chat_event).await;
