@@ -23,11 +23,14 @@ thiserror = { version = "2.0" }
 bytes = { version = "1.12" }
 uuid = { version = "1.26", features = ["serde", "v3", "v4"] }
 rand = { version = "0.10" }
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 
 # Networking & Sockets
 socket2 = { version = "0.6", features = ["all"] }
 
 # Security & Cryptography
+aes = { version = "0.9", default-features = false }
+cfb8 = { version = "0.9", default-features = false }
 rsa = { version = "=0.10.0-rc.18", features = ["std", "encoding"] }
 sha1 = { version = "=0.11.0" }
 sha2 = { version = "=0.11.0" }
