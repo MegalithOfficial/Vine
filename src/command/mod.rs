@@ -19,7 +19,6 @@ use pumpkin_command::suggestion::Suggestion;
 use pumpkin_command::suggestion::provider::{SuggestionProvider, SuggestionProviderResult};
 pub use pumpkin_command::suggestion::suggestions::Suggestions;
 use pumpkin_command::suggestion::suggestions::SuggestionsBuilder;
-use pumpkin_protocol::java::client::play::CommandSuggestion;
 use pumpkin_util::text::TextComponent;
 
 use crate::config::Config;
@@ -338,13 +337,17 @@ impl CommandDispatcher {
     }
 
     /// Returns suggestions for the command string
-    pub fn suggest(&self, input: &str, source: &ProxyCommandSource) -> Vec<CommandSuggestion> {
+    pub fn suggest(
+        &self,
+        input: &str,
+        source: &ProxyCommandSource,
+    ) -> Vec<crate::protocol::packets::play::Suggestion> {
         let suggestions = self.suggest_command(input, source);
         suggestions
             .suggestions
             .into_iter()
-            .map(|s| CommandSuggestion {
-                suggestion: s.text.cached_text().clone(),
+            .map(|s| crate::protocol::packets::play::Suggestion {
+                text: s.text.cached_text().clone(),
                 tooltip: s.tooltip,
             })
             .collect()

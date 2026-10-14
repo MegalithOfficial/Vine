@@ -4,7 +4,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use pumpkin_util::version::JavaMinecraftVersion;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
@@ -419,11 +418,11 @@ pub fn build_heartbeat_payload(config: &Config, online_players: usize) -> Heartb
         (0, 0, "Unknown".to_string())
     };
 
-    let mc_ver = JavaMinecraftVersion::from_protocol(config.motd.protocol_version as u32);
-    let minecraft_version = if mc_ver == JavaMinecraftVersion::Unknown {
-        "26.2".to_string()
+    let mc_ver = crate::protocol::ProtocolVersion(config.motd.protocol_version.max(0) as u32);
+    let minecraft_version = if mc_ver.is_known() {
+        mc_ver.name()
     } else {
-        mc_ver.to_string()
+        "26.2".to_string()
     };
 
     let is_public = config.telemetry.public;

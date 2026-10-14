@@ -1,17 +1,8 @@
-use std::io::Cursor;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use pumpkin_protocol::bedrock::status::{
-    CUnconnectedPong, OFFLINE_MESSAGE_MAGIC, SUnconnectedPing, SUnconnectedPingOpenConnections,
-};
-use pumpkin_protocol::serial::{PacketRead, PacketWrite};
-
 use crate::bedrock::config::BedrockConfig;
-
-pub const RAKNET_UNCONNECTED_PING_ID: u8 = 0x01;
-pub const RAKNET_UNCONNECTED_PING_OPEN_ID: u8 = 0x02;
-pub const RAKNET_UNCONNECTED_PONG_ID: u8 = 0x1c;
+use crate::protocol::bedrock::{OFFLINE_MAGIC, UnconnectedPing, encode_unconnected_pong};
 
 /// Handler for Bedrock RakNet status pings.
 pub struct BedrockStatusHandler {
@@ -63,32 +54,15 @@ impl BedrockStatusHandler {
 
     /// Inspects an incoming UDP datagram and, if it is an unconnected ping, builds the pong response.
     pub fn handle_packet(&self, data: &[u8]) -> Option<Vec<u8>> {
-        let (&packet_id, payload) = data.split_first()?;
-
-        let (time, magic) = match packet_id {
-            RAKNET_UNCONNECTED_PING_ID => {
-                let mut cursor = Cursor::new(payload);
-                let ping = SUnconnectedPing::read(&mut cursor).ok()?;
-                (ping.time, ping.magic)
-            }
-            RAKNET_UNCONNECTED_PING_OPEN_ID => {
-                let mut cursor = Cursor::new(payload);
-                let ping = SUnconnectedPingOpenConnections::read(&mut cursor).ok()?;
-                (ping.time, ping.magic)
-            }
-            _ => return None,
-        };
-
-        if magic != OFFLINE_MESSAGE_MAGIC {
+        let ping = UnconnectedPing::parse(data)?;
+        if ping.magic != OFFLINE_MAGIC {
             return None;
         }
-
-        let ad = self.build_advertisement_string();
-        let pong = CUnconnectedPong::new(time, self.server_guid, ad);
-
-        let mut response = vec![RAKNET_UNCONNECTED_PONG_ID];
-        pong.write(&mut response).ok()?;
-        Some(response)
+        encode_unconnected_pong(
+            ping.time,
+            self.server_guid,
+            self.build_advertisement_string(),
+        )
     }
 
     #[must_use]
@@ -100,6 +74,7 @@ impl BedrockStatusHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::bedrock::{UNCONNECTED_PING_ID, UNCONNECTED_PONG_ID};
 
     #[test]
     fn test_build_advertisement_string() {
@@ -130,17 +105,17 @@ mod tests {
         let online = Arc::new(AtomicUsize::new(0));
         let handler = BedrockStatusHandler::new(config, online, 19132);
 
-        let mut packet = vec![RAKNET_UNCONNECTED_PING_ID];
+        let mut packet = vec![UNCONNECTED_PING_ID];
         packet.extend_from_slice(&1000u64.to_be_bytes());
-        packet.extend_from_slice(&OFFLINE_MESSAGE_MAGIC);
+        packet.extend_from_slice(&OFFLINE_MAGIC);
         packet.extend_from_slice(&9999u64.to_be_bytes());
 
         let response = handler.handle_packet(&packet);
         assert!(response.is_some());
         let res_bytes = response.unwrap();
-        assert_eq!(res_bytes[0], RAKNET_UNCONNECTED_PONG_ID);
+        assert_eq!(res_bytes[0], UNCONNECTED_PONG_ID);
         assert_eq!(&res_bytes[1..9], &1000u64.to_be_bytes());
-        assert_eq!(&res_bytes[17..33], &OFFLINE_MESSAGE_MAGIC);
+        assert_eq!(&res_bytes[17..33], &OFFLINE_MAGIC);
     }
 
     #[test]
@@ -149,7 +124,7 @@ mod tests {
         let online = Arc::new(AtomicUsize::new(0));
         let handler = BedrockStatusHandler::new(config, online, 19132);
 
-        let mut packet = vec![RAKNET_UNCONNECTED_PING_ID];
+        let mut packet = vec![UNCONNECTED_PING_ID];
         packet.extend_from_slice(&1000u64.to_be_bytes());
         packet.extend_from_slice(&[0u8; 16]);
         packet.extend_from_slice(&9999u64.to_be_bytes());

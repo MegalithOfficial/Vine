@@ -4,12 +4,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use pumpkin_protocol::java::client::status::{CPingResponse, CStatusResponse};
-use pumpkin_util::version::JavaMinecraftVersion;
 use serde::Serialize;
 use uuid::Uuid;
 
 use crate::config::{BackendConfig, MotdConfig};
+use crate::protocol::ProtocolVersion;
+use crate::protocol::packets::status::StatusResponse;
 pub use icon::{StatusIcon, StatusIconManager};
 
 #[derive(Serialize)]
@@ -75,7 +75,7 @@ impl StatusHandler {
     /// Build the JSON status response for the given client version and optional virtual host
     pub fn build_status_response(
         &self,
-        client_version: JavaMinecraftVersion,
+        client_version: ProtocolVersion,
         virtual_host: Option<&str>,
     ) -> String {
         let online = self.online_players.load(Ordering::Relaxed);
@@ -84,10 +84,10 @@ impl StatusHandler {
 
         let icon_uri = self.icon_manager.get_icon_for_host(virtual_host);
 
-        let protocol = if client_version == JavaMinecraftVersion::Unknown {
-            self.motd.protocol_version
+        let protocol = if client_version.is_known() {
+            client_version.0 as i32
         } else {
-            client_version.protocol_version()
+            self.motd.protocol_version
         };
 
         let sample: Vec<PlayerSample> = if self.motd.show_sample_players {
@@ -151,30 +151,20 @@ impl StatusHandler {
         format!("{}\n{}", self.motd.line1, self.motd.line2)
     }
 
-    /// Create CStatusResponse packet
-    pub fn create_status_packet(
-        &self,
-        client_version: JavaMinecraftVersion,
-        virtual_host: Option<&str>,
-    ) -> CStatusResponse {
-        let json = self.build_status_response(client_version, virtual_host);
-        CStatusResponse::new(json)
-    }
-
-    /// Create custom CStatusResponse packet with overridden fields from plugins
+    /// Create custom status response with overridden fields from plugins
     pub fn create_custom_status_packet(
         &self,
-        client_version: JavaMinecraftVersion,
+        client_version: ProtocolVersion,
         motd: &str,
         max_players: u32,
         online_players: u32,
         version_name: &str,
         virtual_host: Option<&str>,
-    ) -> CStatusResponse {
-        let protocol = if client_version == JavaMinecraftVersion::Unknown {
-            self.motd.protocol_version
+    ) -> StatusResponse {
+        let protocol = if client_version.is_known() {
+            client_version.0 as i32
         } else {
-            client_version.protocol_version()
+            self.motd.protocol_version
         };
 
         let icon_uri = self.icon_manager.get_icon_for_host(virtual_host);
@@ -210,12 +200,7 @@ impl StatusHandler {
         };
 
         let json = serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string());
-        CStatusResponse::new(json)
-    }
-
-    /// Create CPingResponse packet
-    pub fn create_pong_packet(payload: i64) -> CPingResponse {
-        CPingResponse::new(payload)
+        StatusResponse { json }
     }
 }
 
@@ -276,13 +261,13 @@ mod tests {
         let online = Arc::new(AtomicUsize::new(5));
         let handler = StatusHandler::new(motd, online, icon_mgr, servers, forced_hosts);
 
-        let global_json = handler.build_status_response(JavaMinecraftVersion::V_26_2, None);
+        let global_json = handler.build_status_response(ProtocolVersion(776), None);
         assert!(global_json.contains("Global Line 1\\nGlobal Line 2"));
         assert!(global_json.contains("\"online\":5"));
         assert!(global_json.contains("\"favicon\":\"data:image/png;base64,"));
 
         let vhost_json =
-            handler.build_status_response(JavaMinecraftVersion::V_26_2, Some("mc.survival.com"));
+            handler.build_status_response(ProtocolVersion(776), Some("mc.survival.com"));
         assert!(vhost_json.contains("Survival Line 1\\nSurvival Line 2"));
 
         let _ = std::fs::remove_file(&temp_icon_path);
@@ -311,7 +296,7 @@ mod tests {
         let online = Arc::new(AtomicUsize::new(0));
         let handler = StatusHandler::new(motd, online, icon_mgr, HashMap::new(), HashMap::new());
 
-        let json = handler.build_status_response(JavaMinecraftVersion::V_26_2, None);
+        let json = handler.build_status_response(ProtocolVersion(776), None);
         assert!(!json.contains("favicon"));
     }
 }

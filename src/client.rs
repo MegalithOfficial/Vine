@@ -3,17 +3,6 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
-use pumpkin_protocol::codec::var_int::VarInt;
-use pumpkin_protocol::java::client::login::{
-    CEncryptionRequest, CLoginDisconnect, CSetCompression,
-};
-use pumpkin_protocol::java::packet_decoder::TCPNetworkDecoder;
-use pumpkin_protocol::java::packet_encoder::TCPNetworkEncoder;
-use pumpkin_protocol::java::server::handshake::SHandShake;
-use pumpkin_protocol::java::server::login::{SEncryptionResponse, SLoginStart};
-use pumpkin_protocol::java::server::status::SStatusPingRequest;
-use pumpkin_protocol::{ClientPacket, ConnectionState, ServerPacket};
-use pumpkin_util::version::JavaMinecraftVersion;
 use thiserror::Error;
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -27,6 +16,15 @@ use crate::config::Config;
 use crate::network::PrefixedRead;
 use crate::plugin::PluginManager;
 use crate::plugin::api::{PlayerLoginEvent, PlayerPreLoginEvent, ProxyPingEvent};
+use crate::protocol::packets::handshake::{Handshake, HandshakeIntent};
+use crate::protocol::packets::login::{
+    EncryptionRequest, EncryptionResponse, LoginDisconnect, LoginStart, SetCompression,
+};
+use crate::protocol::packets::status::{PingRequest, PongResponse};
+use crate::protocol::{
+    PacketKind, PacketReader, PacketWriter, ProtocolError, ProtocolVersion, decode_packet,
+    encode_packet,
+};
 use crate::security::Sanitizer;
 use crate::session::SessionManager;
 use crate::status::StatusHandler;
@@ -35,10 +33,8 @@ use crate::status::StatusHandler;
 pub enum ClientError {
     #[error("Client IO error: {0}")]
     IoError(#[from] std::io::Error),
-    #[error("Protocol decode error: {0}")]
-    DecodeError(String),
-    #[error("Protocol encode error: {0}")]
-    EncodeError(String),
+    #[error("Protocol error: {0}")]
+    Protocol(#[from] ProtocolError),
     #[error("Authentication failed: {0}")]
     AuthError(String),
     #[error("Bridge error: {0}")]
@@ -46,6 +42,9 @@ pub enum ClientError {
     #[error("Connection timed out")]
     Timeout,
 }
+
+type ClientReader = PacketReader<PrefixedRead<OwnedReadHalf>>;
+type ClientWriter = PacketWriter<OwnedWriteHalf>;
 
 pub struct ClientHandler {
     peer_addr: SocketAddr,
@@ -94,57 +93,51 @@ impl ClientHandler {
         leftover_bytes: Vec<u8>,
     ) -> Result<(), ClientError> {
         let (read_half, write_half) = stream.into_split();
-        let reader = PrefixedRead::new(read_half, leftover_bytes);
-        let mut decoder = TCPNetworkDecoder::new(reader);
-        let mut encoder = TCPNetworkEncoder::new(write_half);
+        let mut reader = PacketReader::new(PrefixedRead::new(read_half, leftover_bytes));
+        let mut writer = PacketWriter::new(write_half);
 
         let handshake_timeout =
             Duration::from_secs(self.config.network.client_handshake_timeout_secs);
-        let raw_handshake = timeout(handshake_timeout, decoder.get_raw_packet())
+        let raw_handshake = timeout(handshake_timeout, reader.read_packet())
             .await
-            .map_err(|_| ClientError::Timeout)?
-            .map_err(|e| ClientError::DecodeError(e.to_string()))?;
+            .map_err(|_| ClientError::Timeout)??;
 
-        let client_version_guess = JavaMinecraftVersion::V_26_2;
-        let mut handshake_bytes = &raw_handshake.payload[..];
-        let handshake = SHandShake::read(&mut handshake_bytes, &client_version_guess)
-            .map_err(|e| ClientError::DecodeError(e.to_string()))?;
+        // Handshake layout is version independent
+        let handshake: Handshake = decode_packet(&raw_handshake.payload, ProtocolVersion::V1_8)?;
 
-        let client_protocol = handshake.protocol_version.0 as u32;
-        let client_version = JavaMinecraftVersion::from_protocol(client_protocol);
-        let raw_host = &handshake.server_address;
-        let clean_host = Sanitizer::sanitize_host(raw_host);
+        let client_version = ProtocolVersion::from_handshake(handshake.protocol_version);
+        let clean_host = Sanitizer::sanitize_host(&handshake.server_address);
 
         debug!(
-            "[{}] Handshake: protocol={}, resolved_version={:?}, host='{}', next_state={:?}",
-            self.peer_addr, client_protocol, client_version, clean_host, handshake.next_state
+            "[{}] Handshake: version={}, host='{}', intent={:?}",
+            self.peer_addr, client_version, clean_host, handshake.intent
         );
 
-        match handshake.next_state {
-            ConnectionState::Status => {
+        match handshake.intent {
+            HandshakeIntent::Status => {
                 if self.config.network.log_pings {
                     info!(
-                        "[{}] Status ping: protocol={}, version={:?}, host='{}'",
-                        self.peer_addr, client_protocol, client_version, clean_host
+                        "[{}] Status ping: version={}, host='{}'",
+                        self.peer_addr, client_version, clean_host
                     );
                 }
-                self.handle_status(&mut decoder, &mut encoder, client_version, &clean_host)
+                self.handle_status(&mut reader, &mut writer, client_version, &clean_host)
                     .await
             }
-            ConnectionState::Login => {
+            HandshakeIntent::Login => {
                 self.handle_login(
-                    decoder,
-                    encoder,
+                    reader,
+                    writer,
                     client_version,
                     clean_host,
                     self.peer_addr.ip(),
                 )
                 .await
             }
-            other => {
+            HandshakeIntent::Transfer => {
                 debug!(
-                    "[{}] Unsupported handshake state: {:?}",
-                    self.peer_addr, other
+                    "[{}] Unsupported handshake intent: {:?}",
+                    self.peer_addr, handshake.intent
                 );
                 Ok(())
             }
@@ -153,26 +146,25 @@ impl ClientHandler {
 
     async fn handle_status(
         &self,
-        decoder: &mut TCPNetworkDecoder<PrefixedRead<OwnedReadHalf>>,
-        encoder: &mut TCPNetworkEncoder<OwnedWriteHalf>,
-        client_version: JavaMinecraftVersion,
+        reader: &mut ClientReader,
+        writer: &mut ClientWriter,
+        client_version: ProtocolVersion,
         virtual_host: &str,
     ) -> Result<(), ClientError> {
         let status_timeout = Duration::from_secs(self.config.network.client_status_timeout_secs);
 
-        let raw_status = timeout(status_timeout, decoder.get_raw_packet())
+        let raw_status = timeout(status_timeout, reader.read_packet())
             .await
-            .map_err(|_| ClientError::Timeout)?
-            .map_err(|e| ClientError::DecodeError(e.to_string()))?;
+            .map_err(|_| ClientError::Timeout)??;
 
-        if raw_status.id == 0x00 {
+        if PacketKind::StatusRequest.matches(raw_status.id, client_version) {
             let initial_motd = self.status_handler.resolve_motd_text(Some(virtual_host));
             let initial_online = self
                 .online_players
                 .load(std::sync::atomic::Ordering::Relaxed) as u32;
             let mut ping_event = ProxyPingEvent {
                 client_ip: self.peer_addr.ip().to_string(),
-                protocol_version: client_version.protocol_version() as u32,
+                protocol_version: client_version.0,
                 virtual_host: virtual_host.to_string(),
                 motd: initial_motd,
                 max_players: self.config.motd.max_players,
@@ -181,7 +173,7 @@ impl ClientHandler {
             };
             self.plugin_manager.fire_proxy_ping(&mut ping_event).await;
 
-            let status_pkt = self.status_handler.create_custom_status_packet(
+            let status = self.status_handler.create_custom_status_packet(
                 client_version,
                 &ping_event.motd,
                 ping_event.max_players,
@@ -189,31 +181,17 @@ impl ClientHandler {
                 &ping_event.version_name,
                 Some(virtual_host),
             );
-            let status_bytes = status_pkt
-                .serialize_packet(&client_version)
-                .map_err(|e| ClientError::EncodeError(e.to_string()))?;
-            encoder
-                .write_packet(status_bytes)
-                .await
-                .map_err(|e| ClientError::EncodeError(e.to_string()))?;
-            encoder
-                .flush()
-                .await
-                .map_err(|e| ClientError::EncodeError(e.to_string()))?;
+            writer.send(encode_packet(&status, client_version)?).await?;
         }
 
-        if let Ok(Ok(raw_ping)) = timeout(status_timeout, decoder.get_raw_packet()).await
-            && raw_ping.id == 0x01
+        if let Ok(Ok(raw_ping)) = timeout(status_timeout, reader.read_packet()).await
+            && PacketKind::PingRequest.matches(raw_ping.id, client_version)
+            && let Ok(ping) = decode_packet::<PingRequest>(&raw_ping.payload, client_version)
         {
-            let mut ping_bytes = &raw_ping.payload[..];
-            if let Ok(ping) = SStatusPingRequest::read(&mut ping_bytes, &client_version) {
-                let pong_pkt = StatusHandler::create_pong_packet(ping.payload);
-                let pong_bytes = pong_pkt
-                    .serialize_packet(&client_version)
-                    .map_err(|e| ClientError::EncodeError(e.to_string()))?;
-                let _ = encoder.write_packet(pong_bytes).await;
-                let _ = encoder.flush().await;
-            }
+            let pong = PongResponse {
+                payload: ping.payload,
+            };
+            let _ = writer.send(encode_packet(&pong, client_version)?).await;
         }
 
         Ok(())
@@ -221,29 +199,25 @@ impl ClientHandler {
 
     async fn handle_login(
         &self,
-        mut decoder: TCPNetworkDecoder<PrefixedRead<OwnedReadHalf>>,
-        mut encoder: TCPNetworkEncoder<OwnedWriteHalf>,
-        client_version: JavaMinecraftVersion,
+        mut reader: ClientReader,
+        mut writer: ClientWriter,
+        client_version: ProtocolVersion,
         virtual_host: String,
         client_ip: IpAddr,
     ) -> Result<(), ClientError> {
         let login_timeout = Duration::from_secs(self.config.network.client_login_timeout_secs);
 
-        let raw_login_start = timeout(login_timeout, decoder.get_raw_packet())
+        let raw_login_start = timeout(login_timeout, reader.read_packet())
             .await
-            .map_err(|_| ClientError::Timeout)?
-            .map_err(|e| ClientError::DecodeError(e.to_string()))?;
+            .map_err(|_| ClientError::Timeout)??;
 
-        let mut login_start_bytes = &raw_login_start.payload[..];
-        let login_start = SLoginStart::read(&mut login_start_bytes, &client_version)
-            .map_err(|e| ClientError::DecodeError(e.to_string()))?;
-
-        let username = login_start.name.to_string();
+        let login_start: LoginStart = decode_packet(&raw_login_start.payload, client_version)?;
+        let username = login_start.name;
 
         let mut pre_login_event = PlayerPreLoginEvent {
             client_ip: client_ip.to_string(),
             username: username.clone(),
-            protocol_version: client_version.protocol_version() as u32,
+            protocol_version: client_version.0,
             virtual_host: virtual_host.clone(),
             cancelled: false,
             cancel_reason: None,
@@ -260,7 +234,7 @@ impl ClientHandler {
                 "[{}] Player '{}' pre-login cancelled by plugin: {}",
                 self.peer_addr, username, reason
             );
-            Self::kick(&mut encoder, client_version, reason).await?;
+            Self::kick(&mut writer, client_version, reason).await?;
             return Ok(());
         }
 
@@ -270,7 +244,7 @@ impl ClientHandler {
                 self.peer_addr, username
             );
             Self::kick(
-                &mut encoder,
+                &mut writer,
                 client_version,
                 "Invalid username characters or length (must be 2-16 alphanumeric or _)",
             )
@@ -279,35 +253,28 @@ impl ClientHandler {
         }
 
         info!(
-            "[{}] Player '{}' initiating login (version: {:?})",
+            "[{}] Player '{}' initiating login (version: {})",
             self.peer_addr, username, client_version
         );
 
         let authenticated_player = if self.config.server.online_mode {
             let verify_token: [u8; 4] = rand::random();
-            let encryption_request =
-                CEncryptionRequest::new("", self.keystore.public_key_der(), &verify_token, true);
+            let encryption_request = EncryptionRequest {
+                server_id: String::new(),
+                public_key: self.keystore.public_key_der().to_vec(),
+                verify_token: verify_token.to_vec(),
+                should_authenticate: true,
+            };
+            writer
+                .send(encode_packet(&encryption_request, client_version)?)
+                .await?;
 
-            let enc_req_bytes = encryption_request
-                .serialize_packet(&client_version)
-                .map_err(|e| ClientError::EncodeError(e.to_string()))?;
-            encoder
-                .write_packet(enc_req_bytes)
+            let raw_enc_resp = timeout(login_timeout, reader.read_packet())
                 .await
-                .map_err(|e| ClientError::EncodeError(e.to_string()))?;
-            encoder
-                .flush()
-                .await
-                .map_err(|e| ClientError::EncodeError(e.to_string()))?;
+                .map_err(|_| ClientError::Timeout)??;
 
-            let raw_enc_resp = timeout(login_timeout, decoder.get_raw_packet())
-                .await
-                .map_err(|_| ClientError::Timeout)?
-                .map_err(|e| ClientError::DecodeError(e.to_string()))?;
-
-            let mut enc_resp_bytes = &raw_enc_resp.payload[..];
-            let enc_resp = SEncryptionResponse::read(&mut enc_resp_bytes, &client_version)
-                .map_err(|e| ClientError::DecodeError(e.to_string()))?;
+            let enc_resp: EncryptionResponse =
+                decode_packet(&raw_enc_resp.payload, client_version)?;
 
             let decrypted_token = self
                 .keystore
@@ -320,7 +287,7 @@ impl ClientHandler {
                     self.peer_addr, username
                 );
                 Self::kick(
-                    &mut encoder,
+                    &mut writer,
                     client_version,
                     "Failed to verify encryption token",
                 )
@@ -339,12 +306,7 @@ impl ClientHandler {
                     self.peer_addr,
                     shared_secret.len()
                 );
-                Self::kick(
-                    &mut encoder,
-                    client_version,
-                    "Invalid encryption key length",
-                )
-                .await?;
+                Self::kick(&mut writer, client_version, "Invalid encryption key length").await?;
                 return Err(ClientError::AuthError("Invalid key length".to_string()));
             }
 
@@ -370,7 +332,7 @@ impl ClientHandler {
                         self.peer_addr, username, e
                     );
                     Self::kick(
-                        &mut encoder,
+                        &mut writer,
                         client_version,
                         "Failed to verify username with Mojang session servers! Please try again later.",
                     )
@@ -379,12 +341,8 @@ impl ClientHandler {
                 }
             };
 
-            decoder
-                .set_encryption(&aes_key)
-                .map_err(|e| ClientError::DecodeError(e.to_string()))?;
-            encoder
-                .set_encryption(&aes_key)
-                .map_err(|e| ClientError::EncodeError(e.to_string()))?;
+            reader.enable_encryption(&aes_key)?;
+            writer.enable_encryption(&aes_key)?;
 
             debug!(
                 "[{}] Stream encryption enabled for player '{}' ({})",
@@ -415,30 +373,24 @@ impl ClientHandler {
                 "[{}] Player '{}' login cancelled by plugin: {}",
                 self.peer_addr, authenticated_player.username, reason
             );
-            Self::kick(&mut encoder, client_version, reason).await?;
+            Self::kick(&mut writer, client_version, reason).await?;
             return Ok(());
         }
 
         let comp_threshold = self.config.server.compression_threshold;
         if comp_threshold > 0 {
-            let set_comp = CSetCompression::new(VarInt(comp_threshold));
-            let comp_bytes = set_comp
-                .serialize_packet(&client_version)
-                .map_err(|e| ClientError::EncodeError(e.to_string()))?;
-            encoder
-                .write_packet(comp_bytes)
-                .await
-                .map_err(|e| ClientError::EncodeError(e.to_string()))?;
-            encoder
-                .flush()
-                .await
-                .map_err(|e| ClientError::EncodeError(e.to_string()))?;
+            let set_compression = SetCompression {
+                threshold: comp_threshold,
+            };
+            writer
+                .send(encode_packet(&set_compression, client_version)?)
+                .await?;
 
-            decoder.set_compression(comp_threshold as usize);
-            encoder.set_compression((
+            reader.set_compression(comp_threshold as usize);
+            writer.set_compression(
                 comp_threshold as usize,
                 self.config.server.compression_level as u32,
-            ));
+            );
         }
 
         let (server_name, backend_cfg) = match self.router.resolve_server(&virtual_host) {
@@ -449,7 +401,7 @@ impl ClientHandler {
                     self.peer_addr, virtual_host
                 );
                 Self::kick(
-                    &mut encoder,
+                    &mut writer,
                     client_version,
                     "No default or matching backend Minecraft server is configured on the proxy.",
                 )
@@ -491,22 +443,20 @@ impl ClientHandler {
             self.plugin_manager.clone(),
         );
 
-        bridge.run(decoder, encoder).await?;
+        bridge.run(reader, writer).await?;
         Ok(())
     }
 
-    /// Helper to send formatted CLoginDisconnect packet to client
     async fn kick(
-        encoder: &mut TCPNetworkEncoder<OwnedWriteHalf>,
-        version: JavaMinecraftVersion,
+        writer: &mut ClientWriter,
+        version: ProtocolVersion,
         reason: &str,
     ) -> Result<(), ClientError> {
-        let disconnect = CLoginDisconnect::new(kick_reason_json(reason));
-        let bytes = disconnect
-            .serialize_packet(&version)
-            .map_err(|e| ClientError::EncodeError(e.to_string()))?;
-        let _ = encoder.write_packet(bytes).await;
-        let _ = encoder.flush().await;
+        let disconnect = LoginDisconnect {
+            reason_json: kick_reason_json(reason),
+        };
+        let bytes = encode_packet(&disconnect, version)?;
+        let _ = writer.send(bytes).await;
         Ok(())
     }
 }

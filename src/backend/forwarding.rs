@@ -1,13 +1,12 @@
 use ed25519_dalek::{Signer, SigningKey};
 use hmac::{Hmac, KeyInit, Mac};
-use pumpkin_protocol::codec::var_int::VarInt;
-use pumpkin_protocol::ser::{NetworkWriteExt, WritingError};
 use sha2::{Digest, Sha256};
 use std::net::IpAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 use crate::auth::AuthenticatedPlayer;
+use crate::protocol::wire::WriteExt;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -25,10 +24,6 @@ pub enum ForwardingError {
     MissingVineSecret,
     #[error("HMAC initialization failed: {0}")]
     HmacError(String),
-    #[error("Serialization IO error: {0}")]
-    IoError(#[from] std::io::Error),
-    #[error("Writing error: {0}")]
-    WritingError(#[from] WritingError),
 }
 
 pub struct ForwardingHelper;
@@ -71,24 +66,24 @@ impl ForwardingHelper {
 
         let mut payload = Vec::new();
 
-        VarInt(VELOCITY_FORWARDING_VERSION).encode(&mut payload)?;
+        payload.write_varint(VELOCITY_FORWARDING_VERSION);
 
         let ip_str = client_ip.to_string();
-        payload.write_string(&ip_str)?;
+        payload.write_string(&ip_str);
 
         payload.extend_from_slice(player.id.as_bytes());
 
-        payload.write_string(&player.username)?;
+        payload.write_string(&player.username);
 
-        VarInt(player.properties.len() as i32).encode(&mut payload)?;
+        payload.write_varint(player.properties.len() as i32);
         for prop in &player.properties {
-            payload.write_string(&prop.name)?;
-            payload.write_string(&prop.value)?;
+            payload.write_string(&prop.name);
+            payload.write_string(&prop.value);
             if let Some(sig) = &prop.signature {
-                payload.write_bool(true)?;
-                payload.write_string(sig)?;
+                payload.write_bool(true);
+                payload.write_string(sig);
             } else {
-                payload.write_bool(false)?;
+                payload.write_bool(false);
             }
         }
 
@@ -149,7 +144,7 @@ impl ForwardingHelper {
         let signing_key = Self::get_vine_signing_key(secret)?;
 
         let mut payload = Vec::new();
-        VarInt(VINE_FORWARDING_VERSION).encode(&mut payload)?;
+        payload.write_varint(VINE_FORWARDING_VERSION);
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -159,20 +154,20 @@ impl ForwardingHelper {
         payload.extend_from_slice(challenge);
 
         let ip_str = client_ip.to_string();
-        payload.write_string(&ip_str)?;
+        payload.write_string(&ip_str);
 
         payload.extend_from_slice(player.id.as_bytes());
-        payload.write_string(&player.username)?;
+        payload.write_string(&player.username);
 
-        VarInt(player.properties.len() as i32).encode(&mut payload)?;
+        payload.write_varint(player.properties.len() as i32);
         for prop in &player.properties {
-            payload.write_string(&prop.name)?;
-            payload.write_string(&prop.value)?;
+            payload.write_string(&prop.name);
+            payload.write_string(&prop.value);
             if let Some(sig) = &prop.signature {
-                payload.write_bool(true)?;
-                payload.write_string(sig)?;
+                payload.write_bool(true);
+                payload.write_string(sig);
             } else {
-                payload.write_bool(false)?;
+                payload.write_bool(false);
             }
         }
 

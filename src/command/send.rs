@@ -347,18 +347,12 @@ mod tests {
 
         let dispatcher = CommandDispatcher::new();
         let target_suggestions = dispatcher.suggest("send ", &source);
-        let names: Vec<&str> = target_suggestions
-            .iter()
-            .map(|s| s.suggestion.as_str())
-            .collect();
+        let names: Vec<&str> = target_suggestions.iter().map(|s| s.text.as_str()).collect();
         assert!(names.contains(&"all"));
         assert!(names.contains(&"Steve"));
 
         let server_suggestions = dispatcher.suggest("send Steve ", &source);
-        let servers: Vec<&str> = server_suggestions
-            .iter()
-            .map(|s| s.suggestion.as_str())
-            .collect();
+        let servers: Vec<&str> = server_suggestions.iter().map(|s| s.text.as_str()).collect();
         assert!(servers.contains(&"survival"));
         assert!(servers.contains(&"lobby"));
     }

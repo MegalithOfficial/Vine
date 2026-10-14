@@ -1,7 +1,6 @@
 use num_bigint::BigInt;
-use pumpkin_protocol::Property;
 use rsa::{Pkcs1v15Encrypt, RsaPrivateKey, pkcs8::EncodePublicKey};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::{net::IpAddr, time::Duration};
 use thiserror::Error;
@@ -67,11 +66,18 @@ impl KeyStore {
     }
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct ProfileProperty {
+    pub name: String,
+    pub value: String,
+    pub signature: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct AuthenticatedPlayer {
     pub id: Uuid,
     pub username: String,
-    pub properties: Vec<Property>,
+    pub properties: Vec<ProfileProperty>,
 }
 
 impl AuthenticatedPlayer {
@@ -171,10 +177,10 @@ impl Authenticator {
         let properties = data
             .properties
             .into_iter()
-            .map(|p| Property {
-                name: p.name.into_boxed_str(),
-                value: p.value.into_boxed_str(),
-                signature: p.signature.map(String::into_boxed_str),
+            .map(|p| ProfileProperty {
+                name: p.name,
+                value: p.value,
+                signature: p.signature,
             })
             .collect();
 
