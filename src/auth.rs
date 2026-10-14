@@ -120,6 +120,28 @@ impl Authenticator {
         Self { client }
     }
 
+    /// Builds the `hasJoined` URL with every query parameter percent-encoded
+    fn has_joined_url(
+        username: &str,
+        server_hash: &str,
+        client_ip: &IpAddr,
+        prevent_proxy_connections: bool,
+    ) -> reqwest::Url {
+        let mut url =
+            reqwest::Url::parse("https://sessionserver.mojang.com/session/minecraft/hasJoined")
+                .expect("static URL is valid");
+        {
+            let mut query = url.query_pairs_mut();
+            query
+                .append_pair("username", username)
+                .append_pair("serverId", server_hash);
+            if prevent_proxy_connections {
+                query.append_pair("ip", &client_ip.to_string());
+            }
+        }
+        url
+    }
+
     /// Authenticate a player with Mojang's session servers
     pub async fn authenticate(
         &self,
@@ -128,18 +150,10 @@ impl Authenticator {
         client_ip: &IpAddr,
         prevent_proxy_connections: bool,
     ) -> Result<AuthenticatedPlayer, AuthError> {
-        let url = if prevent_proxy_connections {
-            format!(
-                "https://sessionserver.mojang.com/session/minecraft/hasJoined?username={username}&serverId={server_hash}&ip={client_ip}"
-            )
-        } else {
-            format!(
-                "https://sessionserver.mojang.com/session/minecraft/hasJoined?username={username}&serverId={server_hash}"
-            )
-        };
+        let url = Self::has_joined_url(username, server_hash, client_ip, prevent_proxy_connections);
 
         debug!("Querying Mojang authentication service for '{}'", username);
-        let resp = self.client.get(&url).send().await?;
+        let resp = self.client.get(url).send().await?;
 
         if !resp.status().is_success() {
             error!(
@@ -170,5 +184,32 @@ impl Authenticator {
             username: data.name,
             properties,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_has_joined_url_encodes_parameters() {
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        let url = Authenticator::has_joined_url("evil&ip=1.1.1.1", "-1a2b", &ip, true);
+
+        let pairs: Vec<(String, String)> = url
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("username".to_string(), "evil&ip=1.1.1.1".to_string()),
+                ("serverId".to_string(), "-1a2b".to_string()),
+                ("ip".to_string(), "203.0.113.7".to_string()),
+            ]
+        );
+
+        let url = Authenticator::has_joined_url("Steve", "abc", &ip, false);
+        assert_eq!(url.query(), Some("username=Steve&serverId=abc"));
     }
 }
