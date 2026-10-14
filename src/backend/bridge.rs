@@ -820,10 +820,7 @@ impl BackendBridge {
         reason: &str,
     ) {
         if is_config_state {
-            let json_reason = format!(
-                r#"{{"text":"[Vine Proxy] {}","color":"red"}}"#,
-                reason.replace('"', "\\\"")
-            );
+            let json_reason = crate::client::kick_reason_json(reason);
             let pkt = CConfigDisconnect::new(&json_reason);
             if let Ok(bytes) = pkt.serialize_packet(&version) {
                 let _ = encoder.write_packet(bytes).await;

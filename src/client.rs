@@ -501,16 +501,36 @@ impl ClientHandler {
         version: JavaMinecraftVersion,
         reason: &str,
     ) -> Result<(), ClientError> {
-        let json_reason = format!(
-            r#"{{"text":"[Vine Proxy] {}","color":"red"}}"#,
-            reason.replace('"', "\\\"")
-        );
-        let disconnect = CLoginDisconnect::new(json_reason);
+        let disconnect = CLoginDisconnect::new(kick_reason_json(reason));
         let bytes = disconnect
             .serialize_packet(&version)
             .map_err(|e| ClientError::EncodeError(e.to_string()))?;
         let _ = encoder.write_packet(bytes).await;
         let _ = encoder.flush().await;
         Ok(())
+    }
+}
+
+/// Builds the JSON chat component used for proxy-generated kick messages
+pub(crate) fn kick_reason_json(reason: &str) -> String {
+    serde_json::json!({
+        "text": format!("[Vine Proxy] {reason}"),
+        "color": "red",
+    })
+    .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_kick_reason_json_escapes_special_characters() {
+        let reason = "bad \\ \"quote\"\nnext line";
+        let json = kick_reason_json(reason);
+
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(parsed["text"], format!("[Vine Proxy] {reason}"));
+        assert_eq!(parsed["color"], "red");
     }
 }
