@@ -208,6 +208,19 @@ impl ClientHandler {
     ) -> Result<(), ClientError> {
         let login_timeout = Duration::from_secs(self.config.network.client_login_timeout_secs);
 
+        if !client_version.is_known() {
+            info!(
+                "[{}] Rejecting unsupported client version {}",
+                self.peer_addr, client_version
+            );
+            let reason = format!(
+                "Unsupported Minecraft version. This proxy supports {}.",
+                ProtocolVersion::supported_range()
+            );
+            Self::kick(&mut writer, client_version, &reason).await?;
+            return Ok(());
+        }
+
         let raw_login_start = timeout(login_timeout, reader.read_packet())
             .await
             .map_err(|_| ClientError::Timeout)??;

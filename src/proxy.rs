@@ -102,7 +102,10 @@ impl ProxyServer {
         info!("=====================================================");
         info!("  Vine Minecraft Proxy is listening on {}", bind_addr);
         info!("  Online mode: {}", self.config.server.online_mode);
-        info!("  Multi-version support: 1.7.2 through 1.21.x / 26.x");
+        info!(
+            "  Supported Minecraft versions: {}",
+            crate::protocol::ProtocolVersion::supported_range()
+        );
         info!("  Networking options:");
         info!("    - TCP_NODELAY: {}", self.config.network.tcp_nodelay);
         info!(
