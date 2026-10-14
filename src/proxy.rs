@@ -161,6 +161,27 @@ impl ProxyServer {
         }
         info!("=====================================================");
 
+        if self.config.network.proxy_protocol
+            && self
+                .config
+                .network
+                .proxy_protocol_trusted_proxies
+                .is_empty()
+        {
+            warn!(
+                "PROXY protocol is enabled but network.proxy_protocol_trusted_proxies is empty: \
+                 any client reaching this port can spoof its IP address"
+            );
+        }
+        let trusted_proxies: Arc<Vec<network::IpRange>> = Arc::new(
+            self.config
+                .network
+                .proxy_protocol_trusted_proxies
+                .iter()
+                .filter_map(|entry| network::IpRange::parse(entry))
+                .collect(),
+        );
+
         let telemetry_handle = telemetry::start_telemetry(
             self.config.clone(),
             self.online_players.clone(),
@@ -256,6 +277,7 @@ impl ProxyServer {
                             let session_manager = self.session_manager.clone();
                             let command_dispatcher = self.command_dispatcher.clone();
                             let plugin_manager = self.plugin_manager.clone();
+                            let trusted_proxies = trusted_proxies.clone();
 
                             tokio::spawn(async move {
                                 if let Err(e) = network::configure_client_socket(&stream, &config.network) {
@@ -267,14 +289,26 @@ impl ProxyServer {
                                 let mut leftover_bytes = Vec::new();
 
                                 if config.network.proxy_protocol {
-                                    match network::parse_proxy_protocol(&mut stream, peer_addr).await {
-                                        Ok(res) => {
+                                    if !trusted_proxies.is_empty()
+                                        && !trusted_proxies.iter().any(|range| range.contains(&peer_addr.ip()))
+                                    {
+                                        debug!("[{}] Dropped connection: peer is not a trusted PROXY protocol source", peer_addr);
+                                        return;
+                                    }
+
+                                    let header_timeout = Duration::from_secs(config.network.client_handshake_timeout_secs);
+                                    match tokio::time::timeout(header_timeout, network::parse_proxy_protocol(&mut stream, peer_addr)).await {
+                                        Ok(Ok(res)) => {
                                              effective_addr = res.client_addr;
                                              leftover_bytes = res.leftover_bytes;
                                              debug!("[{}] PROXY protocol resolved client IP: {}", peer_addr, effective_addr);
                                         }
-                                        Err(err) => {
+                                        Ok(Err(err)) => {
                                             warn!("[{}] Dropped connection: PROXY protocol error: {}", peer_addr, err);
+                                            return;
+                                        }
+                                        Err(_) => {
+                                            debug!("[{}] Dropped connection: PROXY protocol header timed out", peer_addr);
                                             return;
                                         }
                                     }

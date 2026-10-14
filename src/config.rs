@@ -161,6 +161,11 @@ pub struct NetworkConfig {
     #[serde(default)]
     pub proxy_protocol: bool,
 
+    /// Upstream addresses allowed to send PROXY protocol headers (IPs or CIDR ranges, e.g. "10.0.0.0/8").
+    /// When empty, PROXY headers are accepted from any peer, which allows client IP spoofing.
+    #[serde(default)]
+    pub proxy_protocol_trusted_proxies: Vec<String>,
+
     /// Log incoming server list status pings in the console
     #[serde(default)]
     pub log_pings: bool,
@@ -181,6 +186,7 @@ impl Default for NetworkConfig {
             send_buffer_size: None,
             listen_backlog: default_listen_backlog(),
             proxy_protocol: false,
+            proxy_protocol_trusted_proxies: Vec::new(),
             log_pings: false,
         }
     }
@@ -416,6 +422,13 @@ impl Config {
 
     /// Rejects configurations whose forwarding secrets are missing or publicly known
     pub fn validate(&self) -> Result<(), String> {
+        for entry in &self.network.proxy_protocol_trusted_proxies {
+            if crate::network::IpRange::parse(entry).is_none() {
+                return Err(format!(
+                    "invalid entry '{entry}' in network.proxy_protocol_trusted_proxies"
+                ));
+            }
+        }
         for (name, server) in &self.servers {
             if !matches!(
                 server.forwarding,

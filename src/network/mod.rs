@@ -10,7 +10,7 @@ use tracing::{debug, warn};
 
 use crate::config::NetworkConfig;
 pub use prefixed_stream::PrefixedRead;
-pub use proxy_protocol::{ProxyHeaderResult, parse_proxy_protocol};
+pub use proxy_protocol::{IpRange, ProxyHeaderResult, parse_proxy_protocol};
 
 /// Creates and tunes a Tokio `TcpListener` based on `NetworkConfig`
 pub fn create_tcp_listener(

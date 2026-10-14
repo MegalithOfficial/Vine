@@ -6,6 +6,52 @@ pub const PROXY_V2_MAGIC: [u8; 12] = [
     0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
 ];
 
+/// An IP address or CIDR range describing upstream peers trusted to send PROXY headers
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IpRange {
+    network: IpAddr,
+    prefix_len: u8,
+}
+
+impl IpRange {
+    /// Parses a plain IP address (`10.0.0.1`) or a CIDR range (`10.0.0.0/8`, `fd00::/8`)
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        let (network, prefix_len) = match s.split_once('/') {
+            Some((addr, prefix)) => (addr.parse::<IpAddr>().ok()?, Some(prefix.parse().ok()?)),
+            None => (s.parse::<IpAddr>().ok()?, None),
+        };
+        let network = network.to_canonical();
+        let max_len = if network.is_ipv4() { 32 } else { 128 };
+        let prefix_len = prefix_len.unwrap_or(max_len);
+        if prefix_len > max_len {
+            return None;
+        }
+        Some(Self {
+            network,
+            prefix_len,
+        })
+    }
+
+    pub fn contains(&self, ip: &IpAddr) -> bool {
+        match (self.network, ip.to_canonical()) {
+            (IpAddr::V4(net), IpAddr::V4(addr)) => {
+                let mask = u32::MAX
+                    .checked_shl(32 - u32::from(self.prefix_len))
+                    .unwrap_or(0);
+                u32::from(net) & mask == u32::from(addr) & mask
+            }
+            (IpAddr::V6(net), IpAddr::V6(addr)) => {
+                let mask = u128::MAX
+                    .checked_shl(128 - u32::from(self.prefix_len))
+                    .unwrap_or(0);
+                u128::from(net) & mask == u128::from(addr) & mask
+            }
+            _ => false,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct ProxyHeaderResult {
     pub client_addr: SocketAddr,
@@ -248,6 +294,30 @@ async fn parse_proxy_v2<R: AsyncRead + Unpin>(
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn test_ip_range_matching() {
+        let single = IpRange::parse("10.0.0.5").unwrap();
+        assert!(single.contains(&"10.0.0.5".parse().unwrap()));
+        assert!(!single.contains(&"10.0.0.6".parse().unwrap()));
+
+        let v4 = IpRange::parse("10.0.0.0/8").unwrap();
+        assert!(v4.contains(&"10.200.1.1".parse().unwrap()));
+        assert!(v4.contains(&"::ffff:10.1.2.3".parse().unwrap()));
+        assert!(!v4.contains(&"11.0.0.1".parse().unwrap()));
+
+        let any = IpRange::parse("0.0.0.0/0").unwrap();
+        assert!(any.contains(&"203.0.113.9".parse().unwrap()));
+
+        let v6 = IpRange::parse("fd00::/8").unwrap();
+        assert!(v6.contains(&"fd12::1".parse().unwrap()));
+        assert!(!v6.contains(&"fe80::1".parse().unwrap()));
+        assert!(!v6.contains(&"10.0.0.1".parse().unwrap()));
+
+        assert!(IpRange::parse("10.0.0.0/33").is_none());
+        assert!(IpRange::parse("not-an-ip").is_none());
+        assert!(IpRange::parse("10.0.0.0/").is_none());
+    }
 
     #[tokio::test]
     async fn test_proxy_v1_ipv4() {
