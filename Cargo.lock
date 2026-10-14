@@ -1931,6 +1931,7 @@ dependencies = [
 [[package]]
 name = "pumpkin-auth"
 version = "0.2.0+26.3-26.51"
+source = "git+https://github.com/Pumpkin-MC/Pumpkin?rev=e0cb7c01fbab5892d9dbbed0ef574c59c977d07f#e0cb7c01fbab5892d9dbbed0ef574c59c977d07f"
 dependencies = [
  "base64 0.23.1",
  "crypto-bigint",
@@ -1951,6 +1952,7 @@ dependencies = [
 [[package]]
 name = "pumpkin-codecs"
 version = "0.2.0+26.3-26.51"
+source = "git+https://github.com/Pumpkin-MC/Pumpkin?rev=e0cb7c01fbab5892d9dbbed0ef574c59c977d07f#e0cb7c01fbab5892d9dbbed0ef574c59c977d07f"
 dependencies = [
  "serde_json",
  "tracing",
@@ -1959,6 +1961,7 @@ dependencies = [
 [[package]]
 name = "pumpkin-command"
 version = "0.2.0+26.3-26.51"
+source = "git+https://github.com/Pumpkin-MC/Pumpkin?rev=e0cb7c01fbab5892d9dbbed0ef574c59c977d07f#e0cb7c01fbab5892d9dbbed0ef574c59c977d07f"
 dependencies = [
  "pumpkin-codecs",
  "pumpkin-data",
@@ -1974,6 +1977,7 @@ dependencies = [
 [[package]]
 name = "pumpkin-data"
 version = "0.2.0+26.3-26.51"
+source = "git+https://github.com/Pumpkin-MC/Pumpkin?rev=e0cb7c01fbab5892d9dbbed0ef574c59c977d07f#e0cb7c01fbab5892d9dbbed0ef574c59c977d07f"
 dependencies = [
  "crc32c",
  "flate2",
@@ -1991,6 +1995,7 @@ dependencies = [
 [[package]]
 name = "pumpkin-macros"
 version = "0.2.0+26.3-26.51"
+source = "git+https://github.com/Pumpkin-MC/Pumpkin?rev=e0cb7c01fbab5892d9dbbed0ef574c59c977d07f#e0cb7c01fbab5892d9dbbed0ef574c59c977d07f"
 dependencies = [
  "heck",
  "proc-macro-error2",
@@ -2002,6 +2007,7 @@ dependencies = [
 [[package]]
 name = "pumpkin-nbt"
 version = "0.2.0+26.3-26.51"
+source = "git+https://github.com/Pumpkin-MC/Pumpkin?rev=e0cb7c01fbab5892d9dbbed0ef574c59c977d07f#e0cb7c01fbab5892d9dbbed0ef574c59c977d07f"
 dependencies = [
  "bytes",
  "cesu8",
@@ -2015,6 +2021,7 @@ dependencies = [
 [[package]]
 name = "pumpkin-plugin-runtime"
 version = "0.2.0+26.3-26.51"
+source = "git+https://github.com/Pumpkin-MC/Pumpkin?rev=e0cb7c01fbab5892d9dbbed0ef574c59c977d07f#e0cb7c01fbab5892d9dbbed0ef574c59c977d07f"
 dependencies = [
  "futures",
  "thiserror 2.0.20",
@@ -2026,6 +2033,7 @@ dependencies = [
 [[package]]
 name = "pumpkin-protocol"
 version = "0.2.0+26.3-26.51"
+source = "git+https://github.com/Pumpkin-MC/Pumpkin?rev=e0cb7c01fbab5892d9dbbed0ef574c59c977d07f#e0cb7c01fbab5892d9dbbed0ef574c59c977d07f"
 dependencies = [
  "aes",
  "async-compression",
@@ -2050,6 +2058,7 @@ dependencies = [
 [[package]]
 name = "pumpkin-util"
 version = "0.2.0+26.3-26.51"
+source = "git+https://github.com/Pumpkin-MC/Pumpkin?rev=e0cb7c01fbab5892d9dbbed0ef574c59c977d07f#e0cb7c01fbab5892d9dbbed0ef574c59c977d07f"
 dependencies = [
  "bytes",
  "colored",

@@ -5,10 +5,10 @@ edition = "2024"
 license = "GPL-3.0"
 
 [dependencies]
-pumpkin-util = { path = "../Pumpkin/crates/pumpkin-util" }
-pumpkin-auth = { path = "../Pumpkin/crates/pumpkin-auth" }
-pumpkin-command = { path = "../Pumpkin/crates/pumpkin-command" }
-pumpkin-plugin-runtime = { path = "../Pumpkin/crates/pumpkin-plugin-runtime" }
+pumpkin-util = { git = "https://github.com/Pumpkin-MC/Pumpkin", rev = "e0cb7c01fbab5892d9dbbed0ef574c59c977d07f" }
+pumpkin-auth = { git = "https://github.com/Pumpkin-MC/Pumpkin", rev = "e0cb7c01fbab5892d9dbbed0ef574c59c977d07f" }
+pumpkin-command = { git = "https://github.com/Pumpkin-MC/Pumpkin", rev = "e0cb7c01fbab5892d9dbbed0ef574c59c977d07f" }
+pumpkin-plugin-runtime = { git = "https://github.com/Pumpkin-MC/Pumpkin", rev = "e0cb7c01fbab5892d9dbbed0ef574c59c977d07f" }
 wasmtime = { git = "https://github.com/bytecodealliance/wasmtime", rev = "f6b3140dbb1d9b436ef523d14740292c956b0364", default-features = false, features = ["runtime", "component-model", "component-model-async", "async", "cache", "cranelift", "gc", "gc-drc", "threads", "std"] }
 wasmtime-wasi = { git = "https://github.com/bytecodealliance/wasmtime", rev = "f6b3140dbb1d9b436ef523d14740292c956b0364", default-features = false, features = ["p2", "p3"] }
 
