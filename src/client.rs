@@ -399,7 +399,7 @@ impl ClientHandler {
         }
 
         let comp_threshold = self.config.server.compression_threshold;
-        if comp_threshold > 0 {
+        if comp_threshold > 0 && PacketKind::SetCompression.id(client_version).is_some() {
             let set_compression = SetCompression {
                 threshold: comp_threshold,
             };
