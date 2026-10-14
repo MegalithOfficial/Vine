@@ -5,9 +5,8 @@ pub mod play;
 pub mod status;
 
 use bytes::Bytes;
-use pumpkin_protocol::java::{client, server};
-use pumpkin_protocol::packet::MultiVersionJavaPacket;
 
+use super::generated::PACKET_IDS;
 use super::wire::WriteExt;
 use super::{ProtocolError, ProtocolVersion};
 
@@ -23,6 +22,7 @@ pub enum PacketKind {
     LoginStart,
     EncryptionResponse,
     LoginPluginResponse,
+    LoginAcknowledged,
     LoginDisconnect,
     EncryptionRequest,
     LoginSuccess,
@@ -30,11 +30,24 @@ pub enum PacketKind {
     LoginPluginRequest,
 
     ConfigDisconnect,
+    ConfigFinish,
+    ConfigKeepAlive,
+    ConfigPing,
+    ConfigKnownPacks,
+    ConfigCodeOfConduct,
+    ConfigFinishAck,
+    ConfigKeepAliveResponse,
+    ConfigPong,
+    ConfigKnownPacksResponse,
+    ConfigAcceptCodeOfConduct,
 
     ChatCommand,
+    SignedChatCommand,
     ChatMessage,
     CommandSuggestionRequest,
     ServerboundPluginMessage,
+    ConfigurationAcknowledged,
+    PlayKeepAliveResponse,
     PlayDisconnect,
     SystemChat,
     Commands,
@@ -42,39 +55,20 @@ pub enum PacketKind {
     ClientboundPluginMessage,
     StartConfiguration,
     Transfer,
+    PlayKeepAlive,
+    JoinGame,
+    Respawn,
 }
 
 impl PacketKind {
     pub fn id(self, version: ProtocolVersion) -> Option<i32> {
-        let v = version.to_pumpkin();
-        let id = match self {
-            Self::Handshake => server::handshake::SHandShake::to_id(v),
-            Self::StatusRequest => server::status::SStatusRequest::to_id(v),
-            Self::PingRequest => server::status::SStatusPingRequest::to_id(v),
-            Self::StatusResponse => client::status::CStatusResponse::to_id(v),
-            Self::PongResponse => client::status::CPingResponse::to_id(v),
-            Self::LoginStart => server::login::SLoginStart::to_id(v),
-            Self::EncryptionResponse => server::login::SEncryptionResponse::to_id(v),
-            Self::LoginPluginResponse => server::login::SLoginPluginResponse::to_id(v),
-            Self::LoginDisconnect => client::login::CLoginDisconnect::to_id(v),
-            Self::EncryptionRequest => client::login::CEncryptionRequest::to_id(v),
-            Self::LoginSuccess => client::login::CLoginSuccess::to_id(v),
-            Self::SetCompression => client::login::CSetCompression::to_id(v),
-            Self::LoginPluginRequest => client::login::CLoginPluginRequest::to_id(v),
-            Self::ConfigDisconnect => client::config::CConfigDisconnect::to_id(v),
-            Self::ChatCommand => server::play::SChatCommand::to_id(v),
-            Self::ChatMessage => server::play::SChatMessage::to_id(v),
-            Self::CommandSuggestionRequest => server::play::SCommandSuggestion::to_id(v),
-            Self::ServerboundPluginMessage => server::play::SCustomPayload::to_id(v),
-            Self::PlayDisconnect => client::play::CPlayDisconnect::to_id(v),
-            Self::SystemChat => client::play::CSystemChatMessage::to_id(v),
-            Self::Commands => client::play::CCommands::to_id(v),
-            Self::CommandSuggestionsResponse => client::play::CCommandSuggestions::to_id(v),
-            Self::ClientboundPluginMessage => client::play::CCustomPayload::to_id(v),
-            Self::StartConfiguration => client::play::CStartConfiguration::to_id(v),
-            Self::Transfer => client::play::CTransfer::to_id(v),
-        };
-        Some(id)
+        if !version.is_known() {
+            return None;
+        }
+        let (_, runs) = PACKET_IDS.iter().find(|(kind, _)| *kind == self)?;
+        let idx = runs.partition_point(|(first, _)| *first <= version.0);
+        let (_, id) = runs.get(idx.checked_sub(1)?)?;
+        (*id >= 0).then_some(*id)
     }
 
     pub fn matches(self, id: i32, version: ProtocolVersion) -> bool {
@@ -111,16 +105,92 @@ pub fn decode_packet<P: Packet>(
     P::read(&mut cur, version)
 }
 
-fn write_pumpkin<P: pumpkin_protocol::ClientPacket>(
-    packet: &P,
-    buf: &mut Vec<u8>,
-    version: ProtocolVersion,
-) -> Result<(), ProtocolError> {
-    packet
-        .write_packet_data(&mut *buf, &version.to_pumpkin())
-        .map_err(|e| ProtocolError::Encode(e.to_string()))
+fn read_only(kind: PacketKind, version: ProtocolVersion) -> Result<(), ProtocolError> {
+    Err(ProtocolError::UnsupportedPacket(kind, version))
 }
 
-fn read_error(err: impl std::fmt::Display) -> ProtocolError {
-    ProtocolError::Malformed(err.to_string())
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::generated::LAYOUT_CHANGES;
+
+    const HANDLED_LAYOUTS: &[(PacketKind, &[u32])] = &[
+        (PacketKind::Handshake, &[]),
+        (PacketKind::StatusRequest, &[]),
+        (PacketKind::PingRequest, &[]),
+        (PacketKind::StatusResponse, &[]),
+        (PacketKind::PongResponse, &[]),
+        (PacketKind::LoginStart, &[759, 760, 761, 764]),
+        (PacketKind::EncryptionResponse, &[47, 759, 761]),
+        (PacketKind::LoginPluginResponse, &[393]),
+        (PacketKind::LoginAcknowledged, &[764]),
+        (PacketKind::LoginDisconnect, &[]),
+        (PacketKind::EncryptionRequest, &[47, 766]),
+        (PacketKind::SetCompression, &[47]),
+        (PacketKind::LoginPluginRequest, &[393]),
+        (PacketKind::ConfigDisconnect, &[764, 765]),
+        (PacketKind::ConfigFinish, &[764]),
+        (PacketKind::ConfigKeepAlive, &[764]),
+        (PacketKind::ConfigPing, &[764]),
+        (PacketKind::ConfigCodeOfConduct, &[773]),
+        (PacketKind::ConfigFinishAck, &[764]),
+        (PacketKind::ConfigKeepAliveResponse, &[764]),
+        (PacketKind::ConfigPong, &[764]),
+        (PacketKind::ConfigAcceptCodeOfConduct, &[773]),
+        // Only the leading command/message string is read from these
+        (PacketKind::ChatCommand, &[759, 760, 761, 766]),
+        (PacketKind::SignedChatCommand, &[766, 770, 774, 775]),
+        (PacketKind::ChatMessage, &[759, 760, 761, 770]),
+        (PacketKind::CommandSuggestionRequest, &[47, 107, 393]),
+        (PacketKind::ServerboundPluginMessage, &[47]),
+        (PacketKind::ConfigurationAcknowledged, &[764]),
+        (PacketKind::PlayKeepAliveResponse, &[47, 340]),
+        (PacketKind::PlayDisconnect, &[765]),
+        (PacketKind::SystemChat, &[47, 735, 759, 760, 765]),
+        (PacketKind::Commands, &[393, 771]),
+        (PacketKind::CommandSuggestionsResponse, &[393, 765]),
+        (PacketKind::ClientboundPluginMessage, &[47]),
+        (PacketKind::StartConfiguration, &[764]),
+        (PacketKind::Transfer, &[]),
+        (PacketKind::PlayKeepAlive, &[47, 340]),
+    ];
+
+    const OPAQUE: &[PacketKind] = &[
+        PacketKind::LoginSuccess,
+        PacketKind::ConfigKnownPacks,
+        PacketKind::ConfigKnownPacksResponse,
+        PacketKind::JoinGame,
+        PacketKind::Respawn,
+    ];
+
+    #[test]
+    fn test_layout_changes_are_handled() {
+        for (kind, changes) in LAYOUT_CHANGES {
+            if OPAQUE.contains(kind) {
+                continue;
+            }
+            let handled = HANDLED_LAYOUTS
+                .iter()
+                .find(|(k, _)| k == kind)
+                .unwrap_or_else(|| panic!("{kind:?} is neither handled nor opaque"))
+                .1;
+            assert_eq!(
+                handled, *changes,
+                "{kind:?} changes layout at {changes:?}, the code handles {handled:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ids_follow_generated_runs() {
+        let v1_8 = ProtocolVersion(47);
+        let v1_21_4 = ProtocolVersion(769);
+        assert_eq!(PacketKind::SystemChat.id(v1_8), Some(0x02));
+        assert_eq!(PacketKind::PlayDisconnect.id(v1_8), Some(0x40));
+        assert_eq!(PacketKind::SystemChat.id(v1_21_4), Some(0x73));
+        assert_eq!(PacketKind::PlayDisconnect.id(v1_21_4), Some(0x1D));
+        assert_eq!(PacketKind::SetCompression.id(ProtocolVersion(5)), None);
+        assert_eq!(PacketKind::Transfer.id(ProtocolVersion(765)), None);
+        assert_eq!(PacketKind::Handshake.id(ProtocolVersion(9999)), None);
+    }
 }

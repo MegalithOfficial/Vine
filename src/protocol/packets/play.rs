@@ -1,60 +1,49 @@
-use pumpkin_protocol::ServerPacket;
-use pumpkin_protocol::codec::var_int::VarInt;
-use pumpkin_protocol::java::client::play::{
-    ArgumentType, CCommandSuggestions, CCustomPayload, CPlayDisconnect, CStartConfiguration,
-    CSystemChatMessage, CTransfer, CommandSuggestion, ProtoNode, ProtoNodeType,
-    StringProtoArgBehavior, SuggestionProviders,
-};
-use pumpkin_protocol::java::server::play::{SChatCommand, SCommandSuggestion, SCustomPayload};
-use pumpkin_util::text::TextComponent;
+use serde_json::Value;
+use uuid::Uuid;
 
-use super::{Packet, PacketKind, read_error, write_pumpkin};
-use crate::protocol::text::read_component;
+use super::config::empty_packet;
+use super::{Packet, PacketKind, read_only};
+use crate::protocol::generated::STRING_PARSER_IDS;
+use crate::protocol::text::{read_component, write_component};
 use crate::protocol::wire::{ReadExt, WriteExt};
 use crate::protocol::{ProtocolError, ProtocolVersion};
 
-fn read_only(kind: PacketKind, version: ProtocolVersion) -> Result<(), ProtocolError> {
-    Err(ProtocolError::UnsupportedPacket(kind, version))
+const MAX_CHAT_LEN: usize = 256;
+const MAX_SUGGESTION_INPUT_LEN: usize = 32500;
+
+empty_packet!(StartConfiguration, StartConfiguration);
+empty_packet!(ConfigurationAcknowledged, ConfigurationAcknowledged);
+
+macro_rules! leading_string_packet {
+    ($name:ident, $kind:ident, $field:ident) => {
+        #[derive(Clone, Debug)]
+        pub struct $name {
+            pub $field: String,
+        }
+
+        impl Packet for $name {
+            const KIND: PacketKind = PacketKind::$kind;
+
+            fn read(buf: &mut &[u8], _version: ProtocolVersion) -> Result<Self, ProtocolError> {
+                Ok(Self {
+                    $field: buf.read_string_bounded(MAX_CHAT_LEN)?,
+                })
+            }
+
+            fn write(
+                &self,
+                _buf: &mut Vec<u8>,
+                version: ProtocolVersion,
+            ) -> Result<(), ProtocolError> {
+                read_only(Self::KIND, version)
+            }
+        }
+    };
 }
 
-#[derive(Clone, Debug)]
-pub struct ChatCommand {
-    pub command: String,
-}
-
-impl Packet for ChatCommand {
-    const KIND: PacketKind = PacketKind::ChatCommand;
-
-    fn read(buf: &mut &[u8], version: ProtocolVersion) -> Result<Self, ProtocolError> {
-        let packet = SChatCommand::read(buf, &version.to_pumpkin()).map_err(read_error)?;
-        Ok(Self {
-            command: packet.command.to_owned(),
-        })
-    }
-
-    fn write(&self, _buf: &mut Vec<u8>, version: ProtocolVersion) -> Result<(), ProtocolError> {
-        read_only(Self::KIND, version)
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct ChatMessage {
-    pub message: String,
-}
-
-impl Packet for ChatMessage {
-    const KIND: PacketKind = PacketKind::ChatMessage;
-
-    fn read(buf: &mut &[u8], _version: ProtocolVersion) -> Result<Self, ProtocolError> {
-        Ok(Self {
-            message: buf.read_string_bounded(256)?,
-        })
-    }
-
-    fn write(&self, _buf: &mut Vec<u8>, version: ProtocolVersion) -> Result<(), ProtocolError> {
-        read_only(Self::KIND, version)
-    }
-}
+leading_string_packet!(ChatCommand, ChatCommand, command);
+leading_string_packet!(SignedChatCommand, SignedChatCommand, command);
+leading_string_packet!(ChatMessage, ChatMessage, message);
 
 #[derive(Clone, Debug)]
 pub struct CommandSuggestionRequest {
@@ -66,15 +55,46 @@ impl Packet for CommandSuggestionRequest {
     const KIND: PacketKind = PacketKind::CommandSuggestionRequest;
 
     fn read(buf: &mut &[u8], version: ProtocolVersion) -> Result<Self, ProtocolError> {
-        let packet = SCommandSuggestion::read(buf, &version.to_pumpkin()).map_err(read_error)?;
+        if version < ProtocolVersion::V1_13 {
+            return Err(ProtocolError::UnsupportedPacket(Self::KIND, version));
+        }
         Ok(Self {
-            id: packet.id.0,
-            text: packet.command.to_owned(),
+            id: buf.read_varint()?,
+            text: buf.read_string_bounded(MAX_SUGGESTION_INPUT_LEN)?,
         })
     }
 
-    fn write(&self, _buf: &mut Vec<u8>, version: ProtocolVersion) -> Result<(), ProtocolError> {
-        read_only(Self::KIND, version)
+    fn write(&self, buf: &mut Vec<u8>, version: ProtocolVersion) -> Result<(), ProtocolError> {
+        if version < ProtocolVersion::V1_13 {
+            return Err(ProtocolError::UnsupportedPacket(Self::KIND, version));
+        }
+        buf.write_varint(self.id);
+        buf.write_string(&self.text);
+        Ok(())
+    }
+}
+
+fn read_plugin_message(
+    buf: &mut &[u8],
+    version: ProtocolVersion,
+) -> Result<(String, Vec<u8>), ProtocolError> {
+    let channel = buf.read_string()?;
+    let data = if version < ProtocolVersion::V1_8 {
+        let len = usize::try_from(buf.read_i16()?)
+            .map_err(|_| ProtocolError::Malformed("negative plugin message length".into()))?;
+        buf.read_bytes(len)?.to_vec()
+    } else {
+        std::mem::take(buf).to_vec()
+    };
+    Ok((channel, data))
+}
+
+fn write_plugin_message(buf: &mut Vec<u8>, channel: &str, data: &[u8], version: ProtocolVersion) {
+    buf.write_string(channel);
+    if version < ProtocolVersion::V1_8 {
+        buf.write_short_byte_array(data);
+    } else {
+        buf.extend_from_slice(data);
     }
 }
 
@@ -88,15 +108,13 @@ impl Packet for ServerboundPluginMessage {
     const KIND: PacketKind = PacketKind::ServerboundPluginMessage;
 
     fn read(buf: &mut &[u8], version: ProtocolVersion) -> Result<Self, ProtocolError> {
-        let packet = SCustomPayload::read(buf, &version.to_pumpkin()).map_err(read_error)?;
-        Ok(Self {
-            channel: packet.channel.to_owned(),
-            data: packet.data.to_vec(),
-        })
+        let (channel, data) = read_plugin_message(buf, version)?;
+        Ok(Self { channel, data })
     }
 
-    fn write(&self, _buf: &mut Vec<u8>, version: ProtocolVersion) -> Result<(), ProtocolError> {
-        read_only(Self::KIND, version)
+    fn write(&self, buf: &mut Vec<u8>, version: ProtocolVersion) -> Result<(), ProtocolError> {
+        write_plugin_message(buf, &self.channel, &self.data, version);
+        Ok(())
     }
 }
 
@@ -109,26 +127,20 @@ pub struct ClientboundPluginMessage {
 impl Packet for ClientboundPluginMessage {
     const KIND: PacketKind = PacketKind::ClientboundPluginMessage;
 
-    fn read(buf: &mut &[u8], _version: ProtocolVersion) -> Result<Self, ProtocolError> {
-        let channel = buf.read_string()?;
-        Ok(Self {
-            channel,
-            data: std::mem::take(buf).to_vec(),
-        })
+    fn read(buf: &mut &[u8], version: ProtocolVersion) -> Result<Self, ProtocolError> {
+        let (channel, data) = read_plugin_message(buf, version)?;
+        Ok(Self { channel, data })
     }
 
     fn write(&self, buf: &mut Vec<u8>, version: ProtocolVersion) -> Result<(), ProtocolError> {
-        write_pumpkin(
-            &CCustomPayload::new(&self.channel, &self.data),
-            buf,
-            version,
-        )
+        write_plugin_message(buf, &self.channel, &self.data, version);
+        Ok(())
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct PlayDisconnect {
-    pub reason: TextComponent,
+    pub reason: Value,
 }
 
 impl Packet for PlayDisconnect {
@@ -141,13 +153,15 @@ impl Packet for PlayDisconnect {
     }
 
     fn write(&self, buf: &mut Vec<u8>, version: ProtocolVersion) -> Result<(), ProtocolError> {
-        write_pumpkin(&CPlayDisconnect::new(&self.reason), buf, version)
+        write_component(buf, &self.reason, version);
+        Ok(())
     }
 }
 
+// Before 1.19 this is the generic chat packet with a position byte (1 = system, 2 = action bar)
 #[derive(Clone, Debug)]
 pub struct SystemChat {
-    pub content: TextComponent,
+    pub content: Value,
     pub overlay: bool,
 }
 
@@ -156,25 +170,45 @@ impl Packet for SystemChat {
 
     fn read(buf: &mut &[u8], version: ProtocolVersion) -> Result<Self, ProtocolError> {
         let content = read_component(buf, version)?;
-        Ok(Self {
-            content,
-            overlay: buf.read_bool().unwrap_or(false),
-        })
+        let overlay = if version < ProtocolVersion::V1_8 {
+            false
+        } else if version < ProtocolVersion::V1_19 {
+            let position = buf.read_u8()?;
+            if version >= ProtocolVersion::V1_16 {
+                buf.read_uuid()?;
+            }
+            position == 2
+        } else if version < ProtocolVersion::V1_19_1 {
+            buf.read_varint()? == 2
+        } else {
+            buf.read_bool()?
+        };
+        Ok(Self { content, overlay })
     }
 
     fn write(&self, buf: &mut Vec<u8>, version: ProtocolVersion) -> Result<(), ProtocolError> {
-        write_pumpkin(
-            &CSystemChatMessage::new(&self.content, self.overlay),
-            buf,
-            version,
-        )
+        write_component(buf, &self.content, version);
+        if version < ProtocolVersion::V1_8 {
+            return Ok(());
+        }
+        if version < ProtocolVersion::V1_19 {
+            buf.write_u8(if self.overlay { 2 } else { 1 });
+            if version >= ProtocolVersion::V1_16 {
+                buf.write_uuid(&Uuid::nil());
+            }
+        } else if version < ProtocolVersion::V1_19_1 {
+            buf.write_varint(if self.overlay { 2 } else { 1 });
+        } else {
+            buf.write_bool(self.overlay);
+        }
+        Ok(())
     }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Suggestion {
     pub text: String,
-    pub tooltip: Option<TextComponent>,
+    pub tooltip: Option<Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -196,16 +230,15 @@ impl Packet for CommandSuggestions {
         let start = buf.read_varint()?;
         let length = buf.read_varint()?;
         let count = buf.read_varint()?;
-        if !(0..=20000).contains(&count) {
-            return Err(ProtocolError::Malformed(format!(
-                "invalid suggestion count {count}"
-            )));
-        }
-        let mut matches = Vec::with_capacity((count as usize).min(1024));
+        let count = usize::try_from(count)
+            .ok()
+            .filter(|count| *count <= buf.len())
+            .ok_or_else(|| ProtocolError::Malformed(format!("invalid suggestion count {count}")))?;
+        let mut matches = Vec::with_capacity(count);
         for _ in 0..count {
             let text = buf.read_string()?;
             let tooltip = if buf.read_bool()? {
-                read_component(buf, version).ok()
+                Some(read_component(buf, version)?)
             } else {
                 None
             };
@@ -220,36 +253,21 @@ impl Packet for CommandSuggestions {
     }
 
     fn write(&self, buf: &mut Vec<u8>, version: ProtocolVersion) -> Result<(), ProtocolError> {
-        let matches: Box<[CommandSuggestion]> = self
-            .matches
-            .iter()
-            .map(|m| CommandSuggestion {
-                suggestion: m.text.clone(),
-                tooltip: m.tooltip.clone(),
-            })
-            .collect();
-        let packet = CCommandSuggestions::new(
-            VarInt(self.id),
-            VarInt(self.start),
-            VarInt(self.length),
-            matches,
-        );
-        write_pumpkin(&packet, buf, version)
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct StartConfiguration;
-
-impl Packet for StartConfiguration {
-    const KIND: PacketKind = PacketKind::StartConfiguration;
-
-    fn read(_buf: &mut &[u8], _version: ProtocolVersion) -> Result<Self, ProtocolError> {
-        Ok(Self)
-    }
-
-    fn write(&self, buf: &mut Vec<u8>, version: ProtocolVersion) -> Result<(), ProtocolError> {
-        write_pumpkin(&CStartConfiguration, buf, version)
+        if version < ProtocolVersion::V1_13 {
+            return Err(ProtocolError::UnsupportedPacket(Self::KIND, version));
+        }
+        buf.write_varint(self.id);
+        buf.write_varint(self.start);
+        buf.write_varint(self.length);
+        buf.write_varint(self.matches.len() as i32);
+        for m in &self.matches {
+            buf.write_string(&m.text);
+            buf.write_bool(m.tooltip.is_some());
+            if let Some(tooltip) = &m.tooltip {
+                write_component(buf, tooltip, version);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -267,17 +285,88 @@ impl Packet for Transfer {
         let port = buf.read_varint()?;
         Ok(Self {
             host,
-            port: port as u16,
+            port: u16::try_from(port)
+                .map_err(|_| ProtocolError::Malformed(format!("invalid port {port}")))?,
+        })
+    }
+
+    fn write(&self, buf: &mut Vec<u8>, _version: ProtocolVersion) -> Result<(), ProtocolError> {
+        buf.write_string(&self.host);
+        buf.write_varint(i32::from(self.port));
+        Ok(())
+    }
+}
+
+fn read_keep_alive(buf: &mut &[u8], version: ProtocolVersion) -> Result<i64, ProtocolError> {
+    if version < ProtocolVersion::V1_8 {
+        Ok(i64::from(buf.read_i32()?))
+    } else if version < ProtocolVersion::V1_12_2 {
+        Ok(i64::from(buf.read_varint()?))
+    } else {
+        buf.read_i64()
+    }
+}
+
+fn write_keep_alive(buf: &mut Vec<u8>, id: i64, version: ProtocolVersion) {
+    if version < ProtocolVersion::V1_8 {
+        buf.write_i32(id as i32);
+    } else if version < ProtocolVersion::V1_12_2 {
+        buf.write_varint(id as i32);
+    } else {
+        buf.write_i64(id);
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PlayKeepAlive {
+    pub id: i64,
+}
+
+impl Packet for PlayKeepAlive {
+    const KIND: PacketKind = PacketKind::PlayKeepAlive;
+
+    fn read(buf: &mut &[u8], version: ProtocolVersion) -> Result<Self, ProtocolError> {
+        Ok(Self {
+            id: read_keep_alive(buf, version)?,
         })
     }
 
     fn write(&self, buf: &mut Vec<u8>, version: ProtocolVersion) -> Result<(), ProtocolError> {
-        write_pumpkin(
-            &CTransfer::new(&self.host, VarInt(i32::from(self.port))),
-            buf,
-            version,
-        )
+        write_keep_alive(buf, self.id, version);
+        Ok(())
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PlayKeepAliveResponse {
+    pub id: i64,
+}
+
+impl Packet for PlayKeepAliveResponse {
+    const KIND: PacketKind = PacketKind::PlayKeepAliveResponse;
+
+    fn read(buf: &mut &[u8], version: ProtocolVersion) -> Result<Self, ProtocolError> {
+        Ok(Self {
+            id: read_keep_alive(buf, version)?,
+        })
+    }
+
+    fn write(&self, buf: &mut Vec<u8>, version: ProtocolVersion) -> Result<(), ProtocolError> {
+        write_keep_alive(buf, self.id, version);
+        Ok(())
+    }
+}
+
+const NODE_LITERAL: u8 = 0x01;
+const NODE_ARGUMENT: u8 = 0x02;
+const NODE_EXECUTABLE: u8 = 0x04;
+const NODE_SUGGESTIONS: u8 = 0x10;
+const GREEDY_PHRASE: i32 = 2;
+
+fn string_parser_id(version: ProtocolVersion) -> Option<i32> {
+    let idx = STRING_PARSER_IDS.partition_point(|(first, _)| *first <= version.0);
+    let (_, id) = STRING_PARSER_IDS.get(idx.checked_sub(1)?)?;
+    (*id >= 0).then_some(*id)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -285,6 +374,33 @@ pub struct InjectedCommand<'a> {
     pub name: &'a str,
     pub takes_args: bool,
     pub executable_without_args: bool,
+}
+
+fn write_literal(buf: &mut Vec<u8>, name: &str, executable: bool, child: Option<i32>) {
+    let mut flags = NODE_LITERAL;
+    if executable {
+        flags |= NODE_EXECUTABLE;
+    }
+    buf.write_u8(flags);
+    buf.write_varint(i32::from(child.is_some()));
+    if let Some(child) = child {
+        buf.write_varint(child);
+    }
+    buf.write_string(name);
+}
+
+fn write_greedy_argument(buf: &mut Vec<u8>, version: ProtocolVersion) -> Option<()> {
+    buf.write_u8(NODE_ARGUMENT | NODE_EXECUTABLE | NODE_SUGGESTIONS);
+    buf.write_varint(0);
+    buf.write_string("args");
+    if version >= ProtocolVersion::V1_19 {
+        buf.write_varint(string_parser_id(version)?);
+    } else {
+        buf.write_string("brigadier:string");
+    }
+    buf.write_varint(GREEDY_PHRASE);
+    buf.write_string("minecraft:ask_server");
+    Some(())
 }
 
 /// Returns `None` when the backend's tree layout is not one we can safely rewrite.
@@ -318,7 +434,7 @@ pub fn inject_commands(
         return None;
     }
 
-    let mut original_children = Vec::with_capacity(children_count as usize);
+    let mut original_children = Vec::with_capacity((children_count as usize).min(cur.len()));
     for _ in 0..children_count {
         original_children.push(cur.read_varint().ok()?);
     }
@@ -328,62 +444,30 @@ pub fn inject_commands(
     }
 
     let nodes1_to_end = &cur[..cur.len() - 1];
-    let pumpkin_version = version.to_pumpkin();
 
-    let mut next_node_idx = node_count as usize;
+    let mut next_node_idx = node_count;
     let mut new_root_children = Vec::new();
     let mut extra_nodes_buf = Vec::new();
 
     for command in commands {
+        new_root_children.push(next_node_idx);
         if command.takes_args {
-            let lit_node = ProtoNode {
-                children: vec![VarInt((next_node_idx + 1) as i32)].into_boxed_slice(),
-                node_type: ProtoNodeType::Literal {
-                    name: command.name,
-                    is_executable: command.executable_without_args,
-                    redirect_target: None,
-                    restricted: false,
-                },
-            };
-            let arg_node = ProtoNode {
-                children: Vec::new().into_boxed_slice(),
-                node_type: ProtoNodeType::Argument {
-                    name: "args",
-                    is_executable: true,
-                    redirect_target: None,
-                    parser: ArgumentType::String(StringProtoArgBehavior::GreedyPhrase),
-                    override_suggestion_type: Some(SuggestionProviders::AskServer),
-                    restricted: false,
-                },
-            };
-            lit_node
-                .write_to(&mut extra_nodes_buf, &pumpkin_version)
-                .ok()?;
-            arg_node
-                .write_to(&mut extra_nodes_buf, &pumpkin_version)
-                .ok()?;
-            new_root_children.push(next_node_idx as i32);
+            write_literal(
+                &mut extra_nodes_buf,
+                command.name,
+                command.executable_without_args,
+                Some(next_node_idx + 1),
+            );
+            write_greedy_argument(&mut extra_nodes_buf, version)?;
             next_node_idx += 2;
         } else {
-            let lit_node = ProtoNode {
-                children: Vec::new().into_boxed_slice(),
-                node_type: ProtoNodeType::Literal {
-                    name: command.name,
-                    is_executable: true,
-                    redirect_target: None,
-                    restricted: false,
-                },
-            };
-            lit_node
-                .write_to(&mut extra_nodes_buf, &pumpkin_version)
-                .ok()?;
-            new_root_children.push(next_node_idx as i32);
+            write_literal(&mut extra_nodes_buf, command.name, true, None);
             next_node_idx += 1;
         }
     }
 
     let mut new_payload = Vec::with_capacity(payload.len() + extra_nodes_buf.len() + 64);
-    new_payload.write_varint(next_node_idx as i32);
+    new_payload.write_varint(next_node_idx);
     new_payload.push(0x00);
     new_payload.write_varint((original_children.len() + new_root_children.len()) as i32);
     for child in original_children.into_iter().chain(new_root_children) {
@@ -400,57 +484,111 @@ pub fn inject_commands(
 mod tests {
     use super::*;
     use crate::protocol::{decode_packet, encode_packet};
+    use serde_json::json;
 
     const V1_21_4: ProtocolVersion = ProtocolVersion(769);
 
     #[test]
     fn test_command_suggestions_round_trip() {
-        let packet = CommandSuggestions {
-            id: 42,
-            start: 1,
-            length: 3,
-            matches: vec![
-                Suggestion {
-                    text: "say".to_string(),
-                    tooltip: Some(TextComponent::text("broadcast message")),
-                },
-                Suggestion {
-                    text: "spawnpoint".to_string(),
-                    tooltip: None,
-                },
-            ],
-        };
+        for protocol in [393, 764, 765, 777] {
+            let version = ProtocolVersion(protocol);
+            let packet = CommandSuggestions {
+                id: 42,
+                start: 1,
+                length: 3,
+                matches: vec![
+                    Suggestion {
+                        text: "say".to_string(),
+                        tooltip: Some(json!({"text": "broadcast message"})),
+                    },
+                    Suggestion {
+                        text: "spawnpoint".to_string(),
+                        tooltip: None,
+                    },
+                ],
+            };
 
-        let bytes = encode_packet(&packet, V1_21_4).unwrap();
-        let mut cur = &bytes[..];
-        assert!(
-            PacketKind::CommandSuggestionsResponse.matches(cur.read_varint().unwrap(), V1_21_4)
-        );
+            let bytes = encode_packet(&packet, version).unwrap();
+            let mut cur = &bytes[..];
+            assert!(
+                PacketKind::CommandSuggestionsResponse.matches(cur.read_varint().unwrap(), version)
+            );
 
-        let decoded: CommandSuggestions = decode_packet(cur, V1_21_4).unwrap();
-        assert_eq!(decoded.id, 42);
-        assert_eq!(decoded.start, 1);
-        assert_eq!(decoded.length, 3);
-        assert_eq!(decoded.matches.len(), 2);
-        assert_eq!(decoded.matches[0].text, "say");
-        assert!(decoded.matches[0].tooltip.is_some());
-        assert_eq!(decoded.matches[1].text, "spawnpoint");
-        assert!(decoded.matches[1].tooltip.is_none());
+            let decoded: CommandSuggestions = decode_packet(cur, version).unwrap();
+            assert_eq!(decoded.id, 42);
+            assert_eq!(decoded.start, 1);
+            assert_eq!(decoded.length, 3);
+            assert_eq!(decoded.matches, packet.matches);
+        }
     }
 
     #[test]
-    fn test_inject_commands() {
-        // root -> "say"
+    fn test_system_chat_layouts() {
+        for protocol in [5, 47, 735, 759, 760, 765, 777] {
+            let version = ProtocolVersion(protocol);
+            for overlay in [false, true] {
+                let packet = SystemChat {
+                    content: json!({"text": "hello"}),
+                    overlay,
+                };
+                let bytes = encode_packet(&packet, version).unwrap();
+                let mut cur = &bytes[..];
+                cur.read_varint().unwrap();
+                let decoded: SystemChat = decode_packet(cur, version).unwrap();
+                assert_eq!(decoded.content, packet.content, "protocol {protocol}");
+                assert_eq!(
+                    decoded.overlay,
+                    overlay && protocol >= 47,
+                    "protocol {protocol}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_keep_alive_widths() {
+        for (protocol, len) in [(5, 4), (47, 1), (340, 8), (777, 8)] {
+            let version = ProtocolVersion(protocol);
+            let bytes = encode_packet(&PlayKeepAlive { id: 5 }, version).unwrap();
+            let mut cur = &bytes[..];
+            cur.read_varint().unwrap();
+            assert_eq!(cur.len(), len, "protocol {protocol}");
+            let decoded: PlayKeepAliveResponse = decode_packet(cur, version).unwrap();
+            assert_eq!(decoded.id, 5);
+        }
+    }
+
+    #[test]
+    fn test_plugin_message_1_7_length_prefix() {
+        let packet = ClientboundPluginMessage {
+            channel: "MC|Brand".into(),
+            data: vec![1, 2, 3],
+        };
+        for protocol in [5, 47] {
+            let version = ProtocolVersion(protocol);
+            let bytes = encode_packet(&packet, version).unwrap();
+            let mut cur = &bytes[..];
+            cur.read_varint().unwrap();
+            let decoded: ClientboundPluginMessage = decode_packet(cur, version).unwrap();
+            assert_eq!(decoded.data, packet.data);
+        }
+    }
+
+    fn root_with_say() -> Vec<u8> {
         let mut payload = Vec::new();
         payload.write_varint(2);
         payload.write_u8(0x00);
         payload.write_varint(1);
         payload.write_varint(1);
-        payload.write_u8(0x01 | 0x04);
+        payload.write_u8(NODE_LITERAL | NODE_EXECUTABLE);
         payload.write_varint(0);
         payload.write_string("say");
         payload.write_varint(0);
+        payload
+    }
 
+    #[test]
+    fn test_inject_commands() {
         let commands = [
             InjectedCommand {
                 name: "server",
@@ -463,17 +601,49 @@ mod tests {
                 executable_without_args: true,
             },
         ];
-        let injected = inject_commands(&payload, V1_21_4, &commands).unwrap();
+        let injected = inject_commands(&root_with_say(), V1_21_4, &commands).unwrap();
 
         let mut cur = &injected[..];
-        // say, server literal + args, list
         assert_eq!(cur.read_varint().unwrap(), 5);
         assert_eq!(cur.read_u8().unwrap(), 0);
         assert_eq!(cur.read_varint().unwrap(), 3);
         assert_eq!(cur.read_varint().unwrap(), 1);
         assert_eq!(cur.read_varint().unwrap(), 2);
         assert_eq!(cur.read_varint().unwrap(), 4);
-        assert_eq!(injected.last(), Some(&0));
+
+        assert_eq!(cur.read_u8().unwrap(), NODE_LITERAL | NODE_EXECUTABLE);
+        assert_eq!(cur.read_varint().unwrap(), 0);
+        assert_eq!(cur.read_string().unwrap(), "say");
+        assert_eq!(cur.read_u8().unwrap(), NODE_LITERAL | NODE_EXECUTABLE);
+        assert_eq!(cur.read_varint().unwrap(), 1);
+        assert_eq!(cur.read_varint().unwrap(), 3);
+        assert_eq!(cur.read_string().unwrap(), "server");
+        assert_eq!(
+            cur.read_u8().unwrap(),
+            NODE_ARGUMENT | NODE_EXECUTABLE | NODE_SUGGESTIONS
+        );
+        assert_eq!(cur.read_varint().unwrap(), 0);
+        assert_eq!(cur.read_string().unwrap(), "args");
+        assert_eq!(cur.read_varint().unwrap(), 5);
+        assert_eq!(cur.read_varint().unwrap(), GREEDY_PHRASE);
+        assert_eq!(cur.read_string().unwrap(), "minecraft:ask_server");
+        assert_eq!(cur.read_u8().unwrap(), NODE_LITERAL | NODE_EXECUTABLE);
+        assert_eq!(cur.read_varint().unwrap(), 0);
+        assert_eq!(cur.read_string().unwrap(), "list");
+        assert_eq!(cur.read_varint().unwrap(), 0);
+        assert!(cur.is_empty());
+    }
+
+    #[test]
+    fn test_inject_commands_uses_identifier_parser_before_1_19() {
+        let commands = [InjectedCommand {
+            name: "server",
+            takes_args: true,
+            executable_without_args: true,
+        }];
+        let injected = inject_commands(&root_with_say(), ProtocolVersion(404), &commands).unwrap();
+        let needle = b"\x10brigadier:string\x02";
+        assert!(injected.windows(needle.len()).any(|w| w == needle));
     }
 
     #[test]

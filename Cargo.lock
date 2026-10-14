@@ -3060,7 +3060,6 @@ dependencies = [
  "pumpkin-auth",
  "pumpkin-command",
  "pumpkin-plugin-runtime",
- "pumpkin-protocol",
  "pumpkin-util",
  "rand",
  "reqwest",

@@ -1,8 +1,21 @@
-use pumpkin_protocol::java::client::status::{CPingResponse, CStatusResponse};
-
-use super::{Packet, PacketKind, write_pumpkin};
-use crate::protocol::wire::ReadExt;
+use super::{Packet, PacketKind};
+use crate::protocol::wire::{ReadExt, WriteExt};
 use crate::protocol::{ProtocolError, ProtocolVersion};
+
+#[derive(Clone, Copy, Debug)]
+pub struct StatusRequest;
+
+impl Packet for StatusRequest {
+    const KIND: PacketKind = PacketKind::StatusRequest;
+
+    fn read(_buf: &mut &[u8], _version: ProtocolVersion) -> Result<Self, ProtocolError> {
+        Ok(Self)
+    }
+
+    fn write(&self, _buf: &mut Vec<u8>, _version: ProtocolVersion) -> Result<(), ProtocolError> {
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct StatusResponse {
@@ -18,8 +31,9 @@ impl Packet for StatusResponse {
         })
     }
 
-    fn write(&self, buf: &mut Vec<u8>, version: ProtocolVersion) -> Result<(), ProtocolError> {
-        write_pumpkin(&CStatusResponse::new(self.json.clone()), buf, version)
+    fn write(&self, buf: &mut Vec<u8>, _version: ProtocolVersion) -> Result<(), ProtocolError> {
+        buf.write_string(&self.json);
+        Ok(())
     }
 }
 
@@ -38,7 +52,7 @@ impl Packet for PingRequest {
     }
 
     fn write(&self, buf: &mut Vec<u8>, _version: ProtocolVersion) -> Result<(), ProtocolError> {
-        buf.extend_from_slice(&self.payload.to_be_bytes());
+        buf.write_i64(self.payload);
         Ok(())
     }
 }
@@ -57,7 +71,8 @@ impl Packet for PongResponse {
         })
     }
 
-    fn write(&self, buf: &mut Vec<u8>, version: ProtocolVersion) -> Result<(), ProtocolError> {
-        write_pumpkin(&CPingResponse::new(self.payload), buf, version)
+    fn write(&self, buf: &mut Vec<u8>, _version: ProtocolVersion) -> Result<(), ProtocolError> {
+        buf.write_i64(self.payload);
+        Ok(())
     }
 }

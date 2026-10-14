@@ -35,6 +35,7 @@ use crate::protocol::packets::play::{
     CommandSuggestions, InjectedCommand, PlayDisconnect, ServerboundPluginMessage,
     StartConfiguration, Suggestion, SystemChat, Transfer, inject_commands,
 };
+use crate::protocol::text::{component_json, plain_text};
 use crate::protocol::{
     Packet, PacketKind, PacketReader, PacketWriter, ProtocolError, ProtocolVersion, decode_packet,
     encode_packet,
@@ -223,6 +224,7 @@ impl BackendBridge {
         let login_start = LoginStart {
             name: self.player.username.clone(),
             uuid: Some(self.player.id),
+            profile_key: None,
         };
         backend_writer
             .send(encode_packet(&login_start, version)?)
@@ -512,7 +514,7 @@ impl BackendBridge {
                         send_best_effort(
                             &mut client_writer,
                             &SystemChat {
-                                content: msg,
+                                content: component_json(&msg, self.client_version),
                                 overlay: false,
                             },
                             self.client_version,
@@ -532,7 +534,7 @@ impl BackendBridge {
                             send_best_effort(
                                 &mut client_writer,
                                 &SystemChat {
-                                    content: msg,
+                                    content: component_json(&msg, self.client_version),
                                     overlay: false,
                                 },
                                 self.client_version,
@@ -582,7 +584,7 @@ impl BackendBridge {
                             send_best_effort(
                                 &mut client_writer,
                                 &SystemChat {
-                                    content: msg,
+                                    content: component_json(&msg, self.client_version),
                                     overlay: false,
                                 },
                                 self.client_version,
@@ -661,7 +663,7 @@ impl BackendBridge {
                         send_best_effort(
                             &mut client_writer,
                             &SystemChat {
-                                content: notice,
+                                content: component_json(&notice, self.client_version),
                                 overlay: false,
                             },
                             self.client_version,
@@ -752,9 +754,11 @@ impl BackendBridge {
         if is_config_state {
             let reason =
                 TextComponent::text(format!("[Vine Proxy] {reason}")).color_named(NamedColor::Red);
+            let reason = component_json(&reason, version);
             send_best_effort(writer, &ConfigDisconnect { reason }, version).await;
         } else {
             let reason = TextComponent::text(reason.to_string());
+            let reason = component_json(&reason, version);
             send_best_effort(writer, &PlayDisconnect { reason }, version).await;
         }
     }
@@ -941,7 +945,9 @@ impl BackendBridge {
                                         .into_iter()
                                         .map(|s| Suggestion {
                                             text: s.text.cached_text().clone(),
-                                            tooltip: s.tooltip,
+                                            tooltip: s
+                                                .tooltip
+                                                .map(|t| component_json(&t, client_version)),
                                         })
                                         .collect(),
                                 };
@@ -993,7 +999,12 @@ impl BackendBridge {
                                                     .into_iter()
                                                     .map(|(cmd, tip)| Suggestion {
                                                         text: cmd,
-                                                        tooltip: tip.map(TextComponent::text),
+                                                        tooltip: tip.map(|t| {
+                                                            component_json(
+                                                                &TextComponent::text(t),
+                                                                client_version,
+                                                            )
+                                                        }),
                                                     })
                                                     .collect(),
                                             };
@@ -1030,7 +1041,7 @@ impl BackendBridge {
                                 &raw_packet.payload,
                                 client_version,
                             )
-                            .map(|d| d.reason.to_pretty_console())
+                            .map(|d| plain_text(&d.reason))
                             .ok()
                             .or_else(|| {
                                 let s = String::from_utf8_lossy(&raw_packet.payload).to_string();
@@ -1053,6 +1064,7 @@ impl BackendBridge {
                             merge_suggestions(
                                 &mut backend_suggestions.matches,
                                 pending.proxy_matches,
+                                client_version,
                             );
                             if let Ok(bytes) = encode_packet(&backend_suggestions, client_version) {
                                 if client_tx.send(bytes).is_err() {
@@ -1120,7 +1132,7 @@ impl BackendBridge {
                     }
                     PlayerAction::Message(content) => {
                         let chat_msg = SystemChat {
-                            content,
+                            content: component_json(&content, client_version),
                             overlay: false,
                         };
                         if let Ok(bytes) = encode_packet(&chat_msg, client_version) {
@@ -1129,7 +1141,10 @@ impl BackendBridge {
                     }
                     PlayerAction::Disconnect(reason) => {
                         let disconnect = PlayDisconnect {
-                            reason: TextComponent::text(reason.clone()),
+                            reason: component_json(
+                                &TextComponent::text(reason.clone()),
+                                client_version,
+                            ),
                         };
                         if let Ok(bytes) = encode_packet(&disconnect, client_version) {
                             let _ = client_tx.send(bytes);
@@ -1163,6 +1178,7 @@ impl BackendBridge {
 fn merge_suggestions(
     backend_matches: &mut Vec<Suggestion>,
     proxy_matches: Vec<(String, Option<String>)>,
+    version: ProtocolVersion,
 ) {
     for (cmd_name, tooltip) in proxy_matches {
         if !backend_matches
@@ -1171,7 +1187,7 @@ fn merge_suggestions(
         {
             backend_matches.push(Suggestion {
                 text: cmd_name,
-                tooltip: tooltip.map(TextComponent::text),
+                tooltip: tooltip.map(|t| component_json(&TextComponent::text(t), version)),
             });
         }
     }
@@ -1206,6 +1222,7 @@ mod tests {
                     Some("Send players to a backend".to_string()),
                 ),
             ],
+            ProtocolVersion(769),
         );
 
         let names: Vec<&str> = backend_matches.iter().map(|m| m.text.as_str()).collect();

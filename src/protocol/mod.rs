@@ -1,5 +1,6 @@
 pub mod bedrock;
 pub mod codec;
+mod generated;
 pub mod packets;
 pub mod text;
 pub mod version;

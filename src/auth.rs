@@ -1,5 +1,8 @@
 use num_bigint::BigInt;
-use rsa::{Pkcs1v15Encrypt, RsaPrivateKey, pkcs8::EncodePublicKey};
+use rsa::pkcs1v15::{Signature, VerifyingKey};
+use rsa::pkcs8::{DecodePublicKey, EncodePublicKey};
+use rsa::signature::Verifier;
+use rsa::{Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey};
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::{net::IpAddr, time::Duration};
@@ -64,6 +67,26 @@ impl KeyStore {
 
         BigInt::from_signed_bytes_be(&digest).to_str_radix(16)
     }
+}
+
+// 1.19-1.19.2 clients sign `verify_token ++ salt` with their profile key (SHA256withRSA)
+pub fn verify_signed_token(
+    public_key_der: &[u8],
+    verify_token: &[u8],
+    salt: i64,
+    signature: &[u8],
+) -> bool {
+    let Ok(key) = RsaPublicKey::from_public_key_der(public_key_der) else {
+        return false;
+    };
+    let Ok(signature) = Signature::try_from(signature) else {
+        return false;
+    };
+    let mut message = verify_token.to_vec();
+    message.extend_from_slice(&salt.to_be_bytes());
+    VerifyingKey::<sha2::Sha256>::new(key)
+        .verify(&message, &signature)
+        .is_ok()
 }
 
 #[derive(Clone, Debug, Serialize)]

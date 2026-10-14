@@ -1,13 +1,14 @@
 use std::fmt;
 
-use pumpkin_util::version::JavaMinecraftVersion;
+use super::generated::RELEASES;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProtocolVersion(pub u32);
 
 impl ProtocolVersion {
-    pub const V1_7_2: Self = Self(4);
+    pub const V1_7_6: Self = Self(5);
     pub const V1_8: Self = Self(47);
+    pub const V1_9: Self = Self(107);
     pub const V1_12_2: Self = Self(340);
     pub const V1_13: Self = Self(393);
     pub const V1_16: Self = Self(735);
@@ -17,30 +18,58 @@ impl ProtocolVersion {
     pub const V1_20_2: Self = Self(764);
     pub const V1_20_3: Self = Self(765);
     pub const V1_20_5: Self = Self(766);
+    pub const V1_21_6: Self = Self(771);
 
     pub fn from_handshake(raw: i32) -> Self {
         Self(raw.max(0) as u32)
     }
 
+    pub fn oldest() -> Self {
+        Self(RELEASES[0].0)
+    }
+
+    pub fn latest() -> Self {
+        Self(RELEASES[RELEASES.len() - 1].0)
+    }
+
     pub fn is_known(self) -> bool {
-        self.to_pumpkin() != JavaMinecraftVersion::Unknown
+        RELEASES.binary_search_by_key(&self.0, |(p, _)| *p).is_ok()
     }
 
     pub fn name(self) -> String {
-        if self.is_known() {
-            self.to_pumpkin().to_string()
-        } else {
-            format!("unknown ({})", self.0)
+        match RELEASES.binary_search_by_key(&self.0, |(p, _)| *p) {
+            Ok(i) => RELEASES[i].1.to_string(),
+            Err(_) => format!("unknown ({})", self.0),
         }
     }
 
-    pub(crate) fn to_pumpkin(self) -> JavaMinecraftVersion {
-        JavaMinecraftVersion::from_protocol(self.0)
+    pub fn supported_range() -> String {
+        let first = RELEASES[0].1.split('-').next().unwrap_or_default();
+        let last = RELEASES[RELEASES.len() - 1]
+            .1
+            .rsplit('-')
+            .next()
+            .unwrap_or_default();
+        format!("{first}-{last}")
     }
 }
 
 impl fmt::Display for ProtocolVersion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} (protocol {})", self.name(), self.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_known_versions() {
+        assert!(ProtocolVersion(47).is_known());
+        assert_eq!(ProtocolVersion(47).name(), "1.8-1.8.9");
+        assert!(!ProtocolVersion(4).is_known());
+        assert!(!ProtocolVersion(9999).is_known());
+        assert!(ProtocolVersion::oldest() < ProtocolVersion::latest());
     }
 }

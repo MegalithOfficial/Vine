@@ -337,19 +337,11 @@ impl CommandDispatcher {
     }
 
     /// Returns suggestions for the command string
-    pub fn suggest(
-        &self,
-        input: &str,
-        source: &ProxyCommandSource,
-    ) -> Vec<crate::protocol::packets::play::Suggestion> {
-        let suggestions = self.suggest_command(input, source);
-        suggestions
+    pub fn suggest(&self, input: &str, source: &ProxyCommandSource) -> Vec<String> {
+        self.suggest_command(input, source)
             .suggestions
             .into_iter()
-            .map(|s| crate::protocol::packets::play::Suggestion {
-                text: s.text.cached_text().clone(),
-                tooltip: s.tooltip,
-            })
+            .map(|s| s.text.cached_text().clone())
             .collect()
     }
 

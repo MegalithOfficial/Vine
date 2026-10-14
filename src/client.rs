@@ -9,7 +9,7 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
-use crate::auth::{AuthenticatedPlayer, Authenticator, KeyStore};
+use crate::auth::{AuthenticatedPlayer, Authenticator, KeyStore, verify_signed_token};
 use crate::backend::{BackendBridge, Router};
 use crate::command::CommandDispatcher;
 use crate::config::Config;
@@ -19,6 +19,7 @@ use crate::plugin::api::{PlayerLoginEvent, PlayerPreLoginEvent, ProxyPingEvent};
 use crate::protocol::packets::handshake::{Handshake, HandshakeIntent};
 use crate::protocol::packets::login::{
     EncryptionRequest, EncryptionResponse, LoginDisconnect, LoginStart, SetCompression,
+    Verification,
 };
 use crate::protocol::packets::status::{PingRequest, PongResponse};
 use crate::protocol::{
@@ -212,7 +213,7 @@ impl ClientHandler {
             .map_err(|_| ClientError::Timeout)??;
 
         let login_start: LoginStart = decode_packet(&raw_login_start.payload, client_version)?;
-        let username = login_start.name;
+        let username = login_start.name.clone();
 
         let mut pre_login_event = PlayerPreLoginEvent {
             client_ip: client_ip.to_string(),
@@ -276,12 +277,19 @@ impl ClientHandler {
             let enc_resp: EncryptionResponse =
                 decode_packet(&raw_enc_resp.payload, client_version)?;
 
-            let decrypted_token = self
-                .keystore
-                .decrypt(&enc_resp.verify_token)
-                .map_err(|e| ClientError::AuthError(e.to_string()))?;
+            let token_valid = match &enc_resp.verification {
+                Verification::Token(encrypted) => self
+                    .keystore
+                    .decrypt(encrypted)
+                    .is_ok_and(|token| token == verify_token),
+                Verification::Signature { salt, signature } => {
+                    login_start.profile_key.as_ref().is_some_and(|key| {
+                        verify_signed_token(&key.public_key, &verify_token, *salt, signature)
+                    })
+                }
+            };
 
-            if decrypted_token != verify_token {
+            if !token_valid {
                 warn!(
                     "[{}] Verify token mismatch for '{}'",
                     self.peer_addr, username
