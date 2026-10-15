@@ -1,6 +1,6 @@
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -28,6 +28,7 @@ use crate::plugin::api::{
 };
 use crate::protocol::packets::config::ConfigDisconnect;
 use crate::protocol::packets::handshake::{Handshake, HandshakeIntent};
+use crate::protocol::packets::login::LoginDisconnect as LoginKick;
 use crate::protocol::packets::login::{
     LoginDisconnect, LoginPluginRequest, LoginPluginResponse, LoginStart, SetCompression,
 };
@@ -404,6 +405,11 @@ impl BackendBridge {
 
         // Forward login success packet to the client
         client_writer.send(success_bytes).await?;
+        let phase = PhaseCell::new(if self.client_version >= ProtocolVersion::V1_20_2 {
+            Phase::Login
+        } else {
+            Phase::Play
+        });
 
         self.online_players.fetch_add(1, Ordering::Relaxed);
         info!(
@@ -450,6 +456,7 @@ impl BackendBridge {
                 self.plugin_manager.clone(),
                 self.player.id,
                 current_server_name.clone(),
+                &phase,
             )
             .await;
 
@@ -472,7 +479,7 @@ impl BackendBridge {
                     Self::disconnect_client(
                         &mut client_writer,
                         self.client_version,
-                        false,
+                        phase.get(),
                         &reason,
                     )
                     .await;
@@ -633,7 +640,7 @@ impl BackendBridge {
                                         Self::disconnect_client(
                                             &mut client_writer,
                                             self.client_version,
-                                            false,
+                                            phase.get(),
                                             &kick_reason,
                                         )
                                         .await;
@@ -711,7 +718,7 @@ impl BackendBridge {
                                 Self::disconnect_client(
                                     &mut client_writer,
                                     self.client_version,
-                                    false,
+                                    phase.get(),
                                     &kick_reason,
                                 )
                                 .await;
@@ -723,7 +730,7 @@ impl BackendBridge {
                         Self::disconnect_client(
                             &mut client_writer,
                             self.client_version,
-                            false,
+                            phase.get(),
                             reason_str,
                         )
                         .await;
@@ -756,18 +763,27 @@ impl BackendBridge {
     async fn disconnect_client<W: AsyncWrite + Unpin>(
         writer: &mut PacketWriter<W>,
         version: ProtocolVersion,
-        is_config_state: bool,
+        phase: Phase,
         reason: &str,
     ) {
-        if is_config_state {
-            let reason =
-                TextComponent::text(format!("[Vine Proxy] {reason}")).color_named(NamedColor::Red);
-            let reason = component_json(&reason, version);
-            send_best_effort(writer, &ConfigDisconnect { reason }, version).await;
-        } else {
-            let reason = TextComponent::text(reason.to_string());
-            let reason = component_json(&reason, version);
-            send_best_effort(writer, &PlayDisconnect { reason }, version).await;
+        match phase {
+            Phase::Login => {
+                let kick = LoginKick {
+                    reason_json: crate::client::kick_reason_json(reason),
+                };
+                send_best_effort(writer, &kick, version).await;
+            }
+            Phase::Config => {
+                let reason = TextComponent::text(format!("[Vine Proxy] {reason}"))
+                    .color_named(NamedColor::Red);
+                let reason = component_json(&reason, version);
+                send_best_effort(writer, &ConfigDisconnect { reason }, version).await;
+            }
+            Phase::Play => {
+                let reason = TextComponent::text(reason.to_string());
+                let reason = component_json(&reason, version);
+                send_best_effort(writer, &PlayDisconnect { reason }, version).await;
+            }
         }
     }
 }
@@ -782,6 +798,46 @@ async fn send_best_effort<P: Packet, W: AsyncWrite + Unpin>(
             let _ = timeout(CLIENT_WRITE_TIMEOUT, writer.send(bytes)).await;
         }
         Err(e) => debug!("Skipping {:?} for {}: {}", P::KIND, version, e),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    Login,
+    Config,
+    Play,
+}
+
+struct PhaseCell(AtomicU8);
+
+impl PhaseCell {
+    fn new(phase: Phase) -> Self {
+        Self(AtomicU8::new(phase as u8))
+    }
+
+    fn get(&self) -> Phase {
+        match self.0.load(Ordering::Acquire) {
+            0 => Phase::Login,
+            1 => Phase::Config,
+            _ => Phase::Play,
+        }
+    }
+
+    fn set(&self, phase: Phase) {
+        self.0.store(phase as u8, Ordering::Release);
+    }
+}
+
+// The client's acknowledgements mark every phase change; the backend switches only after
+// receiving them, so updating the phase before forwarding keeps both directions in step.
+fn serverbound_transition(phase: Phase, id: i32, version: ProtocolVersion) -> Option<Phase> {
+    match phase {
+        Phase::Login if PacketKind::LoginAcknowledged.matches(id, version) => Some(Phase::Config),
+        Phase::Config if PacketKind::ConfigFinishAck.matches(id, version) => Some(Phase::Play),
+        Phase::Play if PacketKind::ConfigurationAcknowledged.matches(id, version) => {
+            Some(Phase::Config)
+        }
+        _ => None,
     }
 }
 
@@ -837,6 +893,7 @@ impl BackendBridge {
         plugin_manager: Arc<PluginManager>,
         player_uuid: uuid::Uuid,
         current_server_name: String,
+        phase: &PhaseCell,
     ) -> Result<TunnelExit, BridgeError>
     where
         R1: AsyncRead + Unpin,
@@ -881,16 +938,24 @@ impl BackendBridge {
                             return TunnelExit::ClientDisconnected;
                         }
 
-                        let chat_message =
-                            if PacketKind::ChatMessage.matches(raw_packet.id, client_version) {
+                        let current = phase.get();
+                        if let Some(next) =
+                            serverbound_transition(current, raw_packet.id, client_version)
+                        {
+                            phase.set(next);
+                        } else if current == Phase::Play {
+                            let chat_message = if PacketKind::ChatMessage
+                                .matches(raw_packet.id, client_version)
+                            {
                                 decode_packet::<ChatMessage>(&raw_packet.payload, client_version)
                                     .ok()
                                     .map(|m| m.message)
                             } else {
                                 None
                             };
-                        let command =
-                            if PacketKind::ChatCommand.matches(raw_packet.id, client_version) {
+                            let command = if PacketKind::ChatCommand
+                                .matches(raw_packet.id, client_version)
+                            {
                                 decode_packet::<ChatCommand>(&raw_packet.payload, client_version)
                                     .ok()
                                     .map(|c| c.command)
@@ -904,24 +969,79 @@ impl BackendBridge {
                                 None
                             };
 
-                        if let Some(command) = command {
-                            let mut cmd_event = PlayerCommandEvent {
-                                uuid: player_uuid.to_string(),
-                                username: username.to_string(),
-                                command,
-                                cancelled: false,
-                            };
-                            plugin_manager.fire_player_command(&mut cmd_event).await;
-                            if cmd_event.cancelled {
-                                continue;
+                            if let Some(command) = command {
+                                let mut cmd_event = PlayerCommandEvent {
+                                    uuid: player_uuid.to_string(),
+                                    username: username.to_string(),
+                                    command,
+                                    cancelled: false,
+                                };
+                                plugin_manager.fire_player_command(&mut cmd_event).await;
+                                if cmd_event.cancelled {
+                                    continue;
+                                }
+
+                                let first_word = cmd_event
+                                    .command
+                                    .split_whitespace()
+                                    .next()
+                                    .unwrap_or(&cmd_event.command);
+                                if command_dispatcher.has_command(first_word) {
+                                    let source = ProxyCommandSource {
+                                        sender: CommandSender::Player {
+                                            username: username.to_string(),
+                                            action_tx: action_tx.clone(),
+                                        },
+                                        config: proxy_config.clone(),
+                                        session_manager: session_manager.clone(),
+                                    };
+                                    command_dispatcher.handle_command(&source, &cmd_event.command);
+                                    continue;
+                                }
+                            } else if let Some(message) = chat_message {
+                                let mut chat_event = PlayerChatEvent {
+                                    uuid: player_uuid.to_string(),
+                                    username: username.to_string(),
+                                    message,
+                                    cancelled: false,
+                                };
+                                plugin_manager.fire_player_chat(&mut chat_event).await;
+                                if chat_event.cancelled {
+                                    continue;
+                                }
                             }
 
-                            let first_word = cmd_event
-                                .command
-                                .split_whitespace()
-                                .next()
-                                .unwrap_or(&cmd_event.command);
-                            if command_dispatcher.has_command(first_word) {
+                            if PacketKind::ServerboundPluginMessage
+                                .matches(raw_packet.id, client_version)
+                                && let Ok(custom_payload) = decode_packet::<ServerboundPluginMessage>(
+                                    &raw_packet.payload,
+                                    client_version,
+                                )
+                            {
+                                let mut msg_event = PluginMessageEvent {
+                                    channel: custom_payload.channel,
+                                    data: custom_payload.data,
+                                    player_uuid: Some(player_uuid.to_string()),
+                                    server_name: Some(current_server_name.clone()),
+                                    cancelled: false,
+                                };
+                                plugin_manager.fire_plugin_message(&mut msg_event).await;
+                                if msg_event.cancelled {
+                                    continue;
+                                }
+                            }
+
+                            if PacketKind::CommandSuggestionRequest
+                                .matches(raw_packet.id, client_version)
+                                && let Ok(suggestion_req) = decode_packet::<CommandSuggestionRequest>(
+                                    &raw_packet.payload,
+                                    client_version,
+                                )
+                            {
+                                let raw_cmd = &suggestion_req.text;
+                                let clean_cmd = raw_cmd.strip_prefix('/').unwrap_or(raw_cmd);
+                                let first_word =
+                                    clean_cmd.split_whitespace().next().unwrap_or(clean_cmd);
                                 let source = ProxyCommandSource {
                                     sender: CommandSender::Player {
                                         username: username.to_string(),
@@ -930,147 +1050,94 @@ impl BackendBridge {
                                     config: proxy_config.clone(),
                                     session_manager: session_manager.clone(),
                                 };
-                                command_dispatcher.handle_command(&source, &cmd_event.command);
-                                continue;
-                            }
-                        } else if let Some(message) = chat_message {
-                            let mut chat_event = PlayerChatEvent {
-                                uuid: player_uuid.to_string(),
-                                username: username.to_string(),
-                                message,
-                                cancelled: false,
-                            };
-                            plugin_manager.fire_player_chat(&mut chat_event).await;
-                            if chat_event.cancelled {
-                                continue;
-                            }
-                        }
 
-                        if PacketKind::ServerboundPluginMessage
-                            .matches(raw_packet.id, client_version)
-                            && let Ok(custom_payload) = decode_packet::<ServerboundPluginMessage>(
-                                &raw_packet.payload,
-                                client_version,
-                            )
-                        {
-                            let mut msg_event = PluginMessageEvent {
-                                channel: custom_payload.channel,
-                                data: custom_payload.data,
-                                player_uuid: Some(player_uuid.to_string()),
-                                server_name: Some(current_server_name.clone()),
-                                cancelled: false,
-                            };
-                            plugin_manager.fire_plugin_message(&mut msg_event).await;
-                            if msg_event.cancelled {
-                                continue;
-                            }
-                        }
-
-                        if PacketKind::CommandSuggestionRequest
-                            .matches(raw_packet.id, client_version)
-                            && let Ok(suggestion_req) = decode_packet::<CommandSuggestionRequest>(
-                                &raw_packet.payload,
-                                client_version,
-                            )
-                        {
-                            let raw_cmd = &suggestion_req.text;
-                            let clean_cmd = raw_cmd.strip_prefix('/').unwrap_or(raw_cmd);
-                            let first_word =
-                                clean_cmd.split_whitespace().next().unwrap_or(clean_cmd);
-                            let source = ProxyCommandSource {
-                                sender: CommandSender::Player {
-                                    username: username.to_string(),
-                                    action_tx: action_tx.clone(),
-                                },
-                                config: proxy_config.clone(),
-                                session_manager: session_manager.clone(),
-                            };
-
-                            // 1. Arguments to a proxy command (contains a space, e.g. "/server ", "/send ")
-                            if clean_cmd.contains(' ') && command_dispatcher.has_command(first_word)
-                            {
-                                let suggestions =
-                                    command_dispatcher.suggest_with_range(clean_cmd, &source);
-                                let offset = if raw_cmd.starts_with('/') { 1 } else { 0 };
-                                let response = CommandSuggestions {
-                                    id: suggestion_req.id,
-                                    start: (suggestions.range.start + offset) as i32,
-                                    length: suggestions.range.len() as i32,
-                                    matches: suggestions
-                                        .suggestions
-                                        .into_iter()
-                                        .map(|s| Suggestion {
-                                            text: s.text.cached_text().clone(),
-                                            tooltip: s
-                                                .tooltip
-                                                .map(|t| component_json(&t, client_version)),
-                                        })
-                                        .collect(),
-                                };
-                                if let Ok(bytes) = encode_packet(&response, client_version) {
-                                    client_tx.send(bytes).await;
-                                }
-                                continue;
-                            }
-
-                            // 2. Root command name completion (no space, e.g. "/", "/s", "/ser", "/server")
-                            if !clean_cmd.contains(' ') {
-                                let clean_lower = clean_cmd.to_ascii_lowercase();
-                                let permitted =
-                                    command_dispatcher.get_all_permitted_commands(&source);
-                                let proxy_matches: Vec<(String, Option<String>)> = permitted
-                                    .into_iter()
-                                    .filter(|(cmd_name, _)| cmd_name.starts_with(&clean_lower))
-                                    .map(|(cmd_name, description)| {
-                                        (cmd_name.to_string(), Some(description.to_string()))
-                                    })
-                                    .collect();
-
-                                if !proxy_matches.is_empty() {
+                                // 1. Arguments to a proxy command (contains a space, e.g. "/server ", "/send ")
+                                if clean_cmd.contains(' ')
+                                    && command_dispatcher.has_command(first_word)
+                                {
+                                    let suggestions =
+                                        command_dispatcher.suggest_with_range(clean_cmd, &source);
                                     let offset = if raw_cmd.starts_with('/') { 1 } else { 0 };
-                                    let req_id = suggestion_req.id;
+                                    let response = CommandSuggestions {
+                                        id: suggestion_req.id,
+                                        start: (suggestions.range.start + offset) as i32,
+                                        length: suggestions.range.len() as i32,
+                                        matches: suggestions
+                                            .suggestions
+                                            .into_iter()
+                                            .map(|s| Suggestion {
+                                                text: s.text.cached_text().clone(),
+                                                tooltip: s
+                                                    .tooltip
+                                                    .map(|t| component_json(&t, client_version)),
+                                            })
+                                            .collect(),
+                                    };
+                                    if let Ok(bytes) = encode_packet(&response, client_version) {
+                                        client_tx.send(bytes).await;
+                                    }
+                                    continue;
+                                }
 
-                                    pending_suggestions.lock().await.insert(
-                                        req_id,
-                                        PendingSuggestion {
-                                            clean_cmd: clean_cmd.to_string(),
-                                            offset,
-                                            proxy_matches,
-                                        },
-                                    );
+                                // 2. Root command name completion (no space, e.g. "/", "/s", "/ser", "/server")
+                                if !clean_cmd.contains(' ') {
+                                    let clean_lower = clean_cmd.to_ascii_lowercase();
+                                    let permitted =
+                                        command_dispatcher.get_all_permitted_commands(&source);
+                                    let proxy_matches: Vec<(String, Option<String>)> = permitted
+                                        .into_iter()
+                                        .filter(|(cmd_name, _)| cmd_name.starts_with(&clean_lower))
+                                        .map(|(cmd_name, description)| {
+                                            (cmd_name.to_string(), Some(description.to_string()))
+                                        })
+                                        .collect();
 
-                                    let pending_ref = pending_suggestions.clone();
-                                    let client_tx_clone = client_tx.clone();
-                                    tokio::spawn(async move {
-                                        tokio::time::sleep(Duration::from_millis(200)).await;
-                                        if let Some(pending) =
-                                            pending_ref.lock().await.remove(&req_id)
-                                        {
-                                            let response = CommandSuggestions {
-                                                id: req_id,
-                                                start: pending.offset as i32,
-                                                length: pending.clean_cmd.len() as i32,
-                                                matches: pending
-                                                    .proxy_matches
-                                                    .into_iter()
-                                                    .map(|(cmd, tip)| Suggestion {
-                                                        text: cmd,
-                                                        tooltip: tip.map(|t| {
-                                                            component_json(
-                                                                &TextComponent::text(t),
-                                                                client_version,
-                                                            )
-                                                        }),
-                                                    })
-                                                    .collect(),
-                                            };
-                                            if let Ok(bytes) =
-                                                encode_packet(&response, client_version)
+                                    if !proxy_matches.is_empty() {
+                                        let offset = if raw_cmd.starts_with('/') { 1 } else { 0 };
+                                        let req_id = suggestion_req.id;
+
+                                        pending_suggestions.lock().await.insert(
+                                            req_id,
+                                            PendingSuggestion {
+                                                clean_cmd: clean_cmd.to_string(),
+                                                offset,
+                                                proxy_matches,
+                                            },
+                                        );
+
+                                        let pending_ref = pending_suggestions.clone();
+                                        let client_tx_clone = client_tx.clone();
+                                        tokio::spawn(async move {
+                                            tokio::time::sleep(Duration::from_millis(200)).await;
+                                            if let Some(pending) =
+                                                pending_ref.lock().await.remove(&req_id)
                                             {
-                                                client_tx_clone.send(bytes).await;
+                                                let response = CommandSuggestions {
+                                                    id: req_id,
+                                                    start: pending.offset as i32,
+                                                    length: pending.clean_cmd.len() as i32,
+                                                    matches: pending
+                                                        .proxy_matches
+                                                        .into_iter()
+                                                        .map(|(cmd, tip)| Suggestion {
+                                                            text: cmd,
+                                                            tooltip: tip.map(|t| {
+                                                                component_json(
+                                                                    &TextComponent::text(t),
+                                                                    client_version,
+                                                                )
+                                                            }),
+                                                        })
+                                                        .collect(),
+                                                };
+                                                if let Ok(bytes) =
+                                                    encode_packet(&response, client_version)
+                                                {
+                                                    client_tx_clone.send(bytes).await;
+                                                }
                                             }
-                                        }
-                                    });
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -1092,74 +1159,97 @@ impl BackendBridge {
             loop {
                 match backend_reader.read_packet().await {
                     Ok(raw_packet) => {
-                        if PacketKind::PlayDisconnect.matches(raw_packet.id, client_version) {
-                            let reason = decode_packet::<PlayDisconnect>(
+                        let current = phase.get();
+                        if current == Phase::Config
+                            && PacketKind::ConfigDisconnect.matches(raw_packet.id, client_version)
+                        {
+                            let reason = decode_packet::<ConfigDisconnect>(
                                 &raw_packet.payload,
                                 client_version,
                             )
                             .map(|d| plain_text(&d.reason))
-                            .ok()
-                            .or_else(|| {
-                                let s = String::from_utf8_lossy(&raw_packet.payload).to_string();
-                                if s.is_empty() { None } else { Some(s) }
-                            });
+                            .ok();
                             return TunnelExit::BackendDisconnected { reason };
                         }
 
-                        if PacketKind::CommandSuggestionsResponse
-                            .matches(raw_packet.id, client_version)
-                            && let Ok(mut backend_suggestions) = decode_packet::<CommandSuggestions>(
-                                &raw_packet.payload,
-                                client_version,
-                            )
-                            && let Some(pending) = pending_suggestions
-                                .lock()
-                                .await
-                                .remove(&backend_suggestions.id)
-                        {
-                            merge_suggestions(
-                                &mut backend_suggestions.matches,
-                                pending.proxy_matches,
-                                client_version,
-                            );
-                            if let Ok(bytes) = encode_packet(&backend_suggestions, client_version) {
-                                if !client_tx.send(bytes).await {
-                                    return TunnelExit::ClientDisconnected;
-                                }
-                                continue;
+                        if current == Phase::Play {
+                            if PacketKind::PlayDisconnect.matches(raw_packet.id, client_version) {
+                                let reason = decode_packet::<PlayDisconnect>(
+                                    &raw_packet.payload,
+                                    client_version,
+                                )
+                                .map(|d| plain_text(&d.reason))
+                                .ok()
+                                .or_else(|| {
+                                    let s =
+                                        String::from_utf8_lossy(&raw_packet.payload).to_string();
+                                    if s.is_empty() { None } else { Some(s) }
+                                });
+                                return TunnelExit::BackendDisconnected { reason };
                             }
-                        }
 
-                        if PacketKind::Commands.matches(raw_packet.id, client_version) {
-                            let source = ProxyCommandSource {
-                                sender: CommandSender::Player {
-                                    username: username.to_string(),
-                                    action_tx: action_tx.clone(),
-                                },
-                                config: proxy_config.clone(),
-                                session_manager: session_manager.clone(),
-                            };
-                            let permitted = command_dispatcher.get_all_permitted_commands(&source);
-                            let injected: Vec<InjectedCommand<'_>> = permitted
-                                .iter()
-                                .map(|(name, _)| InjectedCommand {
-                                    name: name.as_str(),
-                                    takes_args: matches!(name.as_str(), "server" | "send" | "help"),
-                                    executable_without_args: name != "send",
-                                })
-                                .collect();
-
-                            if let Some(modified_payload) =
-                                inject_commands(&raw_packet.payload, client_version, &injected)
+                            if PacketKind::CommandSuggestionsResponse
+                                .matches(raw_packet.id, client_version)
+                                && let Ok(mut backend_suggestions) =
+                                    decode_packet::<CommandSuggestions>(
+                                        &raw_packet.payload,
+                                        client_version,
+                                    )
+                                && let Some(pending) = pending_suggestions
+                                    .lock()
+                                    .await
+                                    .remove(&backend_suggestions.id)
                             {
-                                let packet = crate::protocol::RawPacket {
-                                    id: raw_packet.id,
-                                    payload: modified_payload.into(),
-                                };
-                                if !client_tx.send(packet.to_bytes()).await {
-                                    return TunnelExit::ClientDisconnected;
+                                merge_suggestions(
+                                    &mut backend_suggestions.matches,
+                                    pending.proxy_matches,
+                                    client_version,
+                                );
+                                if let Ok(bytes) =
+                                    encode_packet(&backend_suggestions, client_version)
+                                {
+                                    if !client_tx.send(bytes).await {
+                                        return TunnelExit::ClientDisconnected;
+                                    }
+                                    continue;
                                 }
-                                continue;
+                            }
+
+                            if PacketKind::Commands.matches(raw_packet.id, client_version) {
+                                let source = ProxyCommandSource {
+                                    sender: CommandSender::Player {
+                                        username: username.to_string(),
+                                        action_tx: action_tx.clone(),
+                                    },
+                                    config: proxy_config.clone(),
+                                    session_manager: session_manager.clone(),
+                                };
+                                let permitted =
+                                    command_dispatcher.get_all_permitted_commands(&source);
+                                let injected: Vec<InjectedCommand<'_>> = permitted
+                                    .iter()
+                                    .map(|(name, _)| InjectedCommand {
+                                        name: name.as_str(),
+                                        takes_args: matches!(
+                                            name.as_str(),
+                                            "server" | "send" | "help"
+                                        ),
+                                        executable_without_args: name != "send",
+                                    })
+                                    .collect();
+
+                                if let Some(modified_payload) =
+                                    inject_commands(&raw_packet.payload, client_version, &injected)
+                                {
+                                    let packet = crate::protocol::RawPacket {
+                                        id: raw_packet.id,
+                                        payload: modified_payload.into(),
+                                    };
+                                    if !client_tx.send(packet.to_bytes()).await {
+                                        return TunnelExit::ClientDisconnected;
+                                    }
+                                    continue;
+                                }
                             }
                         }
 
@@ -1185,6 +1275,11 @@ impl BackendBridge {
                     }
                     PlayerAction::Transfer { host, port } => {
                         return TunnelExit::Transfer { host, port };
+                    }
+                    PlayerAction::Message(_) | PlayerAction::PluginMessage { .. }
+                        if phase.get() != Phase::Play =>
+                    {
+                        debug!("Dropping {:?} for '{}' outside play", action, username);
                     }
                     PlayerAction::Message(content) => {
                         let chat_msg = SystemChat {
@@ -1242,6 +1337,42 @@ fn merge_suggestions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_serverbound_transitions_follow_acknowledgements() {
+        let v = ProtocolVersion(769);
+        let id = |kind: PacketKind| kind.id(v).unwrap();
+
+        assert_eq!(
+            serverbound_transition(Phase::Login, id(PacketKind::LoginAcknowledged), v),
+            Some(Phase::Config)
+        );
+        assert_eq!(
+            serverbound_transition(Phase::Config, id(PacketKind::ConfigFinishAck), v),
+            Some(Phase::Play)
+        );
+        assert_eq!(
+            serverbound_transition(Phase::Play, id(PacketKind::ConfigurationAcknowledged), v),
+            Some(Phase::Config)
+        );
+        assert_eq!(
+            serverbound_transition(Phase::Play, id(PacketKind::ConfigFinishAck), v),
+            None
+        );
+        assert_eq!(
+            serverbound_transition(Phase::Play, 0x0F, ProtocolVersion(763)),
+            None
+        );
+    }
+
+    #[test]
+    fn test_phase_cell_round_trip() {
+        let cell = PhaseCell::new(Phase::Login);
+        for phase in [Phase::Config, Phase::Play, Phase::Login] {
+            cell.set(phase);
+            assert_eq!(cell.get(), phase);
+        }
+    }
 
     #[tokio::test]
     async fn test_client_queue_applies_backpressure() {
