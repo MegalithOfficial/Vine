@@ -28,9 +28,9 @@ use crate::plugin::api::{
 };
 use crate::protocol::packets::config::ConfigDisconnect;
 use crate::protocol::packets::handshake::{Handshake, HandshakeIntent};
-use crate::protocol::packets::login::LoginDisconnect as LoginKick;
 use crate::protocol::packets::login::{
-    LoginDisconnect, LoginPluginRequest, LoginPluginResponse, LoginStart, SetCompression,
+    LoginAcknowledged, LoginDisconnect, LoginPluginRequest, LoginPluginResponse, LoginStart,
+    SetCompression,
 };
 use crate::protocol::packets::play::{
     ChatCommand, ChatMessage, ClientboundPluginMessage, CommandSuggestionRequest,
@@ -526,53 +526,37 @@ impl BackendBridge {
                             .cancel_reason
                             .as_deref()
                             .unwrap_or("Server switch cancelled by plugin");
-                        let msg = TextComponent::text(format!("§c{}", reason));
-                        send_best_effort(
-                            &mut client_writer,
-                            &SystemChat {
-                                content: component_json(&msg, self.client_version),
-                                overlay: false,
-                            },
-                            self.client_version,
-                        )
-                        .await;
+                        self.notify(&mut client_writer, &phase, format!("§c{reason}"))
+                            .await;
                         continue;
                     }
                     let server_name = connect_event.target_server;
 
-                    let target_config = match self.proxy_config.servers.get(&server_name) {
-                        Some(cfg) => cfg.clone(),
-                        None => {
-                            let msg = TextComponent::text(format!(
-                                "Server '{}' does not exist.",
-                                server_name
-                            ));
-                            send_best_effort(
-                                &mut client_writer,
-                                &SystemChat {
-                                    content: component_json(&msg, self.client_version),
-                                    overlay: false,
-                                },
-                                self.client_version,
-                            )
-                            .await;
-                            break;
-                        }
+                    let Some(target_config) = self.proxy_config.servers.get(&server_name).cloned()
+                    else {
+                        self.notify(
+                            &mut client_writer,
+                            &phase,
+                            format!("§cServer '{server_name}' does not exist."),
+                        )
+                        .await;
+                        continue;
                     };
 
-                    match self.login_backend(&server_name, &target_config).await {
-                        Ok((new_dec, new_enc, _)) => {
-                            if self.client_version >= ProtocolVersion::V1_20_2 {
-                                send_best_effort(
-                                    &mut client_writer,
-                                    &StartConfiguration,
-                                    self.client_version,
-                                )
-                                .await;
-                            }
-                            backend_reader = new_dec;
-                            backend_writer = new_enc;
-                            current_server_name = server_name.clone();
+                    match self
+                        .switch_backend(
+                            &mut client_reader,
+                            &mut client_writer,
+                            &phase,
+                            &server_name,
+                            &target_config,
+                        )
+                        .await
+                    {
+                        Ok((new_reader, new_writer)) => {
+                            backend_reader = new_reader;
+                            backend_writer = new_writer;
+                            current_server_name = server_name;
                             self.session_manager
                                 .update_server(&self.player.username, &current_server_name);
                             info!(
@@ -588,68 +572,31 @@ impl BackendBridge {
                                 .fire_server_connected(&connected_event)
                                 .await;
                         }
-                        Err(e) => {
+                        Err(SwitchError::Unreachable(e)) => {
                             warn!(
                                 "Failed to switch player '{}' to '{}': {}",
                                 self.player.username, server_name, e
                             );
-                            let msg = TextComponent::text(format!(
-                                "§cFailed to connect to server '{}': {}",
-                                server_name, e
-                            ));
-                            send_best_effort(
+                            self.notify(
                                 &mut client_writer,
-                                &SystemChat {
-                                    content: component_json(&msg, self.client_version),
-                                    overlay: false,
-                                },
-                                self.client_version,
+                                &phase,
+                                format!("§cFailed to connect to server '{server_name}': {e}"),
                             )
                             .await;
-
-                            let can_fallback = self
-                                .fallback_server
-                                .as_ref()
-                                .is_some_and(|(fb_name, _)| fb_name != &server_name);
-
-                            if can_fallback {
-                                let (fb_name, fb_cfg) = self.fallback_server.as_ref().unwrap();
-                                match self.login_backend(fb_name, fb_cfg).await {
-                                    Ok((new_dec, new_enc, _)) => {
-                                        if self.client_version >= ProtocolVersion::V1_20_2 {
-                                            send_best_effort(
-                                                &mut client_writer,
-                                                &StartConfiguration,
-                                                self.client_version,
-                                            )
-                                            .await;
-                                        }
-                                        backend_reader = new_dec;
-                                        backend_writer = new_enc;
-                                        current_server_name = fb_name.clone();
-                                        self.session_manager.update_server(
-                                            &self.player.username,
-                                            &current_server_name,
-                                        );
-                                    }
-                                    Err(_) => {
-                                        let kick_reason = format!(
-                                            "Lost connection to '{}' and fallback unavailable",
-                                            current_server_name
-                                        );
-                                        Self::disconnect_client(
-                                            &mut client_writer,
-                                            self.client_version,
-                                            phase.get(),
-                                            &kick_reason,
-                                        )
-                                        .await;
-                                        break;
-                                    }
-                                }
-                            } else {
-                                break;
-                            }
+                        }
+                        Err(SwitchError::Fatal(e)) => {
+                            warn!(
+                                "Lost player '{}' while switching to '{}': {}",
+                                self.player.username, server_name, e
+                            );
+                            Self::disconnect_client(
+                                &mut client_writer,
+                                self.client_version,
+                                phase.get(),
+                                &format!("Failed to connect to server '{server_name}'"),
+                            )
+                            .await;
+                            break;
                         }
                     }
                 }
@@ -658,83 +605,71 @@ impl BackendBridge {
                         "Backend server '{}' disconnected player '{}': {:?}",
                         current_server_name, self.player.username, reason
                     );
+                    let reason = reason.unwrap_or_else(|| "Lost connection to server".to_string());
 
-                    let can_fallback = self
+                    let fallback = self
                         .fallback_server
-                        .as_ref()
-                        .is_some_and(|(fb_name, _)| fb_name != &current_server_name);
-
-                    if can_fallback {
-                        let (fb_name, fb_cfg) = self.fallback_server.as_ref().unwrap();
-                        let reason_str = reason.as_deref().unwrap_or("Server closed");
-                        info!(
-                            "Rerouting player '{}' to fallback server '{}' (kicked from '{}': {})",
-                            self.player.username, fb_name, current_server_name, reason_str
-                        );
-
-                        let notice = TextComponent::text(format!(
-                            "§eConnecting to fallback server '{}'... (§c{}§e)",
-                            fb_name, reason_str
-                        ));
-                        send_best_effort(
-                            &mut client_writer,
-                            &SystemChat {
-                                content: component_json(&notice, self.client_version),
-                                overlay: false,
-                            },
-                            self.client_version,
-                        )
-                        .await;
-
-                        match self.login_backend(fb_name, fb_cfg).await {
-                            Ok((new_dec, new_enc, _)) => {
-                                if self.client_version >= ProtocolVersion::V1_20_2 {
-                                    send_best_effort(
-                                        &mut client_writer,
-                                        &StartConfiguration,
-                                        self.client_version,
-                                    )
-                                    .await;
-                                }
-                                backend_reader = new_dec;
-                                backend_writer = new_enc;
-                                current_server_name = fb_name.clone();
-                                self.session_manager
-                                    .update_server(&self.player.username, &current_server_name);
-                                info!(
-                                    "Player '{}' successfully recovered to fallback '{}'",
-                                    self.player.username, current_server_name
-                                );
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "Failed to connect player '{}' to fallback server '{}': {}",
-                                    self.player.username, fb_name, e
-                                );
-                                let kick_reason = format!(
-                                    "Lost connection to '{}' and fallback unavailable: {}",
-                                    current_server_name, e
-                                );
-                                Self::disconnect_client(
-                                    &mut client_writer,
-                                    self.client_version,
-                                    phase.get(),
-                                    &kick_reason,
-                                )
-                                .await;
-                                break;
-                            }
-                        }
-                    } else {
-                        let reason_str = reason.as_deref().unwrap_or("Lost connection to server");
+                        .clone()
+                        .filter(|(fb_name, _)| fb_name != &current_server_name);
+                    let Some((fb_name, fb_cfg)) = fallback else {
                         Self::disconnect_client(
                             &mut client_writer,
                             self.client_version,
                             phase.get(),
-                            reason_str,
+                            &reason,
                         )
                         .await;
                         break;
+                    };
+
+                    info!(
+                        "Rerouting player '{}' to fallback server '{}' (kicked from '{}': {})",
+                        self.player.username, fb_name, current_server_name, reason
+                    );
+                    self.notify(
+                        &mut client_writer,
+                        &phase,
+                        format!("§eConnecting to fallback server '{fb_name}'... (§c{reason}§e)"),
+                    )
+                    .await;
+
+                    match self
+                        .switch_backend(
+                            &mut client_reader,
+                            &mut client_writer,
+                            &phase,
+                            &fb_name,
+                            &fb_cfg,
+                        )
+                        .await
+                    {
+                        Ok((new_reader, new_writer)) => {
+                            backend_reader = new_reader;
+                            backend_writer = new_writer;
+                            current_server_name = fb_name;
+                            self.session_manager
+                                .update_server(&self.player.username, &current_server_name);
+                            info!(
+                                "Player '{}' successfully recovered to fallback '{}'",
+                                self.player.username, current_server_name
+                            );
+                        }
+                        Err(SwitchError::Unreachable(e) | SwitchError::Fatal(e)) => {
+                            warn!(
+                                "Failed to connect player '{}' to fallback server '{}': {}",
+                                self.player.username, fb_name, e
+                            );
+                            Self::disconnect_client(
+                                &mut client_writer,
+                                self.client_version,
+                                phase.get(),
+                                &format!(
+                                    "Lost connection to '{current_server_name}' and fallback unavailable: {e}"
+                                ),
+                            )
+                            .await;
+                            break;
+                        }
                     }
                 }
             }
@@ -759,6 +694,87 @@ impl BackendBridge {
         Ok(())
     }
 
+    /// Logs into another backend and moves the client over to it. On 1.20.2+ the client is sent
+    /// back into the configuration phase so the new backend can configure it from scratch.
+    async fn switch_backend<R, W>(
+        &self,
+        client_reader: &mut PacketReader<R>,
+        client_writer: &mut PacketWriter<W>,
+        phase: &PhaseCell,
+        server_name: &str,
+        config: &BackendConfig,
+    ) -> Result<(BackendReader, BackendWriter), SwitchError>
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        let (backend_reader, mut backend_writer, _) = self
+            .login_backend(server_name, config)
+            .await
+            .map_err(SwitchError::Unreachable)?;
+        let version = self.client_version;
+        if version < ProtocolVersion::V1_20_2 {
+            return Ok((backend_reader, backend_writer));
+        }
+
+        let awaited = match phase.get() {
+            Phase::Play => {
+                let start = encode_packet(&StartConfiguration, version)
+                    .map_err(|e| SwitchError::Fatal(e.into()))?;
+                match timeout(CLIENT_WRITE_TIMEOUT, client_writer.send(start)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => return Err(SwitchError::Fatal(e.into())),
+                    Err(_) => return Err(SwitchError::Fatal(client_timeout())),
+                }
+                Some(PacketKind::ConfigurationAcknowledged)
+            }
+            Phase::Login => Some(PacketKind::LoginAcknowledged),
+            Phase::Config => None,
+        };
+
+        // Packets the client sends before acknowledging belong to the old backend
+        if let Some(kind) = awaited {
+            let acknowledged = async {
+                loop {
+                    let packet = client_reader.read_packet().await?;
+                    if kind.matches(packet.id, version) {
+                        return Ok::<_, ProtocolError>(());
+                    }
+                }
+            };
+            match timeout(SWITCH_ACK_TIMEOUT, acknowledged).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(SwitchError::Fatal(e.into())),
+                Err(_) => return Err(SwitchError::Fatal(client_timeout())),
+            }
+        }
+
+        let ack =
+            encode_packet(&LoginAcknowledged, version).map_err(|e| SwitchError::Fatal(e.into()))?;
+        backend_writer
+            .send(ack)
+            .await
+            .map_err(|e| SwitchError::Fatal(e.into()))?;
+        phase.set(Phase::Config);
+        Ok((backend_reader, backend_writer))
+    }
+
+    async fn notify<W: AsyncWrite + Unpin>(
+        &self,
+        writer: &mut PacketWriter<W>,
+        phase: &PhaseCell,
+        text: String,
+    ) {
+        if phase.get() == Phase::Play {
+            let content = component_json(&TextComponent::text(text), self.client_version);
+            let message = SystemChat {
+                content,
+                overlay: false,
+            };
+            send_best_effort(writer, &message, self.client_version).await;
+        }
+    }
+
     /// Helper to send formatted disconnect packet to client in either play or configuration state
     async fn disconnect_client<W: AsyncWrite + Unpin>(
         writer: &mut PacketWriter<W>,
@@ -768,7 +784,7 @@ impl BackendBridge {
     ) {
         match phase {
             Phase::Login => {
-                let kick = LoginKick {
+                let kick = LoginDisconnect {
                     reason_json: crate::client::kick_reason_json(reason),
                 };
                 send_best_effort(writer, &kick, version).await;
@@ -799,6 +815,21 @@ async fn send_best_effort<P: Packet, W: AsyncWrite + Unpin>(
         }
         Err(e) => debug!("Skipping {:?} for {}: {}", P::KIND, version, e),
     }
+}
+
+const SWITCH_ACK_TIMEOUT: Duration = Duration::from_secs(10);
+
+enum SwitchError {
+    // Nothing was sent to the client yet, so it can stay on its current backend
+    Unreachable(BridgeError),
+    Fatal(BridgeError),
+}
+
+fn client_timeout() -> BridgeError {
+    BridgeError::IoError(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "client did not respond while switching servers",
+    ))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
