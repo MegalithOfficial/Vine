@@ -9,7 +9,10 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
-use crate::auth::{AuthError, AuthenticatedPlayer, Authenticator, KeyStore, verify_signed_token};
+use crate::auth::{
+    AuthError, AuthenticatedPlayer, Authenticator, IdentifiedKey, KeyRevision, KeyStore,
+    verify_signed_token,
+};
 use crate::backend::{BackendBridge, Router};
 use crate::command::CommandDispatcher;
 use crate::config::Config;
@@ -228,6 +231,48 @@ impl ClientHandler {
         let login_start: LoginStart = decode_packet(&raw_login_start.payload, client_version)?;
         let username = login_start.name.clone();
 
+        let mut profile_key = login_start
+            .profile_key
+            .clone()
+            .map(|key| IdentifiedKey::new(key, client_version));
+        if let Some(key) = &mut profile_key {
+            if key.has_expired() {
+                warn!(
+                    "[{}] Expired profile key for '{}'",
+                    self.peer_addr, username
+                );
+                Self::kick(
+                    &mut writer,
+                    client_version,
+                    "Invalid signature for profile public key. Try restarting your game.",
+                )
+                .await?;
+                return Ok(());
+            }
+            let valid = match key.revision {
+                KeyRevision::LinkedV2 => key.add_holder(login_start.uuid),
+                KeyRevision::GenericV1 => key.is_signature_valid(),
+            };
+            if !valid {
+                warn!(
+                    "[{}] Invalid profile key for '{}'",
+                    self.peer_addr, username
+                );
+                Self::kick(&mut writer, client_version, "Invalid profile public key.").await?;
+                return Ok(());
+            }
+        } else if (ProtocolVersion::V1_19..ProtocolVersion::V1_19_3).contains(&client_version)
+            && self.config.server.force_key_authentication
+        {
+            Self::kick(
+                &mut writer,
+                client_version,
+                "Missing profile public key. This server requires secure profiles.",
+            )
+            .await?;
+            return Ok(());
+        }
+
         let mut pre_login_event = PlayerPreLoginEvent {
             client_ip: client_ip.to_string(),
             username: username.clone(),
@@ -271,7 +316,7 @@ impl ClientHandler {
             self.peer_addr, username, client_version
         );
 
-        let authenticated_player = if self.config.server.online_mode {
+        let mut authenticated_player = if self.config.server.online_mode {
             let verify_token: [u8; 4] = rand::random();
             let encryption_request = EncryptionRequest {
                 server_id: String::new(),
@@ -375,6 +420,27 @@ impl ClientHandler {
         } else {
             AuthenticatedPlayer::offline(&username)
         };
+
+        if let Some(key) = &mut profile_key {
+            let online = self.config.server.online_mode;
+            let player_id = Some(authenticated_player.id);
+            let linked = if online && key.revision == KeyRevision::LinkedV2 {
+                key.add_holder(player_id)
+            } else {
+                key.holder.is_some() || key.add_holder(player_id)
+            };
+            if !linked && online {
+                Self::kick(&mut writer, client_version, "Invalid profile public key.").await?;
+                return Ok(());
+            }
+            if !linked {
+                warn!(
+                    "[{}] Profile key for '{}' could not be verified",
+                    self.peer_addr, username
+                );
+            }
+        }
+        authenticated_player.profile_key = profile_key;
 
         let mut login_event = PlayerLoginEvent {
             uuid: authenticated_player.id.to_string(),

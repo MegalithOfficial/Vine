@@ -115,6 +115,9 @@ pub struct ServerConfig {
     /// Shared secret for velocity and vine backends without their own `secret`
     #[serde(default = "default_forwarding_secret_file")]
     pub forwarding_secret_file: String,
+    /// Require 1.19-1.19.2 clients to present a Mojang-signed chat key
+    #[serde(default = "default_true")]
+    pub force_key_authentication: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -371,6 +374,7 @@ impl Default for Config {
                 compression_level: 6,
                 shutdown_timeout_secs: 10,
                 forwarding_secret_file: default_forwarding_secret_file(),
+                force_key_authentication: true,
             },
             network: NetworkConfig::default(),
             motd: MotdConfig {

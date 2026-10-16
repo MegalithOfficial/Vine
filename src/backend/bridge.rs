@@ -226,10 +226,15 @@ impl BackendBridge {
             .send(encode_packet(&handshake, version)?)
             .await?;
 
+        let key = self.player.profile_key.as_ref();
         let login_start = LoginStart {
             name: self.player.username.clone(),
-            uuid: Some(self.player.id),
-            profile_key: None,
+            uuid: match key {
+                Some(key) => key.holder,
+                None if version >= ProtocolVersion::V1_19_3 => Some(self.player.id),
+                None => None,
+            },
+            profile_key: key.map(|key| key.key.clone()),
         };
         backend_writer
             .send(encode_packet(&login_start, version)?)
@@ -288,8 +293,11 @@ impl BackendBridge {
                         .as_deref()
                         .ok_or_else(|| BridgeError::VelocityError("Secret missing".to_string()))?;
 
-                    let forwarding_version =
-                        ForwardingHelper::velocity_forwarding_version(&request.data, version);
+                    let forwarding_version = ForwardingHelper::velocity_forwarding_version(
+                        &request.data,
+                        version,
+                        self.player.profile_key.as_ref(),
+                    );
                     debug!(
                         "Answering Velocity forwarding request {:?} with version {}",
                         request.data, forwarding_version

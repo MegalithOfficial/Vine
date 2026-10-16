@@ -50,7 +50,12 @@ impl Packet for LoginStart {
     fn write(&self, buf: &mut Vec<u8>, version: ProtocolVersion) -> Result<(), ProtocolError> {
         buf.write_string(&self.name);
         if (ProtocolVersion::V1_19..=V1_19_2).contains(&version) {
-            buf.write_bool(false);
+            buf.write_bool(self.profile_key.is_some());
+            if let Some(key) = &self.profile_key {
+                buf.write_i64(key.expires_at);
+                buf.write_byte_array(&key.public_key);
+                buf.write_byte_array(&key.key_signature);
+            }
         }
         if version >= ProtocolVersion::V1_20_2 {
             buf.write_uuid(&self.uuid.unwrap_or_default());
@@ -337,6 +342,26 @@ mod tests {
                 key_signature: vec![4, 5],
             })
         );
+    }
+
+    #[test]
+    fn test_login_start_writes_profile_key_and_holder() {
+        let version = ProtocolVersion::V1_19_1;
+        let holder = Uuid::from_u128(7);
+        let packet = LoginStart {
+            name: "Alex".to_string(),
+            uuid: Some(holder),
+            profile_key: Some(ProfileKey {
+                expires_at: 42,
+                public_key: vec![1, 2, 3],
+                key_signature: vec![4, 5],
+            }),
+        };
+        let mut payload = Vec::new();
+        packet.write(&mut payload, version).unwrap();
+        let decoded: LoginStart = decode_packet(&payload, version).unwrap();
+        assert_eq!(decoded.profile_key, packet.profile_key);
+        assert_eq!(decoded.uuid, Some(holder));
     }
 
     #[test]

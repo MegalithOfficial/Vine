@@ -5,7 +5,7 @@ use std::net::IpAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
-use crate::auth::AuthenticatedPlayer;
+use crate::auth::{AuthenticatedPlayer, IdentifiedKey, KeyRevision};
 use crate::protocol::ProtocolVersion;
 use crate::protocol::wire::WriteExt;
 
@@ -13,6 +13,8 @@ type HmacSha256 = Hmac<Sha256>;
 
 pub const VELOCITY_PLAYER_INFO_CHANNEL: &str = "velocity:player_info";
 pub const VELOCITY_FORWARDING_DEFAULT: i32 = 1;
+pub const VELOCITY_FORWARDING_WITH_KEY: i32 = 2;
+pub const VELOCITY_FORWARDING_WITH_KEY_V2: i32 = 3;
 pub const VELOCITY_FORWARDING_LAZY_SESSION: i32 = 4;
 
 pub const VINE_PLAYER_INFO_CHANNEL: &str = "vine:player_info";
@@ -31,17 +33,31 @@ pub enum ForwardingError {
 pub struct ForwardingHelper;
 
 impl ForwardingHelper {
-    pub fn velocity_forwarding_version(request: &[u8], client_version: ProtocolVersion) -> i32 {
+    pub fn velocity_forwarding_version(
+        request: &[u8],
+        client_version: ProtocolVersion,
+        key: Option<&IdentifiedKey>,
+    ) -> i32 {
         let requested = match request {
             [version] => i32::from(*version as i8),
             _ => VELOCITY_FORWARDING_DEFAULT,
         };
-        if requested >= VELOCITY_FORWARDING_LAZY_SESSION
-            && client_version >= ProtocolVersion::V1_19_3
-        {
-            VELOCITY_FORWARDING_LAZY_SESSION
-        } else {
-            VELOCITY_FORWARDING_DEFAULT
+        if requested <= VELOCITY_FORWARDING_DEFAULT {
+            return VELOCITY_FORWARDING_DEFAULT;
+        }
+        if client_version >= ProtocolVersion::V1_19_3 {
+            return if requested >= VELOCITY_FORWARDING_LAZY_SESSION {
+                VELOCITY_FORWARDING_LAZY_SESSION
+            } else {
+                VELOCITY_FORWARDING_DEFAULT
+            };
+        }
+        match key.map(|key| key.revision) {
+            Some(KeyRevision::GenericV1) => VELOCITY_FORWARDING_WITH_KEY,
+            Some(KeyRevision::LinkedV2) if requested >= VELOCITY_FORWARDING_WITH_KEY_V2 => {
+                VELOCITY_FORWARDING_WITH_KEY_V2
+            }
+            _ => VELOCITY_FORWARDING_DEFAULT,
         }
     }
 
@@ -101,6 +117,20 @@ impl ForwardingHelper {
                 payload.write_string(sig);
             } else {
                 payload.write_bool(false);
+            }
+        }
+
+        if (VELOCITY_FORWARDING_WITH_KEY..VELOCITY_FORWARDING_LAZY_SESSION).contains(&version)
+            && let Some(key) = &player.profile_key
+        {
+            payload.write_i64(key.key.expires_at);
+            payload.write_byte_array(&key.key.public_key);
+            payload.write_byte_array(&key.key.key_signature);
+            if version >= VELOCITY_FORWARDING_WITH_KEY_V2 {
+                payload.write_bool(key.holder.is_some());
+                if let Some(holder) = &key.holder {
+                    payload.write_uuid(holder);
+                }
             }
         }
 
@@ -210,6 +240,7 @@ mod tests {
             id: Uuid::parse_str("d8f4a1e0-0f1b-4c3a-9f2e-1a2b3c4d5e6f").unwrap(),
             username: "Steve".to_string(),
             properties: vec![],
+            profile_key: None,
         };
         let ip: IpAddr = "192.0.2.1".parse().unwrap();
         let host = ForwardingHelper::build_bungeecord_host("play.example.com", &ip, &player);
@@ -228,6 +259,7 @@ mod tests {
             id: Uuid::parse_str("d8f4a1e0-0f1b-4c3a-9f2e-1a2b3c4d5e6f").unwrap(),
             username: "Alex".to_string(),
             properties: vec![],
+            profile_key: None,
         };
         let ip: IpAddr = "127.0.0.1".parse().unwrap();
         let secret = "test-secret-key";
@@ -238,20 +270,72 @@ mod tests {
     }
 
     #[test]
+    fn test_velocity_payload_carries_linked_key() {
+        let holder = Uuid::from_u128(7);
+        let mut key = IdentifiedKey::new(
+            crate::protocol::packets::login::ProfileKey {
+                expires_at: 42,
+                public_key: vec![1, 2, 3],
+                key_signature: vec![4, 5],
+            },
+            ProtocolVersion::V1_19_1,
+        );
+        key.holder = Some(holder);
+        let player = AuthenticatedPlayer {
+            id: holder,
+            username: "Alex".to_string(),
+            properties: vec![],
+            profile_key: Some(key),
+        };
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+
+        let v1 = ForwardingHelper::build_velocity_payload("s", 1, &ip, &player).unwrap();
+        let v3 = ForwardingHelper::build_velocity_payload("s", 3, &ip, &player).unwrap();
+        let mut tail = Vec::new();
+        tail.write_i64(42);
+        tail.write_byte_array(&[1, 2, 3]);
+        tail.write_byte_array(&[4, 5]);
+        tail.write_bool(true);
+        tail.write_uuid(&holder);
+        assert_eq!(v3[32], 3);
+        assert_eq!(&v3[33..v3.len() - tail.len()], &v1[33..]);
+        assert!(v3.ends_with(&tail));
+    }
+
+    #[test]
     fn test_velocity_forwarding_version_negotiation() {
         let pick = ForwardingHelper::velocity_forwarding_version;
         let modern = ProtocolVersion::V1_19_3;
-        let keyed = ProtocolVersion::V1_19_1;
+        let linked = ProtocolVersion::V1_19_1;
+        let generic = ProtocolVersion::V1_19;
+        let key = |version| {
+            IdentifiedKey::new(
+                crate::protocol::packets::login::ProfileKey {
+                    expires_at: 0,
+                    public_key: vec![],
+                    key_signature: vec![],
+                },
+                version,
+            )
+        };
+        let linked_key = key(linked);
+        let generic_key = key(generic);
 
-        assert_eq!(pick(&[], modern), 1);
-        assert_eq!(pick(&[1], modern), 1);
-        assert_eq!(pick(&[3], modern), 1);
-        assert_eq!(pick(&[4], modern), 4);
-        assert_eq!(pick(&[9], modern), 4);
-        assert_eq!(pick(&[4], keyed), 1);
-        assert_eq!(pick(&[3], keyed), 1);
-        assert_eq!(pick(&[0xff], modern), 1);
-        assert_eq!(pick(&[4, 0], modern), 1);
+        assert_eq!(pick(&[], modern, None), 1);
+        assert_eq!(pick(&[1], modern, None), 1);
+        assert_eq!(pick(&[3], modern, None), 1);
+        assert_eq!(pick(&[4], modern, None), 4);
+        assert_eq!(pick(&[9], modern, None), 4);
+        assert_eq!(pick(&[0xff], modern, None), 1);
+        assert_eq!(pick(&[4, 0], modern, None), 1);
+
+        assert_eq!(pick(&[3], linked, None), 1);
+        assert_eq!(pick(&[3], linked, Some(&linked_key)), 3);
+        assert_eq!(pick(&[4], linked, Some(&linked_key)), 3);
+        assert_eq!(pick(&[2], linked, Some(&linked_key)), 1);
+        assert_eq!(pick(&[2], generic, Some(&generic_key)), 2);
+        assert_eq!(pick(&[3], generic, Some(&generic_key)), 2);
+        assert_eq!(pick(&[1], generic, Some(&generic_key)), 1);
     }
 
     #[test]
@@ -260,6 +344,7 @@ mod tests {
             id: Uuid::parse_str("d8f4a1e0-0f1b-4c3a-9f2e-1a2b3c4d5e6f").unwrap(),
             username: "Alex".to_string(),
             properties: vec![],
+            profile_key: None,
         };
         let ip: IpAddr = "127.0.0.1".parse().unwrap();
         let secret = "test-vine-secret-phrase";
