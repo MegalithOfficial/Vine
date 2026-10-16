@@ -16,6 +16,8 @@ pub enum AuthError {
     DecryptError(String),
     #[error("Verify token mismatch")]
     VerifyTokenMismatch,
+    #[error("player has not joined this server through Mojang's session service")]
+    NotJoined,
     #[error("Mojang authentication failed (status: {0})")]
     MojangAuthFailed(u16),
     #[error("Failed to contact Mojang session service: {0}")]
@@ -183,6 +185,9 @@ impl Authenticator {
         debug!("Querying Mojang authentication service for '{}'", username);
         let resp = self.client.get(url).send().await?;
 
+        if resp.status() == reqwest::StatusCode::NO_CONTENT {
+            return Err(AuthError::NotJoined);
+        }
         if !resp.status().is_success() {
             error!(
                 "Mojang authentication failed for '{}': status {}",

@@ -9,7 +9,7 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
-use crate::auth::{AuthenticatedPlayer, Authenticator, KeyStore, verify_signed_token};
+use crate::auth::{AuthError, AuthenticatedPlayer, Authenticator, KeyStore, verify_signed_token};
 use crate::backend::{BackendBridge, Router};
 use crate::command::CommandDispatcher;
 use crate::config::Config;
@@ -355,12 +355,13 @@ impl ClientHandler {
                         "[{}] Mojang authentication failed for '{}': {}",
                         self.peer_addr, username, e
                     );
-                    Self::kick(
-                        &mut writer,
-                        client_version,
-                        "Failed to verify username with Mojang session servers! Please try again later.",
-                    )
-                    .await?;
+                    let reason = match e {
+                        AuthError::NotJoined => "Failed to verify username!",
+                        _ => {
+                            "Failed to verify username with Mojang session servers! Please try again later."
+                        }
+                    };
+                    Self::kick(&mut writer, client_version, reason).await?;
                     return Err(ClientError::AuthError(e.to_string()));
                 }
             };
