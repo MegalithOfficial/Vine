@@ -708,12 +708,44 @@ impl BackendBridge {
         R: AsyncRead + Unpin,
         W: AsyncWrite + Unpin,
     {
-        let (backend_reader, mut backend_writer, _) = self
+        let (mut backend_reader, mut backend_writer, _) = self
             .login_backend(server_name, config)
             .await
             .map_err(SwitchError::Unreachable)?;
         let version = self.client_version;
         if version < ProtocolVersion::V1_20_2 {
+            // The backend may still be in the login state right after LoginSuccess; client
+            // packets are only safe to forward once it has placed the player and sent JoinGame
+            let mut pending = Vec::new();
+            let joined = async {
+                loop {
+                    let packet = backend_reader.read_packet().await?;
+                    let is_join = PacketKind::JoinGame.matches(packet.id, version);
+                    pending.push(packet.to_bytes());
+                    if is_join {
+                        return Ok::<_, ProtocolError>(());
+                    }
+                }
+            };
+            match timeout(SWITCH_ACK_TIMEOUT, joined).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(SwitchError::Unreachable(e.into())),
+                Err(_) => {
+                    return Err(SwitchError::Unreachable(BridgeError::LoginTimeout(
+                        server_name.to_string(),
+                    )));
+                }
+            }
+            for packet in pending {
+                client_writer
+                    .queue(&packet)
+                    .map_err(|e| SwitchError::Fatal(e.into()))?;
+            }
+            match timeout(CLIENT_WRITE_TIMEOUT, client_writer.flush()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(SwitchError::Fatal(e.into())),
+                Err(_) => return Err(SwitchError::Fatal(client_timeout())),
+            }
             return Ok((backend_reader, backend_writer));
         }
 
