@@ -10,13 +10,15 @@ use tokio::sync::broadcast;
 use crate::config::Config;
 
 /// Filename used to persist the telemetry identity key across restarts.
-pub const IDENTITY_KEY_PATH: &str = ".pumpkin/identity.key";
+pub const IDENTITY_KEY_PATH: &str = ".vine/identity.key";
 
-/// Fallback filename used to persist the telemetry identity key across restarts.
-pub const FALLBACK_IDENTITY_KEY_PATH: &str = "telemetry_key.bin";
-
-/// Secondary fallback filename for proxy identity key.
-pub const VINE_IDENTITY_KEY_PATH: &str = ".vine/identity.key";
+const LEGACY_IDENTITY_KEY_PATHS: &[&str] = &[
+    ".pumpkin/identity.key",
+    "telemetry_key.bin",
+    "data/.pumpkin/identity.key",
+    "data/.vine/identity.key",
+    "data/telemetry_key.bin",
+];
 
 /// HTTP header name for the Ed25519 public key in lowercase hex format.
 pub const HEADER_PUBLIC_KEY: &str = "X-Telemetry-Public-Key";
@@ -314,59 +316,16 @@ impl TelemetryClient {
 /// Resolves the server identity key by checking default locations or generating a new one.
 #[must_use]
 pub fn resolve_identity_key() -> SigningKey {
-    let primary = Path::new(IDENTITY_KEY_PATH);
-    if primary.exists()
-        && let Ok(key) = TelemetryClient::load_or_generate_key(primary)
-    {
-        return key;
-    }
+    let path = std::iter::once(IDENTITY_KEY_PATH)
+        .chain(LEGACY_IDENTITY_KEY_PATHS.iter().copied())
+        .map(Path::new)
+        .find(|path| path.exists())
+        .unwrap_or(Path::new(IDENTITY_KEY_PATH));
 
-    let vine_key = Path::new(VINE_IDENTITY_KEY_PATH);
-    if vine_key.exists()
-        && let Ok(key) = TelemetryClient::load_or_generate_key(vine_key)
-    {
-        return key;
-    }
-
-    let fallback = Path::new(FALLBACK_IDENTITY_KEY_PATH);
-    if fallback.exists()
-        && let Ok(key) = TelemetryClient::load_or_generate_key(fallback)
-    {
-        return key;
-    }
-
-    let data_primary = Path::new("data").join(IDENTITY_KEY_PATH);
-    if data_primary.exists()
-        && let Ok(key) = TelemetryClient::load_or_generate_key(&data_primary)
-    {
-        return key;
-    }
-
-    let data_vine = Path::new("data").join(VINE_IDENTITY_KEY_PATH);
-    if data_vine.exists()
-        && let Ok(key) = TelemetryClient::load_or_generate_key(&data_vine)
-    {
-        return key;
-    }
-
-    let data_fallback = Path::new("data").join(FALLBACK_IDENTITY_KEY_PATH);
-    if data_fallback.exists()
-        && let Ok(key) = TelemetryClient::load_or_generate_key(&data_fallback)
-    {
-        return key;
-    }
-
-    if Path::new("data").is_dir() {
-        let path = Path::new("data").join(IDENTITY_KEY_PATH);
-        if let Ok(key) = TelemetryClient::load_or_generate_key(&path) {
-            return key;
-        }
-    }
-
-    TelemetryClient::load_or_generate_key(primary).unwrap_or_else(|err| {
+    TelemetryClient::load_or_generate_key(path).unwrap_or_else(|err| {
         tracing::warn!(
             "Failed to persist telemetry identity key at {}: {err}, using ephemeral key",
-            primary.display()
+            path.display()
         );
         let seed: [u8; 32] = rand::random();
         SigningKey::from_bytes(&seed)
@@ -543,7 +502,7 @@ mod tests {
     #[test]
     fn identity_key_generation_and_persistence() {
         let dir = tempfile::tempdir().unwrap();
-        let key_path = dir.path().join(".pumpkin/identity.key");
+        let key_path = dir.path().join(IDENTITY_KEY_PATH);
 
         assert!(!key_path.exists());
         let key1 = TelemetryClient::load_or_generate_key(&key_path).unwrap();
