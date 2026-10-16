@@ -124,7 +124,8 @@ impl StatusHandler {
     /// Resolves MOTD description for the virtual host or falls back to global default
     pub fn resolve_motd_text(&self, host: Option<&str>) -> String {
         if let Some(h) = host {
-            let clean_host = h.split(':').next().unwrap_or(h).trim();
+            let normalized = crate::config::normalize_host(h);
+            let clean_host = normalized.as_str();
 
             let target_server: Option<&str> = self
                 .forced_hosts

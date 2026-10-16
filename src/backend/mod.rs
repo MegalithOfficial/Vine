@@ -4,7 +4,7 @@ pub mod forwarding;
 pub use bridge::{BackendBridge, BridgeError};
 pub use forwarding::{ForwardingError, ForwardingHelper};
 
-use crate::config::{BackendConfig, RoutingConfig};
+use crate::config::{BackendConfig, RoutingConfig, normalize_host};
 use std::collections::HashMap;
 
 pub struct Router {
@@ -19,7 +19,7 @@ impl Router {
 
     /// Resolves which backend server to connect to based on virtual host or default
     pub fn resolve_server(&self, virtual_host: &str) -> Option<(String, BackendConfig)> {
-        if let Some(target_name) = self.routing.forced_hosts.get(virtual_host)
+        if let Some(target_name) = self.routing.forced_hosts.get(&normalize_host(virtual_host))
             && let Some(cfg) = self.servers.get(target_name)
         {
             return Some((target_name.clone(), cfg.clone()));

@@ -411,6 +411,10 @@ impl Default for Config {
 
 pub use crate::permissions::{GroupConfig, PermissionsConfig, UserPermissionConfig};
 
+pub fn normalize_host(host: &str) -> String {
+    host.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
 fn needs_shared_secret(server: &BackendConfig) -> bool {
     matches!(
         server.forwarding,
@@ -455,6 +459,10 @@ impl Config {
             std::fs::write(path, toml::to_string_pretty(&default_config)?)?;
             default_config
         };
+        config.routing.forced_hosts = std::mem::take(&mut config.routing.forced_hosts)
+            .into_iter()
+            .map(|(host, server)| (normalize_host(&host), server))
+            .collect();
         let env_secret = std::env::var(FORWARDING_SECRET_ENV).ok();
         config.resolve_forwarding_secret(path.parent().unwrap_or(Path::new("")), env_secret)?;
         config.validate()?;

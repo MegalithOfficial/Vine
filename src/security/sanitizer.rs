@@ -18,12 +18,14 @@ impl Sanitizer {
     /// - Truncates to max 255 characters
     /// - Strips control characters
     pub fn sanitize_host(host: &str) -> String {
+        // Forge appends "\0FML\0" markers and a forged "\0ip\0uuid" would spoof BungeeCord forwarding
+        let host = host.split('\0').next().unwrap_or_default();
         let mut clean = String::with_capacity(host.len().min(255));
         for ch in host.chars() {
             if clean.len() >= 255 {
                 break;
             }
-            if ch != '\0' && !ch.is_control() {
+            if !ch.is_control() {
                 clean.push(ch);
             }
         }
@@ -59,7 +61,11 @@ mod tests {
         assert_eq!(Sanitizer::sanitize_host("mc.example.com"), "mc.example.com");
         assert_eq!(
             Sanitizer::sanitize_host("mc.example.com\0malicious_ip\0uuid"),
-            "mc.example.commalicious_ipuuid"
+            "mc.example.com"
+        );
+        assert_eq!(
+            Sanitizer::sanitize_host("mc.example.com\0FML3\0"),
+            "mc.example.com"
         );
     }
 }
