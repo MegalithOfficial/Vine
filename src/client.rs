@@ -290,6 +290,27 @@ impl ClientHandler {
             let enc_resp: EncryptionResponse =
                 decode_packet(&raw_enc_resp.payload, client_version)?;
 
+            let shared_secret = self
+                .keystore
+                .decrypt(&enc_resp.shared_secret)
+                .map_err(|e| ClientError::AuthError(e.to_string()))?;
+
+            if shared_secret.len() != 16 {
+                warn!(
+                    "[{}] Shared secret has invalid length ({})",
+                    self.peer_addr,
+                    shared_secret.len()
+                );
+                Self::kick(&mut writer, client_version, "Invalid encryption key length").await?;
+                return Err(ClientError::AuthError("Invalid key length".to_string()));
+            }
+
+            let mut aes_key = [0u8; 16];
+            aes_key.copy_from_slice(&shared_secret);
+
+            reader.enable_encryption(&aes_key)?;
+            writer.enable_encryption(&aes_key)?;
+
             let token_valid = match &enc_resp.verification {
                 Verification::Token(encrypted) => self
                     .keystore
@@ -315,24 +336,6 @@ impl ClientHandler {
                 .await?;
                 return Err(ClientError::AuthError("Token mismatch".to_string()));
             }
-
-            let shared_secret = self
-                .keystore
-                .decrypt(&enc_resp.shared_secret)
-                .map_err(|e| ClientError::AuthError(e.to_string()))?;
-
-            if shared_secret.len() != 16 {
-                warn!(
-                    "[{}] Shared secret has invalid length ({})",
-                    self.peer_addr,
-                    shared_secret.len()
-                );
-                Self::kick(&mut writer, client_version, "Invalid encryption key length").await?;
-                return Err(ClientError::AuthError("Invalid key length".to_string()));
-            }
-
-            let mut aes_key = [0u8; 16];
-            aes_key.copy_from_slice(&shared_secret);
 
             let server_hash = self.keystore.auth_digest("", &shared_secret);
 
@@ -361,9 +364,6 @@ impl ClientHandler {
                     return Err(ClientError::AuthError(e.to_string()));
                 }
             };
-
-            reader.enable_encryption(&aes_key)?;
-            writer.enable_encryption(&aes_key)?;
 
             debug!(
                 "[{}] Stream encryption enabled for player '{}' ({})",
