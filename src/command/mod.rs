@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::info;
 
+use pumpkin_command::Requirement;
 use pumpkin_command::argument_builder::{ArgumentBuilder, argument, command};
 use pumpkin_command::argument_types::core::string::StringArgumentType;
 use pumpkin_command::context::command_context::CommandContext;
@@ -236,10 +237,12 @@ impl CommandDispatcher {
         glist::register(&mut dispatcher);
         dispatcher.register(
             command("list", "Lists online players connected to the proxy")
+                .requires(Requirement::from("vine.command.list"))
                 .executes(ListCommandExecutor),
         );
         dispatcher.register(
             command("help", "Displays list of available proxy commands")
+                .requires(Requirement::from("vine.command.help"))
                 .executes(HelpCommandExecutor)
                 .then(
                     argument("command", StringArgumentType::SingleWord)
