@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, path::Path};
+use std::{collections::HashMap, io::Write, path::Path};
 
 fn default_true() -> bool {
     true
@@ -46,6 +46,11 @@ fn default_listen_backlog() -> u32 {
 }
 
 const LEGACY_PLACEHOLDER_SECRET: &str = "vine-velocity-secret-change-me";
+const FORWARDING_SECRET_ENV: &str = "VINE_FORWARDING_SECRET";
+
+fn default_forwarding_secret_file() -> String {
+    "forwarding.secret".to_string()
+}
 
 fn generate_forwarding_secret() -> String {
     hex::encode(rand::random::<[u8; 32]>())
@@ -107,6 +112,9 @@ pub struct ServerConfig {
     /// Graceful shutdown timeout in seconds to wait for active connections to close
     #[serde(default = "default_shutdown_timeout")]
     pub shutdown_timeout_secs: u64,
+    /// Shared secret for velocity and vine backends without their own `secret`
+    #[serde(default = "default_forwarding_secret_file")]
+    pub forwarding_secret_file: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -321,7 +329,7 @@ impl Default for Config {
             BackendConfig {
                 address: "127.0.0.1:25566".to_string(),
                 forwarding: ForwardingMode::Velocity,
-                secret: Some(generate_forwarding_secret()),
+                secret: None,
                 icon_path: None,
                 motd_line1: None,
                 motd_line2: None,
@@ -362,6 +370,7 @@ impl Default for Config {
                 compression_threshold: 256,
                 compression_level: 6,
                 shutdown_timeout_secs: 10,
+                forwarding_secret_file: default_forwarding_secret_file(),
             },
             network: NetworkConfig::default(),
             motd: MotdConfig {
@@ -402,20 +411,72 @@ impl Default for Config {
 
 pub use crate::permissions::{GroupConfig, PermissionsConfig, UserPermissionConfig};
 
+fn needs_shared_secret(server: &BackendConfig) -> bool {
+    matches!(
+        server.forwarding,
+        ForwardingMode::Velocity | ForwardingMode::Vine
+    ) && server.secret.as_deref().is_none_or(|s| s.trim().is_empty())
+}
+
+fn load_or_create_secret_file(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    match std::fs::read_to_string(path) {
+        Ok(content) if content.trim().is_empty() => {
+            Err(format!("forwarding secret file '{}' is empty", path.display()).into())
+        }
+        Ok(content) => Ok(content.trim().to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let secret = generate_forwarding_secret();
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+            options.open(path)?.write_all(secret.as_bytes())?;
+            tracing::info!(
+                "Generated a new forwarding secret in '{}'; use it as proxies.velocity.secret in each Paper backend",
+                path.display()
+            );
+            Ok(secret)
+        }
+        Err(e) => Err(format!(
+            "failed to read forwarding secret file '{}': {e}",
+            path.display()
+        )
+        .into()),
+    }
+}
+
 impl Config {
     pub fn load_or_create<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
         let path = path.as_ref();
-        if path.exists() {
-            let content = std::fs::read_to_string(path)?;
-            let config: Config = toml::from_str(&content)?;
-            config.validate()?;
-            Ok(config)
+        let mut config = if path.exists() {
+            toml::from_str(&std::fs::read_to_string(path)?)?
         } else {
             let default_config = Config::default();
-            let toml_string = toml::to_string_pretty(&default_config)?;
-            std::fs::write(path, toml_string)?;
-            Ok(default_config)
+            std::fs::write(path, toml::to_string_pretty(&default_config)?)?;
+            default_config
+        };
+        let env_secret = std::env::var(FORWARDING_SECRET_ENV).ok();
+        config.resolve_forwarding_secret(path.parent().unwrap_or(Path::new("")), env_secret)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn resolve_forwarding_secret(
+        &mut self,
+        config_dir: &Path,
+        env_secret: Option<String>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !self.servers.values().any(needs_shared_secret) {
+            return Ok(());
         }
+        let secret = match env_secret.as_deref().map(str::trim) {
+            Some(secret) if !secret.is_empty() => secret.to_string(),
+            _ => load_or_create_secret_file(&config_dir.join(&self.server.forwarding_secret_file))?,
+        };
+        for server in self.servers.values_mut().filter(|s| needs_shared_secret(s)) {
+            server.secret = Some(secret.clone());
+        }
+        Ok(())
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -455,11 +516,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_default_config_generates_unique_secrets() {
-        let a = Config::default();
-        let b = Config::default();
+    fn test_shared_secret_file_is_generated_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = Config::default();
+        a.resolve_forwarding_secret(dir.path(), None).unwrap();
         assert!(a.validate().is_ok());
-        assert_ne!(a.servers["lobby"].secret, b.servers["lobby"].secret);
+
+        let path = dir.path().join("forwarding.secret");
+        let secret = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(secret.len(), 64);
+        assert_eq!(a.servers["lobby"].secret.as_deref(), Some(secret.as_str()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+
+        let mut b = Config::default();
+        b.resolve_forwarding_secret(dir.path(), None).unwrap();
+        assert_eq!(b.servers["lobby"].secret, a.servers["lobby"].secret);
     }
 
     #[test]
