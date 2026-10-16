@@ -5,7 +5,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-const MAX_TRACKED_ADDRESSES: usize = 65_536;
 const PRUNE_INTERVAL: Duration = Duration::from_secs(1);
 
 struct TokenBucket {
@@ -72,25 +71,19 @@ impl ConnectionRateLimiter {
             return true;
         };
         let buckets = &mut *buckets;
-        let key = bucket_key(ip);
 
-        if !buckets.map.contains_key(&key) && buckets.map.len() >= MAX_TRACKED_ADDRESSES / 2 {
-            let now = Instant::now();
-            if now.duration_since(buckets.last_prune) >= PRUNE_INTERVAL {
-                buckets.last_prune = now;
-                let idle = self.refill_time();
-                buckets
-                    .map
-                    .retain(|_, b| now.duration_since(b.last_update) < idle);
-            }
-            if buckets.map.len() >= MAX_TRACKED_ADDRESSES {
-                return false;
-            }
+        let now = Instant::now();
+        if now.duration_since(buckets.last_prune) >= PRUNE_INTERVAL {
+            buckets.last_prune = now;
+            let idle = self.refill_time();
+            buckets
+                .map
+                .retain(|_, b| now.duration_since(b.last_update) < idle);
         }
 
         buckets
             .map
-            .entry(key)
+            .entry(bucket_key(ip))
             .or_insert_with(|| TokenBucket::new(self.burst))
             .try_consume(self.rate_per_sec, self.burst)
     }
@@ -180,14 +173,22 @@ mod tests {
     }
 
     #[test]
-    fn test_tracked_addresses_are_bounded() {
+    fn test_idle_addresses_are_forgotten() {
         let limiter = ConnectionRateLimiter::new(true, 1, 5);
-        for i in 0..MAX_TRACKED_ADDRESSES as u32 + 100 {
-            limiter.check_connection(&IpAddr::from(i.to_be_bytes()));
+        let idle: IpAddr = "192.0.2.1".parse().unwrap();
+        let active: IpAddr = "192.0.2.2".parse().unwrap();
+        assert!(limiter.check_connection(&idle));
+
+        {
+            let mut buckets = limiter.buckets.lock().unwrap();
+            let past = Instant::now() - Duration::from_secs(10);
+            buckets.last_prune = past;
+            buckets.map.get_mut(&idle).unwrap().last_update = past;
         }
-        assert_eq!(
-            limiter.buckets.lock().unwrap().map.len(),
-            MAX_TRACKED_ADDRESSES
-        );
+        assert!(limiter.check_connection(&active));
+
+        let buckets = limiter.buckets.lock().unwrap();
+        assert!(!buckets.map.contains_key(&idle));
+        assert!(buckets.map.contains_key(&active));
     }
 }
