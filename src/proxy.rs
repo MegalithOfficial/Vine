@@ -94,8 +94,9 @@ impl ProxyServer {
     /// Run the proxy listener loop
     pub async fn run(
         &self,
-        mut shutdown_rx: broadcast::Receiver<()>,
+        shutdown_tx: broadcast::Sender<()>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut shutdown_rx = shutdown_tx.subscribe();
         let bind_addr = &self.config.server.bind_address;
         let listener = network::create_tcp_listener(bind_addr, &self.config.network)?;
 
@@ -239,7 +240,10 @@ impl ProxyServer {
                     cmd_opt = stdin_rx.recv() => {
                         match cmd_opt {
                             Some(trimmed) => {
-                                if !trimmed.is_empty() {
+                                if trimmed.eq_ignore_ascii_case("stop") || trimmed.eq_ignore_ascii_case("end") {
+                                    info!("Received stop command from console. Initiating graceful shutdown...");
+                                    let _ = shutdown_tx.send(());
+                                } else if !trimmed.is_empty() {
                                     let source = ProxyCommandSource {
                                         sender: CommandSender::Console,
                                         config: console_config.clone(),
