@@ -288,9 +288,17 @@ impl BackendBridge {
                         .as_deref()
                         .ok_or_else(|| BridgeError::VelocityError("Secret missing".to_string()))?;
 
+                    let forwarding_version =
+                        ForwardingHelper::velocity_forwarding_version(&request.data, version);
+                    debug!(
+                        "Answering Velocity forwarding request {:?} with version {}",
+                        request.data, forwarding_version
+                    );
+
                     Some(
                         ForwardingHelper::build_velocity_payload(
                             secret,
+                            forwarding_version,
                             &self.client_ip,
                             &self.player,
                         )

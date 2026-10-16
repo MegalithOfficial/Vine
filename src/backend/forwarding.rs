@@ -6,12 +6,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 use crate::auth::AuthenticatedPlayer;
+use crate::protocol::ProtocolVersion;
 use crate::protocol::wire::WriteExt;
 
 type HmacSha256 = Hmac<Sha256>;
 
 pub const VELOCITY_PLAYER_INFO_CHANNEL: &str = "velocity:player_info";
-pub const VELOCITY_FORWARDING_VERSION: i32 = 4;
+pub const VELOCITY_FORWARDING_DEFAULT: i32 = 1;
+pub const VELOCITY_FORWARDING_LAZY_SESSION: i32 = 4;
 
 pub const VINE_PLAYER_INFO_CHANNEL: &str = "vine:player_info";
 pub const VINE_FORWARDING_VERSION: i32 = 1;
@@ -29,6 +31,20 @@ pub enum ForwardingError {
 pub struct ForwardingHelper;
 
 impl ForwardingHelper {
+    pub fn velocity_forwarding_version(request: &[u8], client_version: ProtocolVersion) -> i32 {
+        let requested = match request {
+            [version] => i32::from(*version as i8),
+            _ => VELOCITY_FORWARDING_DEFAULT,
+        };
+        if requested >= VELOCITY_FORWARDING_LAZY_SESSION
+            && client_version >= ProtocolVersion::V1_19_3
+        {
+            VELOCITY_FORWARDING_LAZY_SESSION
+        } else {
+            VELOCITY_FORWARDING_DEFAULT
+        }
+    }
+
     /// Builds the BungeeCord virtual host handshake string for Bukkit / Spigot / PaperMC:
     /// Format: `"{host}\0{client_ip}\0{uuid_without_hyphens}\0{json_properties}"`
     pub fn build_bungeecord_host(
@@ -50,13 +66,14 @@ impl ForwardingHelper {
     /// Builds the Velocity player info plugin response data for PaperMC / Purpur / Pumpkin:
     /// Contains:
     /// - 32-byte HMAC-SHA256 signature
-    /// - Forwarding version (VarInt 4)
+    /// - Forwarding version (VarInt)
     /// - Client IP address string
     /// - Player UUID (16 raw bytes)
     /// - Player username string
     /// - Properties list (name, value, optional signature)
     pub fn build_velocity_payload(
         secret: &str,
+        version: i32,
         client_ip: &IpAddr,
         player: &AuthenticatedPlayer,
     ) -> Result<Vec<u8>, ForwardingError> {
@@ -66,7 +83,7 @@ impl ForwardingHelper {
 
         let mut payload = Vec::new();
 
-        payload.write_varint(VELOCITY_FORWARDING_VERSION);
+        payload.write_varint(version);
 
         let ip_str = client_ip.to_string();
         payload.write_string(&ip_str);
@@ -215,11 +232,26 @@ mod tests {
         let ip: IpAddr = "127.0.0.1".parse().unwrap();
         let secret = "test-secret-key";
 
-        let result = ForwardingHelper::build_velocity_payload(secret, &ip, &player);
-        assert!(result.is_ok());
-        let data = result.unwrap();
-
+        let data = ForwardingHelper::build_velocity_payload(secret, 4, &ip, &player).unwrap();
         assert!(data.len() > 32);
+        assert_eq!(data[32], 4);
+    }
+
+    #[test]
+    fn test_velocity_forwarding_version_negotiation() {
+        let pick = ForwardingHelper::velocity_forwarding_version;
+        let modern = ProtocolVersion::V1_19_3;
+        let keyed = ProtocolVersion::V1_19_1;
+
+        assert_eq!(pick(&[], modern), 1);
+        assert_eq!(pick(&[1], modern), 1);
+        assert_eq!(pick(&[3], modern), 1);
+        assert_eq!(pick(&[4], modern), 4);
+        assert_eq!(pick(&[9], modern), 4);
+        assert_eq!(pick(&[4], keyed), 1);
+        assert_eq!(pick(&[3], keyed), 1);
+        assert_eq!(pick(&[0xff], modern), 1);
+        assert_eq!(pick(&[4, 0], modern), 1);
     }
 
     #[test]
