@@ -1,0 +1,5 @@
+[advisories]
+ignore = [
+    { id = "RUSTSEC-2023-0071", reason = "No fixed rsa release exists; online-mode login needs PKCS#1 v1.5 decryption like vanilla, and the key pair is regenerated on every start" },
+    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 is pulled in by Pumpkin's pumpkin-macros and only runs at compile time" },
+]
