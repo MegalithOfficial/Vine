@@ -31,7 +31,7 @@ pub struct BedrockConfig {
 impl Default for BedrockConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             bind_address: "0.0.0.0:19132".to_string(),
             motd: "§a§lVine §7» §fHigh-Performance Minecraft Proxy".to_string(),
             sub_motd: "Bedrock Support • 1.26.x".to_string(),
