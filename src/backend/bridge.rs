@@ -34,8 +34,9 @@ use crate::protocol::packets::login::{
 };
 use crate::protocol::packets::play::{
     ChatCommand, ChatMessage, ClientboundPluginMessage, CommandSuggestionRequest,
-    CommandSuggestions, InjectedCommand, PlayDisconnect, ServerboundPluginMessage,
-    StartConfiguration, Suggestion, SystemChat, Transfer, inject_commands,
+    CommandSuggestions, InjectedCommand, PlayDisconnect, PlayKeepAlive, PlayKeepAliveResponse,
+    ServerboundPluginMessage, StartConfiguration, Suggestion, SystemChat, Transfer,
+    inject_commands,
 };
 use crate::protocol::text::{component_json, plain_text};
 use crate::protocol::{
@@ -405,6 +406,9 @@ impl BackendBridge {
 
         // Forward login success packet to the client
         client_writer.send(success_bytes).await?;
+        // Keep-alive replies meant for a previous backend would make the current one kick the
+        // player, so only replies to the current backend's latest challenge are forwarded
+        let keep_alive_challenge = std::sync::Mutex::new(None::<i64>);
         let phase = PhaseCell::new(if self.client_version >= ProtocolVersion::V1_20_2 {
             Phase::Login
         } else {
@@ -457,6 +461,7 @@ impl BackendBridge {
                 self.player.id,
                 current_server_name.clone(),
                 &phase,
+                &keep_alive_challenge,
             )
             .await;
 
@@ -556,6 +561,9 @@ impl BackendBridge {
                         Ok((new_reader, new_writer)) => {
                             backend_reader = new_reader;
                             backend_writer = new_writer;
+                            if let Ok(mut challenge) = keep_alive_challenge.lock() {
+                                *challenge = None;
+                            }
                             current_server_name = server_name;
                             self.session_manager
                                 .update_server(&self.player.username, &current_server_name);
@@ -646,6 +654,9 @@ impl BackendBridge {
                         Ok((new_reader, new_writer)) => {
                             backend_reader = new_reader;
                             backend_writer = new_writer;
+                            if let Ok(mut challenge) = keep_alive_challenge.lock() {
+                                *challenge = None;
+                            }
                             current_server_name = fb_name;
                             self.session_manager
                                 .update_server(&self.player.username, &current_server_name);
@@ -957,6 +968,7 @@ impl BackendBridge {
         player_uuid: uuid::Uuid,
         current_server_name: String,
         phase: &PhaseCell,
+        keep_alive_challenge: &std::sync::Mutex<Option<i64>>,
     ) -> Result<TunnelExit, BridgeError>
     where
         R1: AsyncRead + Unpin,
@@ -1007,6 +1019,22 @@ impl BackendBridge {
                         {
                             phase.set(next);
                         } else if current == Phase::Play {
+                            if PacketKind::PlayKeepAliveResponse
+                                .matches(raw_packet.id, client_version)
+                                && let Ok(reply) = decode_packet::<PlayKeepAliveResponse>(
+                                    &raw_packet.payload,
+                                    client_version,
+                                )
+                                && keep_alive_challenge.lock().ok().and_then(|c| *c)
+                                    != Some(reply.id)
+                            {
+                                debug!(
+                                    "Dropping stale keep-alive {} from '{}'",
+                                    reply.id, username
+                                );
+                                continue;
+                            }
+
                             let chat_message = if PacketKind::ChatMessage
                                 .matches(raw_packet.id, client_version)
                             {
@@ -1236,6 +1264,16 @@ impl BackendBridge {
                         }
 
                         if current == Phase::Play {
+                            if PacketKind::PlayKeepAlive.matches(raw_packet.id, client_version)
+                                && let Ok(challenge) = decode_packet::<PlayKeepAlive>(
+                                    &raw_packet.payload,
+                                    client_version,
+                                )
+                                && let Ok(mut current) = keep_alive_challenge.lock()
+                            {
+                                *current = Some(challenge.id);
+                            }
+
                             if PacketKind::PlayDisconnect.matches(raw_packet.id, client_version) {
                                 let reason = decode_packet::<PlayDisconnect>(
                                     &raw_packet.payload,
