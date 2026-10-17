@@ -228,7 +228,9 @@ impl PluginManager {
                 .handle_event(handler.handler_id, wit_evt)
                 .await
             {
-                Ok(loader::wasm::wasm_host::wit::vine::plugin::event::Event::ProxyPing(res)) => {
+                Ok(loader::wasm::wasm_host::wit::vine::plugin::event::Event::ProxyPing(res))
+                    if handler.priority != EventPriority::Monitor =>
+                {
                     event.motd = res.motd;
                     event.max_players = res.max_players;
                     event.online_players = res.online_players;
@@ -270,12 +272,9 @@ impl PluginManager {
             {
                 Ok(loader::wasm::wasm_host::wit::vine::plugin::event::Event::PlayerPreLogin(
                     res,
-                )) => {
+                )) if handler.priority != EventPriority::Monitor => {
                     event.cancelled = res.cancelled;
                     event.cancel_reason = res.cancel_reason;
-                    if event.cancelled {
-                        break;
-                    }
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -310,12 +309,11 @@ impl PluginManager {
                 .handle_event(handler.handler_id, wit_evt)
                 .await
             {
-                Ok(loader::wasm::wasm_host::wit::vine::plugin::event::Event::PlayerLogin(res)) => {
+                Ok(loader::wasm::wasm_host::wit::vine::plugin::event::Event::PlayerLogin(res))
+                    if handler.priority != EventPriority::Monitor =>
+                {
                     event.cancelled = res.cancelled;
                     event.cancel_reason = res.cancel_reason;
-                    if event.cancelled {
-                        break;
-                    }
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -374,13 +372,10 @@ impl PluginManager {
             {
                 Ok(loader::wasm::wasm_host::wit::vine::plugin::event::Event::ServerConnect(
                     res,
-                )) => {
+                )) if handler.priority != EventPriority::Monitor => {
                     event.target_server = res.target_server;
                     event.cancelled = res.cancelled;
                     event.cancel_reason = res.cancel_reason;
-                    if event.cancelled {
-                        break;
-                    }
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -457,12 +452,11 @@ impl PluginManager {
                 .handle_event(handler.handler_id, wit_evt)
                 .await
             {
-                Ok(loader::wasm::wasm_host::wit::vine::plugin::event::Event::PlayerChat(res)) => {
+                Ok(loader::wasm::wasm_host::wit::vine::plugin::event::Event::PlayerChat(res))
+                    if handler.priority != EventPriority::Monitor =>
+                {
                     event.message = res.message;
                     event.cancelled = res.cancelled;
-                    if event.cancelled {
-                        break;
-                    }
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -498,12 +492,9 @@ impl PluginManager {
             {
                 Ok(loader::wasm::wasm_host::wit::vine::plugin::event::Event::PlayerCommand(
                     res,
-                )) => {
+                )) if handler.priority != EventPriority::Monitor => {
                     event.command = res.command;
                     event.cancelled = res.cancelled;
-                    if event.cancelled {
-                        break;
-                    }
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -540,12 +531,9 @@ impl PluginManager {
             {
                 Ok(loader::wasm::wasm_host::wit::vine::plugin::event::Event::PluginMessage(
                     res,
-                )) => {
+                )) if handler.priority != EventPriority::Monitor => {
                     event.data = res.data;
                     event.cancelled = res.cancelled;
-                    if event.cancelled {
-                        break;
-                    }
                 }
                 Ok(_) => {}
                 Err(e) => {
