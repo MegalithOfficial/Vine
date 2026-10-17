@@ -6,11 +6,17 @@ services:
     build: .
     ports:
       - "25565:25565"
-      - "19132:19132/udp"
+      # Only needed when [bedrock] is enabled in vine.toml
+      #- "19132:19132/udp"
     volumes:
-      - ./data:/vine
+      - vine-data:/vine
+      # To keep the files in ./data instead, the directory must be owned by the container user:
+      #   mkdir -p data && sudo chown 2613:2613 data
+      #- ./data:/vine
       # Use the following, if you want to make your config immutable
       #- ./vine.toml:/vine/vine.toml:ro
+    #environment:
+    #  VINE_FORWARDING_SECRET: change-me
     security_opt:
       - no-new-privileges:true
     restart: unless-stopped
@@ -19,3 +25,6 @@ services:
     cap_drop:
       - ALL
     read_only: false
+
+volumes:
+  vine-data:
