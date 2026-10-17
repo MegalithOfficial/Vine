@@ -142,6 +142,16 @@ fn write_nbt_string(buf: &mut Vec<u8>, s: &str) {
     buf.extend_from_slice(&encoded[..encoded.len().min(u16::MAX as usize)]);
 }
 
+pub(crate) fn skip_named_nbt(buf: &mut &[u8]) -> Result<(), ProtocolError> {
+    let tag = buf.read_u8()?;
+    if tag == TAG_END {
+        return Ok(());
+    }
+    let name_len = buf.read_u16()? as usize;
+    buf.read_bytes(name_len)?;
+    read_nbt_payload(buf, tag, 0).map(|_| ())
+}
+
 fn read_nbt_root(buf: &mut &[u8]) -> Result<Value, ProtocolError> {
     let tag = buf.read_u8()?;
     if tag == TAG_END {

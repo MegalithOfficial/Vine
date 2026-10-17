@@ -3,6 +3,7 @@ pub mod handshake;
 pub mod login;
 pub mod play;
 pub mod status;
+pub mod switch;
 
 use bytes::Bytes;
 
@@ -58,6 +59,11 @@ pub enum PacketKind {
     PlayKeepAlive,
     JoinGame,
     Respawn,
+    PlayerInfo,
+    PlayerInfoRemove,
+    BossBar,
+    Title,
+    ClearTitles,
 }
 
 impl PacketKind {
@@ -153,14 +159,28 @@ mod tests {
         (PacketKind::StartConfiguration, &[764]),
         (PacketKind::Transfer, &[]),
         (PacketKind::PlayKeepAlive, &[47, 340]),
+        // Only read before 1.20.2, where switching backends skips the configuration phase
+        (
+            PacketKind::JoinGame,
+            &[
+                47, 109, 477, 573, 735, 751, 755, 757, 759, 763, 764, 766, 768, 773,
+            ],
+        ),
+        (
+            PacketKind::Respawn,
+            &[477, 573, 735, 751, 759, 760, 763, 764, 766, 768, 773],
+        ),
+        (PacketKind::PlayerInfo, &[47, 759, 761, 765, 768, 769]),
+        (PacketKind::PlayerInfoRemove, &[761]),
+        (PacketKind::BossBar, &[107, 765]),
+        (PacketKind::Title, &[47, 315, 755]),
+        (PacketKind::ClearTitles, &[755]),
     ];
 
     const OPAQUE: &[PacketKind] = &[
         PacketKind::LoginSuccess,
         PacketKind::ConfigKnownPacks,
         PacketKind::ConfigKnownPacksResponse,
-        PacketKind::JoinGame,
-        PacketKind::Respawn,
     ];
 
     #[test]

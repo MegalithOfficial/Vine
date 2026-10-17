@@ -38,6 +38,7 @@ use crate::protocol::packets::play::{
     ServerboundPluginMessage, StartConfiguration, Suggestion, SystemChat, Transfer,
     inject_commands,
 };
+use crate::protocol::packets::switch::{Leftovers, join_game_sequence};
 use crate::protocol::text::{component_json, plain_text};
 use crate::protocol::{
     Packet, PacketKind, PacketReader, PacketWriter, ProtocolError, ProtocolVersion, decode_packet,
@@ -425,6 +426,7 @@ impl BackendBridge {
         // Keep-alive replies meant for a previous backend would make the current one kick the
         // player, so only replies to the current backend's latest challenge are forwarded
         let keep_alive_challenge = std::sync::Mutex::new(None::<i64>);
+        let leftovers = std::sync::Mutex::new(Leftovers::default());
         let phase = PhaseCell::new(if self.client_version >= ProtocolVersion::V1_20_2 {
             Phase::Login
         } else {
@@ -478,6 +480,7 @@ impl BackendBridge {
                 current_server_name.clone(),
                 &phase,
                 &keep_alive_challenge,
+                &leftovers,
             )
             .await;
 
@@ -569,6 +572,7 @@ impl BackendBridge {
                             &mut client_reader,
                             &mut client_writer,
                             &phase,
+                            &leftovers,
                             &server_name,
                             &target_config,
                         )
@@ -662,6 +666,7 @@ impl BackendBridge {
                             &mut client_reader,
                             &mut client_writer,
                             &phase,
+                            &leftovers,
                             &fb_name,
                             &fb_cfg,
                         )
@@ -728,6 +733,7 @@ impl BackendBridge {
         client_reader: &mut PacketReader<R>,
         client_writer: &mut PacketWriter<W>,
         phase: &PhaseCell,
+        leftovers: &std::sync::Mutex<Leftovers>,
         server_name: &str,
         config: &BackendConfig,
     ) -> Result<(BackendReader, BackendWriter), SwitchError>
@@ -747,21 +753,35 @@ impl BackendBridge {
             let joined = async {
                 loop {
                     let packet = backend_reader.read_packet().await?;
-                    let is_join = PacketKind::JoinGame.matches(packet.id, version);
-                    pending.push(packet.to_bytes());
-                    if is_join {
-                        return Ok::<_, ProtocolError>(());
+                    if PacketKind::JoinGame.matches(packet.id, version) {
+                        return Ok::<_, ProtocolError>(packet);
                     }
+                    pending.push(packet.to_bytes());
                 }
             };
-            match timeout(SWITCH_ACK_TIMEOUT, joined).await {
-                Ok(Ok(())) => {}
+            let join_game = match timeout(SWITCH_ACK_TIMEOUT, joined).await {
+                Ok(Ok(packet)) => packet,
                 Ok(Err(e)) => return Err(SwitchError::Unreachable(e.into())),
                 Err(_) => {
                     return Err(SwitchError::Unreachable(BridgeError::LoginTimeout(
                         server_name.to_string(),
                     )));
                 }
+            };
+            let joining = join_game_sequence(&join_game, version).unwrap_or_else(|e| {
+                debug!(
+                    "Forwarding JoinGame from '{}' unchanged: {}",
+                    server_name, e
+                );
+                vec![join_game.to_bytes()]
+            });
+            {
+                let mut leftovers = leftovers
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                pending.extend(leftovers.clear_players(version));
+                pending.extend(joining);
+                pending.extend(leftovers.clear_overlays(version));
             }
             for packet in pending {
                 client_writer
@@ -985,6 +1005,7 @@ impl BackendBridge {
         current_server_name: String,
         phase: &PhaseCell,
         keep_alive_challenge: &std::sync::Mutex<Option<i64>>,
+        leftovers: &std::sync::Mutex<Leftovers>,
     ) -> Result<TunnelExit, BridgeError>
     where
         R1: AsyncRead + Unpin,
@@ -1280,6 +1301,12 @@ impl BackendBridge {
                         }
 
                         if current == Phase::Play {
+                            if client_version < ProtocolVersion::V1_20_2
+                                && let Ok(mut leftovers) = leftovers.lock()
+                            {
+                                leftovers.observe(&raw_packet, client_version);
+                            }
+
                             if PacketKind::PlayKeepAlive.matches(raw_packet.id, client_version)
                                 && let Ok(challenge) = decode_packet::<PlayKeepAlive>(
                                     &raw_packet.payload,
