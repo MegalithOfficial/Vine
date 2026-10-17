@@ -119,7 +119,7 @@ pub struct HelpCommandExecutor;
 
 impl CommandExecutor<ProxyCommandSource> for HelpCommandExecutor {
     fn execute(&self, context: &CommandContext<ProxyCommandSource>) -> CommandExecutorResult {
-        let text = "Available commands:\n  - /server [server]            : View current server or switch to another backend\n  - /send <player|all> <server> : Send players to another backend (Admin)\n  - /list                       : List connected players\n  - /glist                      : List players grouped by server\n  - /help [command]             : Show this help or info about a command";
+        let text = "Available commands:\n  - /server [server]            : View current server or switch to another backend\n  - /send <player|all> <server> : Send players to another backend (Admin)\n  - /list                       : List connected players\n  - /glist                      : List players grouped by server\n  - /help [command]             : Show this help or info about a command\n  - /vine plugins|reload [name] : List or reload plugins (Admin)";
         context.source.send_message(TextComponent::text(text));
         Ok(1)
     }
@@ -274,6 +274,13 @@ impl CommandDispatcher {
                 }
             }
             Err(TryLockError::Poisoned(_)) => {}
+        }
+    }
+
+    pub fn deactivate_source(&self, source: &str) {
+        if let Ok(mut lock) = self.inner.write() {
+            self.drain_pending(&mut lock);
+            lock.deactivate_commands_from_source(source);
         }
     }
 

@@ -70,6 +70,16 @@ pub struct WasmPlugin {
 }
 
 impl WasmPlugin {
+    pub fn is_disabled(&self) -> bool {
+        self.killed.load(Ordering::Relaxed)
+    }
+
+    pub async fn shutdown(&self) {
+        let _ = self
+            .guarded(self.store.shutdown(|_| Box::pin(async { Ok(()) })))
+            .await;
+    }
+
     async fn guarded<R>(
         &self,
         call: impl Future<Output = wasmtime::Result<R>>,

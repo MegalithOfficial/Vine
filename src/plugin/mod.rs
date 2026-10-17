@@ -1,3 +1,4 @@
+mod admin;
 pub mod api;
 pub mod loader;
 
@@ -8,7 +9,7 @@ use loader::wasm::wasm_host::state::ProxyPluginContext;
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{OnceCell, RwLock};
 use tracing::{error, info, warn};
@@ -23,11 +24,26 @@ pub struct RegisteredEventHandler {
     pub plugin: Arc<WasmPlugin>,
 }
 
+struct LoadedPlugin {
+    plugin: Arc<WasmPlugin>,
+    path: PathBuf,
+}
+
+#[derive(Clone)]
+struct CommandRoute {
+    plugin: Arc<WasmPlugin>,
+    command_id: u32,
+}
+
+// Command nodes outlive a reload, so they look up the plugin that currently owns the name
+type CommandRoutes = Arc<std::sync::RwLock<HashMap<String, CommandRoute>>>;
+
 pub struct PluginManager {
     plugins_dir: PathBuf,
     loader: WasmPluginLoader,
-    loaded_plugins: RwLock<Vec<Arc<WasmPlugin>>>,
+    loaded_plugins: RwLock<Vec<LoadedPlugin>>,
     event_handlers: RwLock<HashMap<EventType, Vec<RegisteredEventHandler>>>,
+    command_routes: CommandRoutes,
     proxy_ctx: OnceCell<ProxyPluginContext>,
 }
 
@@ -42,6 +58,7 @@ impl PluginManager {
             loader,
             loaded_plugins: RwLock::new(Vec::new()),
             event_handlers: RwLock::new(HashMap::new()),
+            command_routes: Arc::default(),
             proxy_ctx: OnceCell::new(),
         }))
     }
@@ -58,6 +75,7 @@ impl PluginManager {
             command_dispatcher,
             plugin_manager: self.clone(),
         };
+        admin::register(&ctx.command_dispatcher, self);
         let _ = self.proxy_ctx.set(ctx);
     }
 
@@ -91,10 +109,22 @@ impl PluginManager {
             let names = std::iter::once(name.clone())
                 .chain(aliases)
                 .collect::<Vec<_>>();
+            if let Ok(mut routes) = self.command_routes.write() {
+                for cmd_name in &names {
+                    routes.insert(
+                        cmd_name.to_ascii_lowercase(),
+                        CommandRoute {
+                            plugin: plugin.clone(),
+                            command_id,
+                        },
+                    );
+                }
+            }
             for cmd_name in names {
-                let plugin_cmd = plugin.clone();
+                let route = cmd_name.to_ascii_lowercase();
                 let perm_check = permission.clone();
                 let cmd_builder = pumpkin_command::argument_builder::command(cmd_name, description.clone())
+                    .with_source(plugin.metadata.name.clone())
                     .requires(move |src: &ProxyCommandSource| {
                         if let Some(ref p) = perm_check {
                             src.has_permission(p)
@@ -103,8 +133,8 @@ impl PluginManager {
                         }
                     })
                     .executes(PluginCommandExecutor {
-                        command_id,
-                        plugin: plugin_cmd.clone(),
+                        name: route.clone(),
+                        routes: self.command_routes.clone(),
                     })
                     .then(
                         pumpkin_command::argument_builder::argument(
@@ -112,12 +142,12 @@ impl PluginManager {
                             pumpkin_command::argument_types::core::string::StringArgumentType::GreedyPhrase,
                         )
                         .suggests(PluginCommandSuggestionProvider {
-                            command_id,
-                            plugin: plugin_cmd.clone(),
+                            name: route.clone(),
+                            routes: self.command_routes.clone(),
                         })
                         .executes(PluginCommandExecutor {
-                            command_id,
-                            plugin: plugin_cmd,
+                            name: route,
+                            routes: self.command_routes.clone(),
                         }),
                     );
                 proxy.command_dispatcher.register(cmd_builder);
@@ -146,36 +176,13 @@ impl PluginManager {
             }
         };
 
-        let proxy = self.proxy_ctx.get().cloned();
-
         for entry in read_dir.flatten() {
             let path = entry.path();
             if path.is_file() && self.loader.can_load(&path) {
                 info!("Loading plugin from '{}'...", path.display());
-                match self.loader.load(&path, proxy.clone()).await {
-                    Ok((plugin, metadata)) => {
-                        let data_folder =
-                            PathBuf::from("plugins").join("data").join(&metadata.name);
-                        let context = Arc::new(PluginContext::new(metadata.clone(), data_folder));
-                        match plugin.on_load(context).await {
-                            Ok(()) => {
-                                info!(
-                                    "Loaded plugin '{}' v{} by {}",
-                                    metadata.name,
-                                    metadata.version,
-                                    metadata.authors.join(", ")
-                                );
-                                self.loaded_plugins.write().await.push(plugin);
-                                count += 1;
-                            }
-                            Err(e) => {
-                                error!("Plugin '{}' failed to on_load: {}", metadata.name, e);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to load plugin '{}': {}", path.display(), e);
-                    }
+                match self.load_plugin(&path).await {
+                    Ok(_) => count += 1,
+                    Err(e) => error!("{}", e),
                 }
             }
         }
@@ -184,24 +191,146 @@ impl PluginManager {
         Ok(count)
     }
 
-    pub async fn unload_plugins(&self) {
-        let plugins = {
-            let mut lock = self.loaded_plugins.write().await;
-            std::mem::take(&mut *lock)
-        };
-
-        for plugin in plugins {
-            let data_folder = PathBuf::from("plugins")
-                .join("data")
-                .join(&plugin.metadata.name);
-            let context = Arc::new(PluginContext::new(plugin.metadata.clone(), data_folder));
-            if let Err(e) = plugin.on_unload(context).await {
-                error!("Error unloading plugin '{}': {}", plugin.metadata.name, e);
-            } else {
-                info!("Unloaded plugin '{}'", plugin.metadata.name);
-            }
+    async fn load_plugin(&self, path: &Path) -> Result<PluginMetadata, String> {
+        let (plugin, metadata) = self
+            .loader
+            .load(path, self.proxy_ctx.get().cloned())
+            .await
+            .map_err(|e| format!("Failed to load plugin '{}': {}", path.display(), e))?;
+        if self.is_loaded(&metadata.name).await {
+            return Err(format!(
+                "Plugin '{}' from '{}' is already loaded",
+                metadata.name,
+                path.display()
+            ));
         }
+        self.enable_plugin(plugin, path.to_path_buf()).await?;
+        Ok(metadata)
+    }
 
+    async fn enable_plugin(&self, plugin: Arc<WasmPlugin>, path: PathBuf) -> Result<(), String> {
+        let metadata = plugin.metadata.clone();
+        plugin
+            .on_load(Self::plugin_context(&metadata))
+            .await
+            .map_err(|e| format!("Plugin '{}' failed to on_load: {}", metadata.name, e))?;
+        info!(
+            "Loaded plugin '{}' v{} by {}",
+            metadata.name,
+            metadata.version,
+            metadata.authors.join(", ")
+        );
+        self.loaded_plugins
+            .write()
+            .await
+            .push(LoadedPlugin { plugin, path });
+        Ok(())
+    }
+
+    fn plugin_context(metadata: &PluginMetadata) -> Arc<PluginContext> {
+        let data_folder = PathBuf::from("plugins").join("data").join(&metadata.name);
+        Arc::new(PluginContext::new(metadata.clone(), data_folder))
+    }
+
+    async fn is_loaded(&self, name: &str) -> bool {
+        self.loaded_plugins
+            .read()
+            .await
+            .iter()
+            .any(|loaded| loaded.plugin.metadata.name == name)
+    }
+
+    pub async fn plugin_names(&self) -> Vec<String> {
+        self.loaded_plugins
+            .read()
+            .await
+            .iter()
+            .map(|loaded| loaded.plugin.metadata.name.clone())
+            .collect()
+    }
+
+    fn plugin_names_now(&self) -> Vec<String> {
+        self.loaded_plugins
+            .try_read()
+            .map(|plugins| {
+                plugins
+                    .iter()
+                    .map(|loaded| loaded.plugin.metadata.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub async fn plugin_list(&self) -> Vec<(PluginMetadata, bool)> {
+        self.loaded_plugins
+            .read()
+            .await
+            .iter()
+            .map(|loaded| (loaded.plugin.metadata.clone(), loaded.plugin.is_disabled()))
+            .collect()
+    }
+
+    async fn unload_plugin(&self, name: &str) -> Option<PathBuf> {
+        let loaded = {
+            let mut plugins = self.loaded_plugins.write().await;
+            let index = plugins
+                .iter()
+                .position(|loaded| loaded.plugin.metadata.name == name)?;
+            plugins.remove(index)
+        };
+        let plugin = &loaded.plugin;
+        if !plugin.is_disabled()
+            && let Err(e) = plugin
+                .on_unload(Self::plugin_context(&plugin.metadata))
+                .await
+        {
+            error!("Error unloading plugin '{}': {}", name, e);
+        }
+        plugin.shutdown().await;
+        for handlers in self.event_handlers.write().await.values_mut() {
+            handlers.retain(|handler| !Arc::ptr_eq(&handler.plugin, plugin));
+        }
+        if let Ok(mut routes) = self.command_routes.write() {
+            routes.retain(|_, route| !Arc::ptr_eq(&route.plugin, plugin));
+        }
+        if let Some(proxy) = self.proxy_ctx.get() {
+            proxy.command_dispatcher.deactivate_source(name);
+        }
+        info!("Unloaded plugin '{}'", name);
+        Some(loaded.path)
+    }
+
+    /// Swaps a plugin for a fresh instance of its file; a file that fails to load leaves the
+    /// running instance untouched
+    pub async fn reload_plugin(&self, name: &str) -> Result<PluginMetadata, String> {
+        let path = self
+            .loaded_plugins
+            .read()
+            .await
+            .iter()
+            .find(|loaded| loaded.plugin.metadata.name == name)
+            .map(|loaded| loaded.path.clone())
+            .ok_or_else(|| format!("Plugin '{name}' is not loaded"))?;
+        let (plugin, metadata) = self
+            .loader
+            .load(&path, self.proxy_ctx.get().cloned())
+            .await
+            .map_err(|e| format!("Failed to reload plugin '{}': {}", name, e))?;
+        self.unload_plugin(name).await;
+        if metadata.name != name && self.is_loaded(&metadata.name).await {
+            return Err(format!(
+                "Plugin '{}' now reports the name '{}', which is already loaded",
+                name, metadata.name
+            ));
+        }
+        self.enable_plugin(plugin, path).await?;
+        Ok(metadata)
+    }
+
+    pub async fn unload_plugins(&self) {
+        for name in self.plugin_names().await {
+            self.unload_plugin(&name).await;
+        }
         self.event_handlers.write().await.clear();
     }
 
@@ -549,8 +678,12 @@ impl PluginManager {
 }
 
 struct PluginCommandExecutor {
-    command_id: u32,
-    plugin: Arc<WasmPlugin>,
+    name: String,
+    routes: CommandRoutes,
+}
+
+fn resolve_route(routes: &CommandRoutes, name: &str) -> Option<CommandRoute> {
+    routes.read().ok()?.get(name).cloned()
 }
 
 impl pumpkin_command::node::CommandExecutor<ProxyCommandSource> for PluginCommandExecutor {
@@ -588,8 +721,15 @@ impl pumpkin_command::node::CommandExecutor<ProxyCommandSource> for PluginComman
             }
         };
 
-        let plugin = self.plugin.clone();
-        let command_id = self.command_id;
+        let Some(CommandRoute { plugin, command_id }) = resolve_route(&self.routes, &self.name)
+        else {
+            context
+                .source
+                .send_message(pumpkin_util::text::TextComponent::text(
+                    "§cThis plugin command is no longer available.",
+                ));
+            return Ok(0);
+        };
         let handle = tokio::runtime::Handle::current();
         let result = tokio::task::block_in_place(|| {
             handle.block_on(async move { plugin.handle_command(command_id, sender, args).await })
@@ -618,8 +758,8 @@ impl pumpkin_command::node::CommandExecutor<ProxyCommandSource> for PluginComman
 }
 
 struct PluginCommandSuggestionProvider {
-    command_id: u32,
-    plugin: Arc<WasmPlugin>,
+    name: String,
+    routes: CommandRoutes,
 }
 
 impl pumpkin_command::suggestion::provider::SuggestionProvider<ProxyCommandSource>
@@ -660,8 +800,10 @@ impl pumpkin_command::suggestion::provider::SuggestionProvider<ProxyCommandSourc
             }
         };
 
-        let plugin = self.plugin.clone();
-        let command_id = self.command_id;
+        let Some(CommandRoute { plugin, command_id }) = resolve_route(&self.routes, &self.name)
+        else {
+            return builder.build();
+        };
         let handle = tokio::runtime::Handle::current();
         let suggestions_res = tokio::task::block_in_place(|| {
             handle.block_on(async move {
