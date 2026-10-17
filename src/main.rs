@@ -39,11 +39,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let signal_tx = shutdown_tx.clone();
 
     tokio::spawn(async move {
-        if let Err(err) = tokio::signal::ctrl_c().await {
-            error!("Failed to listen for shutdown signal: {}", err);
-        } else {
-            info!("Received shutdown signal (Ctrl+C). Initiating graceful shutdown...");
-            let _ = signal_tx.send(());
+        match shutdown_signal().await {
+            Ok(signal) => {
+                info!("Received shutdown signal ({signal}). Initiating graceful shutdown...");
+                let _ = signal_tx.send(());
+            }
+            Err(err) => error!("Failed to listen for shutdown signal: {}", err),
         }
     });
 
@@ -54,4 +55,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Vine proxy shut down successfully.");
     std::process::exit(0);
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() -> std::io::Result<&'static str> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut terminate = signal(SignalKind::terminate())?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result.map(|()| "Ctrl+C"),
+        _ = terminate.recv() => Ok("SIGTERM"),
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> std::io::Result<&'static str> {
+    tokio::signal::ctrl_c().await.map(|()| "Ctrl+C")
 }
