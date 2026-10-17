@@ -1,18 +1,22 @@
+FROM rust:1-alpine AS builder
+
+RUN apk add --no-cache musl-dev git
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+COPY wit ./wit
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/build/target \
+    cargo build --release --locked && \
+    cp target/release/vine /usr/local/bin/vine
+
 FROM alpine:3.24
 
-ARG TARGETARCH
-ARG VINE_TAG=nightly
-
-RUN apk add --no-cache curl ca-certificates && \
-    case "${TARGETARCH}" in \
-        "amd64") BIN_ARCH="X64" ;; \
-        "arm64") BIN_ARCH="ARM64" ;; \
-        *) echo "Unsupported architecture: ${TARGETARCH}" && exit 1 ;; \
-    esac && \
-    curl -fsSL "https://github.com/Pumpkin-MC/Vine/releases/download/${VINE_TAG}/vine-${BIN_ARCH}-Linux-musl" \
-        -o /usr/local/bin/vine && \
-    chmod +x /usr/local/bin/vine && \
-    apk del curl
+COPY --from=builder /usr/local/bin/vine /usr/local/bin/vine
 
 RUN addgroup -g 2613 vine && \
     adduser -u 2613 -G vine -D -h /vine vine && \
@@ -23,7 +27,6 @@ USER vine:vine
 
 ENV RUST_BACKTRACE=1
 EXPOSE 25565
-EXPOSE 19132/udp
 
 ENTRYPOINT [ "vine" ]
 

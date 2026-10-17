@@ -7,10 +7,6 @@
 # Allow the source code folders
 !/src/
 !/wit/
-!/vine.toml
-
-# Allow build.rs or git sha
-!/.git
 
 # Dependencies
 !Cargo.lock
