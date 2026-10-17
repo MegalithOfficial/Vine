@@ -81,6 +81,20 @@ pub struct PluginConfig {
     pub enabled: bool,
     #[serde(default = "default_plugins_dir")]
     pub plugin_dir: String,
+    /// Linear memory a single plugin may allocate
+    #[serde(default = "default_plugin_memory_mb")]
+    pub max_memory_mb: u64,
+    /// A plugin call running longer than this disables the plugin
+    #[serde(default = "default_plugin_call_timeout_ms")]
+    pub call_timeout_ms: u64,
+}
+
+fn default_plugin_memory_mb() -> u64 {
+    256
+}
+
+fn default_plugin_call_timeout_ms() -> u64 {
+    5000
 }
 
 fn default_plugins_dir() -> String {
@@ -92,6 +106,8 @@ impl Default for PluginConfig {
         Self {
             enabled: true,
             plugin_dir: default_plugins_dir(),
+            max_memory_mb: default_plugin_memory_mb(),
+            call_timeout_ms: default_plugin_call_timeout_ms(),
         }
     }
 }

@@ -3,11 +3,14 @@ pub mod state;
 pub mod wit;
 
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use thiserror::Error;
 use wasmtime::component::{Component, HasSelf, Linker};
-use wasmtime::{Engine, Store};
+use wasmtime::{Engine, Store, UpdateDeadline};
 
 use crate::plugin::api::{Plugin, PluginContext, PluginFuture, PluginMetadata};
 use concurrent_store::{LegacyStore, LegacySyncReentry, TokioSpawner};
@@ -29,6 +32,26 @@ pub enum PluginInitError {
     GetMetadataFailed(wasmtime::Error),
     #[error("Engine creation failed: {0}")]
     EngineCreationFailed(wasmtime::Error),
+    #[error("Plugin did not finish initializing within {0:?}")]
+    InitTimedOut(Duration),
+}
+
+const EPOCH_TICK: Duration = Duration::from_millis(10);
+
+#[derive(Clone, Copy, Debug)]
+pub struct PluginLimits {
+    pub max_memory_bytes: usize,
+    pub call_timeout: Duration,
+}
+
+impl From<&crate::config::PluginConfig> for PluginLimits {
+    fn from(config: &crate::config::PluginConfig) -> Self {
+        Self {
+            max_memory_bytes: usize::try_from(config.max_memory_mb.saturating_mul(1024 * 1024))
+                .unwrap_or(usize::MAX),
+            call_timeout: Duration::from_millis(config.call_timeout_ms),
+        }
+    }
 }
 
 pub fn setup_linker(engine: &Engine) -> wasmtime::Result<Linker<PluginHostState>> {
@@ -42,39 +65,62 @@ pub struct WasmPlugin {
     pub instance: wit::Plugin,
     pub store: LegacyStore,
     pub metadata: PluginMetadata,
+    killed: Arc<AtomicBool>,
+    call_timeout: Duration,
 }
 
 impl WasmPlugin {
+    async fn guarded<R>(
+        &self,
+        call: impl Future<Output = wasmtime::Result<R>>,
+    ) -> wasmtime::Result<R> {
+        if self.killed.load(Ordering::Relaxed) {
+            return Err(wasmtime::Error::msg(
+                "plugin was disabled after exceeding its time limit",
+            ));
+        }
+        match tokio::time::timeout(self.call_timeout, call).await {
+            Ok(result) => result,
+            Err(_) => {
+                self.killed.store(true, Ordering::Relaxed);
+                tracing::error!(
+                    "Plugin '{}' took longer than {:?} and has been disabled",
+                    self.metadata.name,
+                    self.call_timeout
+                );
+                Err(wasmtime::Error::msg("plugin call timed out"))
+            }
+        }
+    }
+
     pub async fn on_load(&self, context: Arc<PluginContext>) -> Result<(), String> {
         let func = self.instance.func_on_load();
         let context_clone = context.clone();
-        self.store
-            .call_guest(move |mut guest| {
-                Box::pin(async move {
-                    let context_res =
-                        guest.with(|mut store| store.data_mut().add_context(context_clone))?;
-                    let (res,) = guest.call(func, (context_res,)).await?;
-                    Ok(res)
-                })
+        self.guarded(self.store.call_guest(move |mut guest| {
+            Box::pin(async move {
+                let context_res =
+                    guest.with(|mut store| store.data_mut().add_context(context_clone))?;
+                let (res,) = guest.call(func, (context_res,)).await?;
+                Ok(res)
             })
-            .await
-            .map_err(|e| e.to_string())?
+        }))
+        .await
+        .map_err(|e| e.to_string())?
     }
 
     pub async fn on_unload(&self, context: Arc<PluginContext>) -> Result<(), String> {
         let func = self.instance.func_on_unload();
         let context_clone = context.clone();
-        self.store
-            .call_guest(move |mut guest| {
-                Box::pin(async move {
-                    let context_res =
-                        guest.with(|mut store| store.data_mut().add_context(context_clone))?;
-                    let (res,) = guest.call(func, (context_res,)).await?;
-                    Ok(res)
-                })
+        self.guarded(self.store.call_guest(move |mut guest| {
+            Box::pin(async move {
+                let context_res =
+                    guest.with(|mut store| store.data_mut().add_context(context_clone))?;
+                let (res,) = guest.call(func, (context_res,)).await?;
+                Ok(res)
             })
-            .await
-            .map_err(|e| e.to_string())?
+        }))
+        .await
+        .map_err(|e| e.to_string())?
     }
 
     pub async fn handle_event(
@@ -83,14 +129,13 @@ impl WasmPlugin {
         event: wit::vine::plugin::event::Event,
     ) -> Result<wit::vine::plugin::event::Event, wasmtime::Error> {
         let func = self.instance.func_handle_event();
-        self.store
-            .call_guest(move |mut guest| {
-                Box::pin(async move {
-                    let (res,) = guest.call(func, (handler_id, event)).await?;
-                    Ok(res)
-                })
+        self.guarded(self.store.call_guest(move |mut guest| {
+            Box::pin(async move {
+                let (res,) = guest.call(func, (handler_id, event)).await?;
+                Ok(res)
             })
-            .await
+        }))
+        .await
     }
 
     pub async fn handle_command(
@@ -100,14 +145,13 @@ impl WasmPlugin {
         args: Vec<String>,
     ) -> Result<Result<i32, String>, wasmtime::Error> {
         let func = self.instance.func_handle_command();
-        self.store
-            .call_guest(move |mut guest| {
-                Box::pin(async move {
-                    let (res,) = guest.call(func, (command_id, sender, args)).await?;
-                    Ok(res)
-                })
+        self.guarded(self.store.call_guest(move |mut guest| {
+            Box::pin(async move {
+                let (res,) = guest.call(func, (command_id, sender, args)).await?;
+                Ok(res)
             })
-            .await
+        }))
+        .await
     }
 
     pub async fn handle_command_suggestion(
@@ -117,14 +161,13 @@ impl WasmPlugin {
         args: Vec<String>,
     ) -> Result<Vec<String>, wasmtime::Error> {
         let func = self.instance.func_handle_command_suggestion();
-        self.store
-            .call_guest(move |mut guest| {
-                Box::pin(async move {
-                    let (res,) = guest.call(func, (command_id, sender, args)).await?;
-                    Ok(res)
-                })
+        self.guarded(self.store.call_guest(move |mut guest| {
+            Box::pin(async move {
+                let (res,) = guest.call(func, (command_id, sender, args)).await?;
+                Ok(res)
             })
-            .await
+        }))
+        .await
     }
 }
 
@@ -143,16 +186,30 @@ pub struct PluginRuntime {
     linker: Linker<PluginHostState>,
     reentry: LegacySyncReentry,
     spawner: Arc<TokioSpawner>,
+    limits: PluginLimits,
 }
 
 impl PluginRuntime {
-    pub fn new() -> Result<Self, PluginInitError> {
+    pub fn new(limits: PluginLimits) -> Result<Self, PluginInitError> {
         let mut config = wasmtime::Config::new();
         config.wasm_component_model(true);
         config.wasm_component_model_async(true);
         config.concurrency_support(true);
+        config.epoch_interruption(true);
 
         let engine = Engine::new(&config).map_err(PluginInitError::EngineCreationFailed)?;
+        // A plain thread, since a runaway plugin may be what is starving the async runtime
+        let ticker = engine.weak();
+        std::thread::Builder::new()
+            .name("plugin-epoch".to_string())
+            .spawn(move || {
+                while let Some(engine) = ticker.upgrade() {
+                    engine.increment_epoch();
+                    drop(engine);
+                    std::thread::sleep(EPOCH_TICK);
+                }
+            })
+            .map_err(|e| PluginInitError::EngineCreationFailed(wasmtime::Error::msg(e)))?;
         let linker = setup_linker(&engine).map_err(PluginInitError::LinkerSetupFailed)?;
         let reentry = LegacySyncReentry::new();
         let spawner = Arc::new(TokioSpawner::new(tokio::runtime::Handle::current()));
@@ -162,6 +219,7 @@ impl PluginRuntime {
             linker,
             reentry,
             spawner,
+            limits,
         })
     }
 
@@ -192,37 +250,57 @@ impl PluginRuntime {
         let data_folder = PathBuf::from("plugins").join("data").join(&filename);
         let _ = fs::create_dir_all(&data_folder);
 
-        let mut store = Store::new(
-            &self.engine,
-            PluginHostState::new(filename, data_folder, proxy),
-        );
+        let mut state = PluginHostState::new(filename, data_folder, proxy);
+        state.limits = wasmtime::StoreLimitsBuilder::new()
+            .memory_size(self.limits.max_memory_bytes)
+            .build();
+        let killed = state.killed.clone();
+        let mut store = Store::new(&self.engine, state);
         store.limiter(|state| &mut state.limits);
+        store.set_epoch_deadline(1);
+        store.epoch_deadline_callback(|store| {
+            Ok(if store.data().killed.load(Ordering::Relaxed) {
+                UpdateDeadline::Interrupt
+            } else {
+                UpdateDeadline::Yield(1)
+            })
+        });
+        let timeout = self.limits.call_timeout;
 
-        let plugin = self
-            .reentry
-            .scope_bootstrap(plugin_pre.instantiate_async(&mut store))
-            .await
-            .map_err(PluginInitError::InstantiationFailed)?;
+        let plugin = tokio::time::timeout(
+            timeout,
+            self.reentry
+                .scope_bootstrap(plugin_pre.instantiate_async(&mut store)),
+        )
+        .await
+        .map_err(|_| PluginInitError::InitTimedOut(timeout))?
+        .map_err(PluginInitError::InstantiationFailed)?;
 
-        store
-            .run_concurrent(async |accessor| {
+        tokio::time::timeout(
+            timeout,
+            store.run_concurrent(async |accessor| {
                 self.reentry
                     .scope_bootstrap(plugin.call_init_plugin(accessor))
                     .await
-            })
-            .await
-            .map_err(PluginInitError::InitPluginFailed)?
-            .map_err(PluginInitError::InitPluginFailed)?;
+            }),
+        )
+        .await
+        .map_err(|_| PluginInitError::InitTimedOut(timeout))?
+        .map_err(PluginInitError::InitPluginFailed)?
+        .map_err(PluginInitError::InitPluginFailed)?;
 
-        let raw_meta = store
-            .run_concurrent(async |accessor| {
+        let raw_meta = tokio::time::timeout(
+            timeout,
+            store.run_concurrent(async |accessor| {
                 self.reentry
                     .scope_bootstrap(plugin.call_get_metadata(accessor))
                     .await
-            })
-            .await
-            .map_err(PluginInitError::GetMetadataFailed)?
-            .map_err(PluginInitError::GetMetadataFailed)?;
+            }),
+        )
+        .await
+        .map_err(|_| PluginInitError::InitTimedOut(timeout))?
+        .map_err(PluginInitError::GetMetadataFailed)?
+        .map_err(PluginInitError::GetMetadataFailed)?;
 
         let metadata = PluginMetadata {
             name: raw_meta.name.clone(),
@@ -246,6 +324,8 @@ impl PluginRuntime {
             instance: plugin,
             store: legacy_store,
             metadata: metadata.clone(),
+            killed,
+            call_timeout: timeout,
         });
 
         let weak = Arc::downgrade(&wasm_plugin);

@@ -34,8 +34,9 @@ pub struct PluginManager {
 impl PluginManager {
     pub fn new(
         plugins_dir: PathBuf,
+        limits: loader::wasm::PluginLimits,
     ) -> Result<Arc<Self>, loader::wasm::wasm_host::PluginInitError> {
-        let loader = WasmPluginLoader::new()?;
+        let loader = WasmPluginLoader::new(limits)?;
         Ok(Arc::new(Self {
             plugins_dir,
             loader,
@@ -694,8 +695,11 @@ mod tests {
         let config = Arc::new(Config::default());
         let dispatcher = Arc::new(CommandDispatcher::new());
         let session_manager = Arc::new(SessionManager::new());
-        let manager =
-            PluginManager::new(temp_dir.path().to_path_buf()).expect("failed to create manager");
+        let manager = PluginManager::new(
+            temp_dir.path().to_path_buf(),
+            (&crate::config::PluginConfig::default()).into(),
+        )
+        .expect("failed to create manager");
         manager.init_proxy_context(config, session_manager, dispatcher);
 
         let count = manager.load_plugins().await.expect("load failed");
@@ -710,8 +714,11 @@ mod tests {
         let config = Arc::new(Config::default());
         let dispatcher = Arc::new(CommandDispatcher::new());
         let session_manager = Arc::new(SessionManager::new());
-        let manager =
-            PluginManager::new(temp_dir.path().to_path_buf()).expect("failed to create manager");
+        let manager = PluginManager::new(
+            temp_dir.path().to_path_buf(),
+            (&crate::config::PluginConfig::default()).into(),
+        )
+        .expect("failed to create manager");
         manager.init_proxy_context(config, session_manager, dispatcher);
 
         // Proxy ping

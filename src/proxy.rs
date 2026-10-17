@@ -70,7 +70,8 @@ impl ProxyServer {
         let router = Arc::new(Router::new(config.routing.clone(), config.servers.clone()));
 
         let plugins_dir = std::path::PathBuf::from(&config.plugins.plugin_dir);
-        let plugin_manager = crate::plugin::PluginManager::new(plugins_dir)?;
+        let plugin_manager =
+            crate::plugin::PluginManager::new(plugins_dir, (&config.plugins).into())?;
         plugin_manager.init_proxy_context(
             config.clone(),
             session_manager.clone(),

@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Weak};
 
 use wasmtime::component::{Resource, ResourceTable};
@@ -33,6 +34,7 @@ pub struct PluginHostState {
     pub plugin_name: String,
     pub data_folder: PathBuf,
     pub plugin: Option<Weak<WasmPlugin>>,
+    pub killed: Arc<AtomicBool>,
 }
 
 impl Default for PluginHostState {
@@ -59,6 +61,7 @@ impl PluginHostState {
             plugin_name,
             data_folder,
             plugin: None,
+            killed: Arc::new(AtomicBool::new(false)),
         }
     }
 

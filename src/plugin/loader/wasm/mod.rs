@@ -5,15 +5,15 @@ use std::sync::Arc;
 
 use crate::plugin::api::PluginMetadata;
 use wasm_host::state::ProxyPluginContext;
-pub use wasm_host::{PluginRuntime, WasmPlugin};
+pub use wasm_host::{PluginLimits, PluginRuntime, WasmPlugin};
 
 pub struct WasmPluginLoader {
     runtime: PluginRuntime,
 }
 
 impl WasmPluginLoader {
-    pub fn new() -> Result<Self, wasm_host::PluginInitError> {
-        let runtime = PluginRuntime::new()?;
+    pub fn new(limits: PluginLimits) -> Result<Self, wasm_host::PluginInitError> {
+        let runtime = PluginRuntime::new(limits)?;
         Ok(Self { runtime })
     }
 
