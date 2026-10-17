@@ -215,11 +215,16 @@ impl CommandExecutor<ProxyCommandSource> for ListCommandExecutor {
     }
 }
 
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock, RwLockReadGuard, TryLockError};
+
+type CommandBuilder = pumpkin_command::argument_builder::CommandArgumentBuilder<ProxyCommandSource>;
 
 /// Central registry and dispatcher for commands using `pumpkin-command`
 pub struct CommandDispatcher {
     inner: RwLock<RawCommandDispatcher<ProxyCommandSource>>,
+    // Plugins register commands from their store task, which a running plugin command may be
+    // waiting on while the dispatcher is read-locked
+    pending: Mutex<Vec<CommandBuilder>>,
 }
 
 impl Default for CommandDispatcher {
@@ -252,23 +257,47 @@ impl CommandDispatcher {
         );
         Self {
             inner: RwLock::new(dispatcher),
+            pending: Mutex::new(Vec::new()),
         }
     }
 
     /// Registers a new command builder into the dispatcher
-    pub fn register(
-        &self,
-        builder: pumpkin_command::argument_builder::CommandArgumentBuilder<ProxyCommandSource>,
-    ) {
-        if let Ok(mut lock) = self.inner.write() {
-            lock.register(builder);
+    pub fn register(&self, builder: CommandBuilder) {
+        match self.inner.try_write() {
+            Ok(mut lock) => {
+                self.drain_pending(&mut lock);
+                lock.register(builder);
+            }
+            Err(TryLockError::WouldBlock) => {
+                if let Ok(mut pending) = self.pending.lock() {
+                    pending.push(builder);
+                }
+            }
+            Err(TryLockError::Poisoned(_)) => {}
         }
+    }
+
+    fn drain_pending(&self, dispatcher: &mut RawCommandDispatcher<ProxyCommandSource>) {
+        if let Ok(mut pending) = self.pending.lock() {
+            for builder in pending.drain(..) {
+                dispatcher.register(builder);
+            }
+        }
+    }
+
+    fn read(&self) -> Option<RwLockReadGuard<'_, RawCommandDispatcher<ProxyCommandSource>>> {
+        if self.pending.lock().is_ok_and(|pending| !pending.is_empty())
+            && let Ok(mut lock) = self.inner.try_write()
+        {
+            self.drain_pending(&mut lock);
+        }
+        self.inner.read().ok()
     }
 
     /// Returns true if a command with the given name is registered
     pub fn has_command(&self, name: &str) -> bool {
         let clean = name.trim_start_matches('/').to_ascii_lowercase();
-        if let Ok(lock) = self.inner.read() {
+        if let Some(lock) = self.read() {
             lock.has_command(&clean)
         } else {
             false
@@ -277,7 +306,7 @@ impl CommandDispatcher {
 
     /// Dispatches a command for execution, reporting any error messages back to the source
     pub fn handle_command(&self, source: &ProxyCommandSource, input: &str) {
-        if let Ok(lock) = self.inner.read() {
+        if let Some(lock) = self.read() {
             lock.handle_command(source, input);
         }
     }
@@ -290,7 +319,7 @@ impl CommandDispatcher {
     ) -> Result<i32, CommandSyntaxError> {
         let trimmed = input.trim();
         let clean = trimmed.strip_prefix('/').unwrap_or(trimmed);
-        if let Ok(lock) = self.inner.read() {
+        if let Some(lock) = self.read() {
             lock.execute_input(clean, source)
         } else {
             Err(command_error("Command dispatcher lock poisoned"))
@@ -299,7 +328,7 @@ impl CommandDispatcher {
 
     /// Returns all permitted commands for the given source
     pub fn get_all_permitted_commands(&self, source: &ProxyCommandSource) -> Vec<(String, String)> {
-        if let Ok(lock) = self.inner.read() {
+        if let Some(lock) = self.read() {
             lock.get_all_permitted_commands(source)
                 .into_iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -317,7 +346,7 @@ impl CommandDispatcher {
         if clean.contains(' ') {
             let first_word = clean.split_whitespace().next().unwrap_or(clean);
             if self.has_command(first_word)
-                && let Ok(lock) = self.inner.read()
+                && let Some(lock) = self.read()
             {
                 return lock.suggest_with_range(clean, source);
             }
@@ -385,6 +414,17 @@ mod tests {
 
         let res_unknown = dispatcher.execute_input("unknown_cmd", &source);
         assert!(res_unknown.is_err());
+    }
+
+    #[test]
+    fn test_register_while_dispatching_is_deferred() {
+        let dispatcher = CommandDispatcher::new();
+        {
+            let _dispatching = dispatcher.inner.read().unwrap();
+            dispatcher
+                .register(command("late", "Registered mid-dispatch").executes(ListCommandExecutor));
+        }
+        assert!(dispatcher.has_command("late"));
     }
 
     #[test]
