@@ -204,6 +204,12 @@ jobs:
           echo "Generated on: $(date -u +"%Y-%m-%d %H:%M") UTC" >> dist/RELEASE.md
           cat dist/RELEASE.md
 
+      - name: Generate Checksums
+        run: |
+          cd dist
+          sha256sum vine-* > checksums.sha256
+          cat checksums.sha256
+
       - name: Update the nightly tag
         run: |
           git config user.name "github-actions[bot]"
@@ -214,7 +220,9 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           prerelease: true
-          files: dist/vine*
+          files: |
+            dist/vine*
+            dist/checksums.sha256
           tag_name: nightly
           name: Nightly Build
           body_path: dist/RELEASE.md

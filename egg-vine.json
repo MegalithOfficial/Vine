@@ -23,7 +23,7 @@
     },
     "scripts": {
         "installation": {
-            "script": "#!/bin/ash\r\nset -eux\r\n\r\napk add --no-cache curl jq\r\nmkdir -p /mnt/server\r\ncd /mnt/server\r\n\r\nARCH=$(uname -m)\r\ncase \"$ARCH\" in\r\n    x86_64|amd64)\r\n        VINE_ARCH=\"X64\"\r\n        ;;\r\n    aarch64|arm64)\r\n        VINE_ARCH=\"ARM64\"\r\n        ;;\r\n    *)\r\n        echo \"Unsupported architecture: $ARCH\"\r\n        exit 1\r\n        ;;\r\nesac\r\n\r\nBINARY_NAME=\"vine-${VINE_ARCH}-Linux-musl\"\r\n\r\nif [ -n \"${DOWNLOAD_URL:-}\" ]; then\r\n    URL=\"$DOWNLOAD_URL\"\r\nelif [ \"${VERSION:-nightly}\" = \"latest\" ] || [ \"${VERSION:-nightly}\" = \"nightly\" ]; then\r\n    URL=\"https://github.com/${GITHUB_PACKAGE:-Pumpkin-MC/Vine}/releases/download/nightly/${BINARY_NAME}\"\r\nelse\r\n    URL=\"https://github.com/${GITHUB_PACKAGE:-Pumpkin-MC/Vine}/releases/download/${VERSION}/${BINARY_NAME}\"\r\nfi\r\n\r\necho \"Downloading Vine from: $URL\"\r\ncurl -fsSL \"$URL\" -o /mnt/server/vine\r\nchmod +x /mnt/server/vine\r\n\r\n# Quickly start and kill proxy to generate initial configuration if not present\r\nif [ ! -f /mnt/server/vine.toml ]; then\r\n    timeout 2 ./vine || true\r\nfi",
+            "script": "#!/bin/ash\r\nset -eux\r\n\r\napk add --no-cache curl jq\r\nmkdir -p /mnt/server\r\ncd /mnt/server\r\n\r\nARCH=$(uname -m)\r\ncase \"$ARCH\" in\r\n    x86_64|amd64)\r\n        VINE_ARCH=\"X64\"\r\n        ;;\r\n    aarch64|arm64)\r\n        VINE_ARCH=\"ARM64\"\r\n        ;;\r\n    *)\r\n        echo \"Unsupported architecture: $ARCH\"\r\n        exit 1\r\n        ;;\r\nesac\r\n\r\nBINARY_NAME=\"vine-${VINE_ARCH}-Linux-musl\"\r\n\r\nif [ -n \"${DOWNLOAD_URL:-}\" ]; then\r\n    URL=\"$DOWNLOAD_URL\"\r\nelif [ \"${VERSION:-nightly}\" = \"latest\" ] || [ \"${VERSION:-nightly}\" = \"nightly\" ]; then\r\n    URL=\"https://github.com/${GITHUB_PACKAGE:-Pumpkin-MC/Vine}/releases/download/nightly/${BINARY_NAME}\"\r\nelse\r\n    URL=\"https://github.com/${GITHUB_PACKAGE:-Pumpkin-MC/Vine}/releases/download/${VERSION}/${BINARY_NAME}\"\r\nfi\r\n\r\necho \"Downloading Vine from: $URL\"\r\ncurl -fsSL \"$URL\" -o /mnt/server/vine\r\n\r\nif [ -n \"${DOWNLOAD_URL:-}\" ]; then\r\n    echo \"Custom download URL, skipping checksum verification\"\r\nelse\r\n    curl -fsSL \"${URL%/*}/checksums.sha256\" -o /tmp/checksums.sha256\r\n    EXPECTED=$(grep \" ${BINARY_NAME}$\" /tmp/checksums.sha256 | cut -d \" \" -f 1)\r\n    if [ -z \"$EXPECTED\" ]; then\r\n        echo \"No checksum published for ${BINARY_NAME}\"\r\n        exit 1\r\n    fi\r\n    echo \"${EXPECTED}  /mnt/server/vine\" | sha256sum -c -\r\nfi\r\nchmod +x /mnt/server/vine\r\n\r\n# Quickly start and kill proxy to generate initial configuration if not present\r\nif [ ! -f /mnt/server/vine.toml ]; then\r\n    timeout 2 ./vine || true\r\nfi",
             "container": "ghcr.io/pterodactyl/installers:alpine",
             "entrypoint": "ash"
         }
@@ -67,6 +67,16 @@
             "user_viewable": true,
             "user_editable": true,
             "rules": "nullable|string",
+            "field_type": "text"
+        },
+        {
+            "name": "Forwarding Secret",
+            "description": "Secret shared with Velocity-forwarding backends (proxies.velocity.secret in Paper). Leave empty to use the generated forwarding.secret file.",
+            "env_variable": "VINE_FORWARDING_SECRET",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:256",
             "field_type": "text"
         }
     ]
