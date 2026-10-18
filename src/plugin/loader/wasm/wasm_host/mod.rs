@@ -289,7 +289,12 @@ impl PluginRuntime {
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
-        let data_folder = PathBuf::from("plugins").join("data").join(&filename);
+        // Kept next to the plugin files, so it follows plugins.plugin_dir
+        let data_folder = path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("data")
+            .join(&filename);
         let _ = fs::create_dir_all(&data_folder);
 
         let mut state = PluginHostState::new(filename, data_folder, proxy);

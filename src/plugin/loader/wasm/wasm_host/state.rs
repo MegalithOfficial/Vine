@@ -3,7 +3,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Weak};
 
 use wasmtime::component::{Resource, ResourceTable};
-use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use wasmtime_wasi::{FsPerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use crate::command::CommandDispatcher;
 use crate::config::Config;
@@ -21,6 +21,9 @@ pub struct ProxyPluginContext {
     pub command_dispatcher: Arc<CommandDispatcher>,
     pub plugin_manager: Arc<PluginManager>,
 }
+
+/// Where a plugin sees its data folder
+const DATA_DIR: &str = "/data";
 
 // A pointer per element, so this is about 8 MB of tables
 const MAX_TABLE_ELEMENTS: usize = 1_000_000;
@@ -108,11 +111,20 @@ impl PluginHostState {
         data_folder: PathBuf,
         proxy: Option<ProxyPluginContext>,
     ) -> Self {
+        let mut wasi = WasiCtxBuilder::new();
+        wasi.inherit_stdout().inherit_stderr();
+        if !data_folder.as_os_str().is_empty()
+            && let Err(e) = wasi.preopened_dir(&data_folder, DATA_DIR, FsPerms::ReadWrite)
+        {
+            tracing::warn!(
+                "Plugin '{}' gets no data folder; '{}' could not be opened: {}",
+                plugin_name,
+                data_folder.display(),
+                e
+            );
+        }
         Self {
-            wasi_ctx: WasiCtxBuilder::new()
-                .inherit_stdout()
-                .inherit_stderr()
-                .build(),
+            wasi_ctx: wasi.build(),
             resource_table: ResourceTable::new(),
             limits: PluginLimiter::new(usize::MAX),
             proxy,
@@ -545,7 +557,7 @@ impl wit::vine::plugin::context::HostContext for PluginHostState {
         &mut self,
         _context: Resource<wit::vine::plugin::context::Context>,
     ) -> wasmtime::Result<String> {
-        Ok(self.data_folder.to_string_lossy().to_string())
+        Ok(DATA_DIR.to_string())
     }
 
     async fn drop(

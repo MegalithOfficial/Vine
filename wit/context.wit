@@ -9,7 +9,8 @@ interface context {
         /// Register a proxy command
         register-command: func(command-id: u32, name: string, description: string, aliases: list<string>, permission: option<string>);
 
-        /// Get path to the plugin's data folder (e.g. plugins/data/<plugin-name>)
+        /// Path of the plugin's data folder as the plugin opens it ("/data"); on the host it is
+        /// <plugin_dir>/data/<plugin file name>
         get-data-folder: func() -> string;
     }
 }
