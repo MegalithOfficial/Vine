@@ -482,6 +482,8 @@ impl BackendBridge {
             },
         ));
         let suggesting = Arc::new(std::sync::Mutex::new(Suggesting::default()));
+        // Kept for the whole session, so restarting the tunnel does not reset it
+        let mut client_rate_limiter = PacketRateLimiter::new(self.max_packets_per_sec);
 
         self.online_players.fetch_add(1, Ordering::Relaxed);
         info!(
@@ -536,7 +538,7 @@ impl BackendBridge {
                     &mut client_rx,
                     &mut backend_reader,
                     &mut backend_writer,
-                    self.max_packets_per_sec,
+                    &mut client_rate_limiter,
                     self.client_version,
                     &mut action_rx,
                     &action_tx,
@@ -1508,7 +1510,7 @@ impl BackendBridge {
         client_rx: &mut ClientQueueRx,
         backend_reader: &mut PacketReader<R2>,
         backend_writer: &mut PacketWriter<W2>,
-        max_packets_per_sec: u32,
+        client_rate_limiter: &mut PacketRateLimiter,
         client_version: ProtocolVersion,
         action_rx: &mut mpsc::UnboundedReceiver<PlayerAction>,
         action_tx: &mpsc::UnboundedSender<PlayerAction>,
@@ -1531,8 +1533,6 @@ impl BackendBridge {
         R2: AsyncRead + Unpin,
         W2: AsyncWrite + Unpin,
     {
-        let mut client_rate_limiter = PacketRateLimiter::new(max_packets_per_sec);
-
         // Answers worked out on other tasks are dropped once this tunnel ends, since the client
         // may have moved to another backend or phase by then
         let alive = Arc::new(AtomicBool::new(true));
