@@ -499,11 +499,16 @@ impl BackendBridge {
         self.session_manager
             .update_server(&self.player.username, &current_server_name);
 
+        // Outlives each tunnel so packets still queued when one ends are not lost
+        let (client_tx, mut client_rx) = ClientQueue::new();
+
         loop {
             let tunnel_res = Self::bridge_tunnel(
                 &self.player.username,
                 &mut client_reader,
                 &mut client_writer,
+                &client_tx,
+                &mut client_rx,
                 &mut backend_reader,
                 &mut backend_writer,
                 self.max_packets_per_sec,
@@ -534,6 +539,9 @@ impl BackendBridge {
                     }
                 }
             };
+            if !matches!(exit, TunnelExit::ClientDisconnected) {
+                Self::flush_queue(&mut client_rx, &mut client_writer).await;
+            }
 
             match exit {
                 TunnelExit::Kicked { reason } => {
@@ -1020,6 +1028,21 @@ impl BackendBridge {
         true
     }
 
+    /// Sends whatever the last tunnel left in the client queue
+    async fn flush_queue<W: AsyncWrite + Unpin>(
+        rx: &mut ClientQueueRx,
+        writer: &mut PacketWriter<W>,
+    ) {
+        while let Ok((bytes, _permit)) = rx.try_recv() {
+            if !matches!(
+                timeout(CLIENT_WRITE_TIMEOUT, writer.send(bytes)).await,
+                Ok(Ok(()))
+            ) {
+                break;
+            }
+        }
+    }
+
     fn locale(&self) -> Option<String> {
         self.session_manager.locale(&self.player.username)
     }
@@ -1159,6 +1182,8 @@ fn serverbound_transition(phase: Phase, id: i32, version: ProtocolVersion) -> Op
 const CLIENT_QUEUE_BYTES: usize = 8 * 1024 * 1024;
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
+type ClientQueueRx = mpsc::UnboundedReceiver<(Bytes, OwnedSemaphorePermit)>;
+
 #[derive(Clone)]
 struct ClientQueue {
     tx: mpsc::UnboundedSender<(Bytes, OwnedSemaphorePermit)>,
@@ -1166,7 +1191,7 @@ struct ClientQueue {
 }
 
 impl ClientQueue {
-    fn new() -> (Self, mpsc::UnboundedReceiver<(Bytes, OwnedSemaphorePermit)>) {
+    fn new() -> (Self, ClientQueueRx) {
         let (tx, rx) = mpsc::unbounded_channel();
         let budget = Arc::new(Semaphore::new(CLIENT_QUEUE_BYTES));
         (Self { tx, budget }, rx)
@@ -1195,6 +1220,8 @@ impl BackendBridge {
         username: &str,
         client_reader: &mut PacketReader<R1>,
         client_writer: &mut PacketWriter<W1>,
+        client_tx: &ClientQueue,
+        client_rx: &mut ClientQueueRx,
         backend_reader: &mut PacketReader<R2>,
         backend_writer: &mut PacketWriter<W2>,
         max_packets_per_sec: u32,
@@ -1222,8 +1249,6 @@ impl BackendBridge {
         let pending_suggestions: Arc<
             tokio::sync::Mutex<std::collections::HashMap<i32, PendingSuggestion>>,
         > = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-
-        let (client_tx, mut client_rx) = ClientQueue::new();
 
         let client_writer = async {
             while let Some((packet_bytes, _permit)) = client_rx.recv().await {
