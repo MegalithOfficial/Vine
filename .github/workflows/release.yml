@@ -21,9 +21,6 @@ jobs:
   build_release:
     name: Build & Sign Release
     runs-on: ${{ matrix.os }}
-    # Secrets cannot be read in step conditions, so the token is exposed as an env variable
-    env:
-      SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
     strategy:
       matrix:
         os:
@@ -79,8 +76,20 @@ jobs:
             cp "target/$TARGET/release/vine" "dist/vine-${{ runner.arch }}-${{ runner.os }}-musl"
           fi
 
+      # Secrets cannot be read in step conditions; only this step sees the token and it just
+      # records whether one is set, so the build steps never get it
+      - name: Check for SignPath
+        id: signpath
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+        run: |
+          if [ -n "$SIGNPATH_API_TOKEN" ]; then enabled=true; else enabled=false; fi
+          echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
+
       - name: Upload unsigned executable for SignPath (Windows only)
-        if: runner.os == 'Windows' && env.SIGNPATH_API_TOKEN != ''
+        if: steps.signpath.outputs.enabled == 'true'
         id: upload_unsigned
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -89,7 +98,7 @@ jobs:
           retention-days: 1
 
       - name: Submit SignPath signing request (Windows only)
-        if: runner.os == 'Windows' && env.SIGNPATH_API_TOKEN != ''
+        if: steps.signpath.outputs.enabled == 'true'
         uses: signpath/github-action-submit-signing-request@c92b958760219087e01f8d67a1669ed57afe2627 # v2.3
         with:
           api-token: '${{ secrets.SIGNPATH_API_TOKEN }}'
@@ -101,7 +110,7 @@ jobs:
           output-artifact-directory: dist/signed/
 
       - name: Overwrite with signed version (Windows only)
-        if: runner.os == 'Windows' && env.SIGNPATH_API_TOKEN != ''
+        if: steps.signpath.outputs.enabled == 'true'
         shell: bash
         run: |
           cp dist/signed/* dist/
