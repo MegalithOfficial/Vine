@@ -94,7 +94,7 @@ impl WasmPlugin {
     {
         if self.killed.load(Ordering::Relaxed) {
             return Err(wasmtime::Error::msg(
-                "plugin was disabled after exceeding its time limit",
+                "plugin is disabled; reload it to start it again",
             ));
         }
         let (started, admitted) = oneshot::channel();
@@ -106,7 +106,18 @@ impl WasmPlugin {
             }
         };
         tokio::select! {
-            result = call => result,
+            result = call => {
+                // A trap leaves the store unusable, so the plugin is marked as such
+                if let Err(e) = &result {
+                    self.killed.store(true, Ordering::Relaxed);
+                    tracing::error!(
+                        "Plugin '{}' crashed and has been disabled: {}",
+                        self.metadata.name,
+                        e
+                    );
+                }
+                result
+            }
             () = limit => {
                 self.killed.store(true, Ordering::Relaxed);
                 tracing::error!(
