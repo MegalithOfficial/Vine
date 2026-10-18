@@ -27,6 +27,9 @@ const DATA_DIR: &str = "/data";
 
 // A pointer per element, so this is about 8 MB of tables
 const MAX_TABLE_ELEMENTS: usize = 1_000_000;
+// Open files, streams and other handles a plugin may hold at once; files are real descriptors
+// that the proxy needs for its own connections
+const MAX_RESOURCES: usize = 1024;
 
 /// Caps what a plugin allocates across all of its memories and tables, not per memory
 // Failed grows stay counted, since wasmtime also reports failures it never asked about
@@ -120,9 +123,11 @@ impl PluginHostState {
                 e
             );
         }
+        let mut resource_table = ResourceTable::new();
+        resource_table.set_max_capacity(MAX_RESOURCES);
         Self {
             wasi_ctx: wasi.build(),
-            resource_table: ResourceTable::new(),
+            resource_table,
             limits: PluginLimiter::new(usize::MAX),
             proxy,
             plugin_name,
