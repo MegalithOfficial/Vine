@@ -148,15 +148,17 @@ impl PluginManager {
                 let route = cmd_name.to_ascii_lowercase();
                 let routes = self.command_routes.clone();
                 let required = route.clone();
-                // Read the permission from the current route, since a reload keeps the first node
+                // Read the permission from the current route, since a reload keeps the first node.
+                // A disabled plugin's commands go on to the backend.
                 let cmd_builder = pumpkin_command::argument_builder::command(cmd_name, description.clone())
                     .with_source(plugin.metadata.name.clone())
                     .requires(move |src: &ProxyCommandSource| {
                         resolve_route(&routes, &required).is_some_and(|route| {
-                            route
-                                .permission
-                                .as_deref()
-                                .is_none_or(|p| src.has_permission(p))
+                            !route.plugin.is_disabled()
+                                && route
+                                    .permission
+                                    .as_deref()
+                                    .is_none_or(|p| src.has_permission(p))
                         })
                     })
                     .executes(PluginCommandExecutor {
