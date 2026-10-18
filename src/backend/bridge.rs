@@ -689,7 +689,8 @@ impl BackendBridge {
                     ));
                 }
                 TunnelExit::Prepared(prepared) => {
-                    if phase.get() != Phase::Play && !std::mem::take(&mut backend_gone) {
+                    let gone = std::mem::take(&mut backend_gone);
+                    if phase.get() != Phase::Play && !gone {
                         // Keep the slot taken so another switch waits; the result is replayed
                         // once the client is playing
                         if let Some((_, future)) = connecting.as_mut() {
