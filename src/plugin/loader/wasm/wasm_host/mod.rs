@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use thiserror::Error;
+use tokio::sync::oneshot;
 use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::{Engine, Store, UpdateDeadline};
 
@@ -75,23 +76,38 @@ impl WasmPlugin {
     }
 
     pub async fn shutdown(&self) {
-        let _ = self
-            .guarded(self.store.shutdown(|_| Box::pin(async { Ok(()) })))
-            .await;
+        let _ = tokio::time::timeout(
+            self.call_timeout,
+            self.store.shutdown(|_| Box::pin(async { Ok(()) })),
+        )
+        .await;
     }
 
-    async fn guarded<R>(
+    /// Runs a guest call, timing it from when the guest starts rather than while it waits for
+    /// other plugins to finish. The call signals its start through the given sender.
+    async fn guarded<R, F>(
         &self,
-        call: impl Future<Output = wasmtime::Result<R>>,
-    ) -> wasmtime::Result<R> {
+        call: impl FnOnce(oneshot::Sender<()>) -> F,
+    ) -> wasmtime::Result<R>
+    where
+        F: Future<Output = wasmtime::Result<R>>,
+    {
         if self.killed.load(Ordering::Relaxed) {
             return Err(wasmtime::Error::msg(
                 "plugin was disabled after exceeding its time limit",
             ));
         }
-        match tokio::time::timeout(self.call_timeout, call).await {
-            Ok(result) => result,
-            Err(_) => {
+        let (started, admitted) = oneshot::channel();
+        let call = call(started);
+        let limit = async {
+            match admitted.await {
+                Ok(()) => tokio::time::sleep(self.call_timeout).await,
+                Err(_) => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            result = call => result,
+            () = limit => {
                 self.killed.store(true, Ordering::Relaxed);
                 tracing::error!(
                     "Plugin '{}' took longer than {:?} and has been disabled",
@@ -106,14 +122,17 @@ impl WasmPlugin {
     pub async fn on_load(&self, context: Arc<PluginContext>) -> Result<(), String> {
         let func = self.instance.func_on_load();
         let context_clone = context.clone();
-        self.guarded(self.store.call_guest(move |mut guest| {
-            Box::pin(async move {
-                let context_res =
-                    guest.with(|mut store| store.data_mut().add_context(context_clone))?;
-                let (res,) = guest.call(func, (context_res,)).await?;
-                Ok(res)
+        self.guarded(|started| {
+            self.store.call_guest(move |mut guest| {
+                Box::pin(async move {
+                    let _ = started.send(());
+                    let context_res =
+                        guest.with(|mut store| store.data_mut().add_context(context_clone))?;
+                    let (res,) = guest.call(func, (context_res,)).await?;
+                    Ok(res)
+                })
             })
-        }))
+        })
         .await
         .map_err(|e| e.to_string())?
     }
@@ -121,14 +140,17 @@ impl WasmPlugin {
     pub async fn on_unload(&self, context: Arc<PluginContext>) -> Result<(), String> {
         let func = self.instance.func_on_unload();
         let context_clone = context.clone();
-        self.guarded(self.store.call_guest(move |mut guest| {
-            Box::pin(async move {
-                let context_res =
-                    guest.with(|mut store| store.data_mut().add_context(context_clone))?;
-                let (res,) = guest.call(func, (context_res,)).await?;
-                Ok(res)
+        self.guarded(|started| {
+            self.store.call_guest(move |mut guest| {
+                Box::pin(async move {
+                    let _ = started.send(());
+                    let context_res =
+                        guest.with(|mut store| store.data_mut().add_context(context_clone))?;
+                    let (res,) = guest.call(func, (context_res,)).await?;
+                    Ok(res)
+                })
             })
-        }))
+        })
         .await
         .map_err(|e| e.to_string())?
     }
@@ -139,12 +161,15 @@ impl WasmPlugin {
         event: wit::vine::plugin::event::Event,
     ) -> Result<wit::vine::plugin::event::Event, wasmtime::Error> {
         let func = self.instance.func_handle_event();
-        self.guarded(self.store.call_guest(move |mut guest| {
-            Box::pin(async move {
-                let (res,) = guest.call(func, (handler_id, event)).await?;
-                Ok(res)
+        self.guarded(|started| {
+            self.store.call_guest(move |mut guest| {
+                Box::pin(async move {
+                    let _ = started.send(());
+                    let (res,) = guest.call(func, (handler_id, event)).await?;
+                    Ok(res)
+                })
             })
-        }))
+        })
         .await
     }
 
@@ -155,12 +180,15 @@ impl WasmPlugin {
         args: Vec<String>,
     ) -> Result<Result<i32, String>, wasmtime::Error> {
         let func = self.instance.func_handle_command();
-        self.guarded(self.store.call_guest(move |mut guest| {
-            Box::pin(async move {
-                let (res,) = guest.call(func, (command_id, sender, args)).await?;
-                Ok(res)
+        self.guarded(|started| {
+            self.store.call_guest(move |mut guest| {
+                Box::pin(async move {
+                    let _ = started.send(());
+                    let (res,) = guest.call(func, (command_id, sender, args)).await?;
+                    Ok(res)
+                })
             })
-        }))
+        })
         .await
     }
 
@@ -171,12 +199,15 @@ impl WasmPlugin {
         args: Vec<String>,
     ) -> Result<Vec<String>, wasmtime::Error> {
         let func = self.instance.func_handle_command_suggestion();
-        self.guarded(self.store.call_guest(move |mut guest| {
-            Box::pin(async move {
-                let (res,) = guest.call(func, (command_id, sender, args)).await?;
-                Ok(res)
+        self.guarded(|started| {
+            self.store.call_guest(move |mut guest| {
+                Box::pin(async move {
+                    let _ = started.send(());
+                    let (res,) = guest.call(func, (command_id, sender, args)).await?;
+                    Ok(res)
+                })
             })
-        }))
+        })
         .await
     }
 }
