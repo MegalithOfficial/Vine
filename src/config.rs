@@ -203,7 +203,7 @@ pub struct NetworkConfig {
     #[serde(default)]
     pub proxy_protocol: bool,
 
-    /// IPs or CIDR ranges allowed to send PROXY headers; empty accepts any peer
+    /// IPs or CIDR ranges allowed to send PROXY headers; required when proxy_protocol is on
     #[serde(default)]
     pub proxy_protocol_trusted_proxies: Vec<String>,
 
@@ -544,6 +544,13 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if self.network.proxy_protocol && self.network.proxy_protocol_trusted_proxies.is_empty() {
+            return Err(
+                "network.proxy_protocol is on, but network.proxy_protocol_trusted_proxies is empty; \
+                 list the proxies allowed to send PROXY headers (\"0.0.0.0/0\" and \"::/0\" trust every address)"
+                    .to_string(),
+            );
+        }
         for entry in &self.network.proxy_protocol_trusted_proxies {
             if crate::network::IpRange::parse(entry).is_none() {
                 return Err(format!(

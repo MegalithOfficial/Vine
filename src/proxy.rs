@@ -175,18 +175,6 @@ impl ProxyServer {
         }
         info!("=====================================================");
 
-        if self.config.network.proxy_protocol
-            && self
-                .config
-                .network
-                .proxy_protocol_trusted_proxies
-                .is_empty()
-        {
-            warn!(
-                "PROXY protocol is enabled but network.proxy_protocol_trusted_proxies is empty: \
-                 any client reaching this port can spoof its IP address"
-            );
-        }
         let trusted_proxies: Arc<Vec<network::IpRange>> = Arc::new(
             self.config
                 .network
@@ -306,8 +294,7 @@ impl ProxyServer {
                                 let mut leftover_bytes = Vec::new();
 
                                 if config.network.proxy_protocol {
-                                    if !trusted_proxies.is_empty()
-                                        && !trusted_proxies.iter().any(|range| range.contains(&peer_addr.ip()))
+                                    if !trusted_proxies.iter().any(|range| range.contains(&peer_addr.ip()))
                                     {
                                         debug!("[{}] Dropped connection: peer is not a trusted PROXY protocol source", peer_addr);
                                         return;
