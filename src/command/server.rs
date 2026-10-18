@@ -184,6 +184,7 @@ mod tests {
             action_tx: action_tx.clone(),
             client_ip: "127.0.0.1".to_string(),
             protocol_version: 765,
+            locale: None,
         };
         let _guard = session_manager.try_register(session).unwrap();
 

@@ -43,6 +43,7 @@ pub enum PacketKind {
     ConfigAcceptCodeOfConduct,
     ConfigServerboundPluginMessage,
     ConfigClientboundPluginMessage,
+    ConfigClientInformation,
 
     ChatCommand,
     SignedChatCommand,
@@ -67,6 +68,7 @@ pub enum PacketKind {
     Title,
     ClearTitles,
     ChatAcknowledgement,
+    ClientInformation,
 }
 
 impl PacketKind {
@@ -171,6 +173,9 @@ mod tests {
         (PacketKind::Title, &[47, 315, 755]),
         (PacketKind::ClearTitles, &[755]),
         (PacketKind::ChatAcknowledgement, &[760, 761]),
+        // Only the leading locale is read
+        (PacketKind::ClientInformation, &[47, 107, 755, 757, 766]),
+        (PacketKind::ConfigClientInformation, &[764, 766]),
     ];
 
     const OPAQUE: &[PacketKind] = &[

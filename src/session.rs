@@ -27,6 +27,8 @@ pub struct PlayerSession {
     pub action_tx: mpsc::UnboundedSender<PlayerAction>,
     pub client_ip: String,
     pub protocol_version: u32,
+    /// Language reported by the client, e.g. `en_us`
+    pub locale: Option<String>,
 }
 
 /// Thread-safe registry of connected player sessions
@@ -70,6 +72,14 @@ impl SessionManager {
             && let Some(session) = lock.get_mut(&username.to_ascii_lowercase())
         {
             session.current_server = new_server.to_string();
+        }
+    }
+
+    pub fn update_locale(&self, username: &str, locale: &str) {
+        if let Ok(mut lock) = self.sessions.write()
+            && let Some(session) = lock.get_mut(&username.to_ascii_lowercase())
+        {
+            session.locale = Some(locale.to_ascii_lowercase());
         }
     }
 
@@ -133,6 +143,7 @@ mod tests {
                 action_tx: tx,
                 client_ip: "127.0.0.1".to_string(),
                 protocol_version: 769,
+                locale: None,
             }
         };
 

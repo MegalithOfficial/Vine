@@ -158,6 +158,7 @@ mod tests {
                 action_tx: tx1,
                 client_ip: "127.0.0.1".to_string(),
                 protocol_version: 765,
+                locale: None,
             })
             .unwrap();
         let _guard2 = session_manager
@@ -168,6 +169,7 @@ mod tests {
                 action_tx: tx2,
                 client_ip: "127.0.0.1".to_string(),
                 protocol_version: 765,
+                locale: None,
             })
             .unwrap();
 

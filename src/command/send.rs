@@ -179,6 +179,7 @@ mod tests {
                 action_tx: tx,
                 client_ip: "127.0.0.1".to_string(),
                 protocol_version: 765,
+                locale: None,
             })
             .unwrap();
 
@@ -308,6 +309,7 @@ mod tests {
                 action_tx: tx,
                 client_ip: "127.0.0.1".to_string(),
                 protocol_version: 765,
+                locale: None,
             })
             .unwrap();
 

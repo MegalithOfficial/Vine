@@ -43,6 +43,8 @@ macro_rules! leading_string_packet {
 leading_string_packet!(ChatCommand, ChatCommand, command);
 leading_string_packet!(SignedChatCommand, SignedChatCommand, command);
 leading_string_packet!(ChatMessage, ChatMessage, message);
+leading_string_packet!(ClientInformation, ClientInformation, locale);
+leading_string_packet!(ConfigClientInformation, ConfigClientInformation, locale);
 
 pub fn chat_length_limit(version: ProtocolVersion) -> usize {
     if version < ProtocolVersion::V1_11 {

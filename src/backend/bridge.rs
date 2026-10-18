@@ -32,11 +32,11 @@ use crate::protocol::packets::login::{
     SetCompression,
 };
 use crate::protocol::packets::play::{
-    ChatAcknowledgement, ChatCommand, ChatMessage, ClientboundPluginMessage,
-    CommandSuggestionRequest, CommandSuggestions, InjectedCommand, PlayDisconnect, PlayKeepAlive,
-    PlayKeepAliveResponse, SignedChatCommand, StartConfiguration, Suggestion, SystemChat,
-    chat_length_limit, chat_signing, inject_commands, read_plugin_message, replace_leading_string,
-    write_plugin_message,
+    ChatAcknowledgement, ChatCommand, ChatMessage, ClientInformation, ClientboundPluginMessage,
+    CommandSuggestionRequest, CommandSuggestions, ConfigClientInformation, InjectedCommand,
+    PlayDisconnect, PlayKeepAlive, PlayKeepAliveResponse, SignedChatCommand, StartConfiguration,
+    Suggestion, SystemChat, chat_length_limit, chat_signing, inject_commands, read_plugin_message,
+    replace_leading_string, write_plugin_message,
 };
 use crate::protocol::packets::switch::{Leftovers, join_game_sequence};
 use crate::protocol::text::{component_json, parse_message, plain_text};
@@ -981,6 +981,26 @@ impl BackendBridge {
     }
 }
 
+fn client_locale(
+    packet: &crate::protocol::RawPacket,
+    phase: Phase,
+    version: ProtocolVersion,
+) -> Option<String> {
+    match phase {
+        Phase::Config if PacketKind::ConfigClientInformation.matches(packet.id, version) => {
+            decode_packet::<ConfigClientInformation>(&packet.payload, version)
+                .ok()
+                .map(|p| p.locale)
+        }
+        Phase::Play if PacketKind::ClientInformation.matches(packet.id, version) => {
+            decode_packet::<ClientInformation>(&packet.payload, version)
+                .ok()
+                .map(|p| p.locale)
+        }
+        _ => None,
+    }
+}
+
 async fn send_best_effort<P: Packet, W: AsyncWrite + Unpin>(
     writer: &mut PacketWriter<W>,
     packet: &P,
@@ -1149,6 +1169,9 @@ impl BackendBridge {
                         }
 
                         let current = phase.get();
+                        if let Some(locale) = client_locale(&raw_packet, current, client_version) {
+                            session_manager.update_locale(username, &locale);
+                        }
                         if let Some(next) =
                             serverbound_transition(current, raw_packet.id, client_version)
                         {
