@@ -597,7 +597,7 @@ impl BackendBridge {
                     }
                 }
                 TunnelExit::Connect { server_name } => {
-                    if phase.get() != Phase::Play {
+                    if phase.backend() != Phase::Play {
                         deferred = Some(server_name);
                         continue;
                     }
@@ -690,7 +690,7 @@ impl BackendBridge {
                 }
                 TunnelExit::Prepared(prepared) => {
                     let gone = std::mem::take(&mut backend_gone);
-                    if phase.get() != Phase::Play && !gone {
+                    if phase.backend() != Phase::Play && !gone {
                         // Keep the slot taken so another switch waits; the result is replayed
                         // once the client is playing
                         if let Some((_, future)) = connecting.as_mut() {
@@ -1052,6 +1052,11 @@ impl BackendBridge {
         }
 
         let awaited = match phase.get() {
+            // The old backend already asked for reconfiguration, so the client is about to
+            // acknowledge that one
+            Phase::Play if phase.backend() == Phase::Config => {
+                Some(PacketKind::ConfigurationAcknowledged)
+            }
             Phase::Play => {
                 let start = encode_packet(&StartConfiguration, version)
                     .map_err(|e| SwitchError::Fatal(e.into()))?;
