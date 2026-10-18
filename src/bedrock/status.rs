@@ -36,16 +36,18 @@ impl BedrockStatusHandler {
     pub fn build_advertisement_string(&self) -> String {
         let online = self.online_players.load(Ordering::Relaxed) as i32;
 
+        // Fields are separated by ';' with no way to escape it, so it is dropped from text
+        let field = |text: &str| text.replace(';', "");
         format!(
             "MCPE;{};{};{};{};{};{};{};{};{};{};{};0;",
-            legacy_message(&self.config.motd),
+            field(&legacy_message(&self.config.motd)),
             self.config.protocol_version,
-            self.config.version_name,
+            field(&self.config.version_name),
             online,
             self.config.max_players,
             self.server_guid,
-            self.config.level_name,
-            self.config.game_mode,
+            field(&self.config.level_name),
+            field(&self.config.game_mode),
             self.config.game_mode_id,
             self.ipv4_port,
             self.ipv6_port,
