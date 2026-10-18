@@ -1458,13 +1458,27 @@ type ClientQueueRx = mpsc::UnboundedReceiver<(Bytes, OwnedSemaphorePermit)>;
 struct ClientQueue {
     tx: mpsc::UnboundedSender<(Bytes, OwnedSemaphorePermit)>,
     budget: Arc<Semaphore>,
+    // Held while the backend's reconfiguration is noted, so a packet checked as in play cannot
+    // be queued behind the backend's StartConfiguration
+    order: Arc<std::sync::Mutex<()>>,
 }
 
 impl ClientQueue {
     fn new() -> (Self, ClientQueueRx) {
         let (tx, rx) = mpsc::unbounded_channel();
         let budget = Arc::new(Semaphore::new(CLIENT_QUEUE_BYTES));
-        (Self { tx, budget }, rx)
+        let order = Arc::new(std::sync::Mutex::new(()));
+        (Self { tx, budget, order }, rx)
+    }
+
+    /// Queues a packet only if the client and backend are still playing
+    async fn send_in_play(&self, bytes: Bytes, phase: &PhaseCell) -> bool {
+        let cost = bytes.len().clamp(1, CLIENT_QUEUE_BYTES) as u32;
+        let Ok(permit) = Arc::clone(&self.budget).acquire_many_owned(cost).await else {
+            return false;
+        };
+        let _order = self.order.lock().unwrap_or_else(|e| e.into_inner());
+        phase.backend() == Phase::Play && self.tx.send((bytes, permit)).is_ok()
     }
 
     async fn send(&self, bytes: Bytes) -> bool {
@@ -1792,6 +1806,7 @@ impl BackendBridge {
                                     }
                                     let dispatcher = command_dispatcher.clone();
                                     let client_tx = client_tx.clone();
+                                    let phase = phase.clone();
                                     let suggesting = suggesting.clone();
                                     tokio::spawn(async move {
                                         let mut request = request;
@@ -1840,7 +1855,7 @@ impl BackendBridge {
                                                 if let Ok(bytes) =
                                                     encode_packet(&response, client_version)
                                                 {
-                                                    client_tx.send(bytes).await;
+                                                    client_tx.send_in_play(bytes, &phase).await;
                                                 }
                                             }
                                             match next {
@@ -1881,6 +1896,7 @@ impl BackendBridge {
                                         let pending_ref = pending_suggestions.clone();
                                         let client_tx_clone = client_tx.clone();
                                         let alive = alive.clone();
+                                        let phase = phase.clone();
                                         tokio::spawn(async move {
                                             tokio::time::sleep(Duration::from_millis(200)).await;
                                             if let Some(pending) =
@@ -1908,7 +1924,9 @@ impl BackendBridge {
                                                     && let Ok(bytes) =
                                                         encode_packet(&response, client_version)
                                                 {
-                                                    client_tx_clone.send(bytes).await;
+                                                    client_tx_clone
+                                                        .send_in_play(bytes, &phase)
+                                                        .await;
                                                 }
                                             }
                                         });
@@ -1941,6 +1959,7 @@ impl BackendBridge {
                         if current == Phase::Play
                             && PacketKind::StartConfiguration.matches(raw_packet.id, client_version)
                         {
+                            let _order = client_tx.order.lock().unwrap_or_else(|e| e.into_inner());
                             phase.backend_started_configuration();
                         }
                         if current == Phase::Config
