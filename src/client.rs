@@ -461,6 +461,25 @@ impl ClientHandler {
         }
         authenticated_player.profile_key = profile_key;
 
+        // Checked before PlayerLogin so plugins never see a login, or a disconnect, for a player
+        // whose account is already playing
+        if self
+            .session_manager
+            .is_online(&authenticated_player.username, authenticated_player.id)
+        {
+            warn!(
+                "[{}] Rejecting duplicate login for '{}' ({})",
+                self.peer_addr, authenticated_player.username, authenticated_player.id
+            );
+            Self::kick(
+                &mut writer,
+                client_version,
+                &translate(None, "vine.login.already_connected", &[]),
+            )
+            .await?;
+            return Ok(());
+        }
+
         let mut login_event = PlayerLoginEvent {
             uuid: authenticated_player.id.to_string(),
             username: authenticated_player.username.clone(),
@@ -560,13 +579,6 @@ impl ClientHandler {
                 &translate(None, "vine.login.already_connected", &[]),
             )
             .await?;
-            self.plugin_manager
-                .fire_player_disconnect(&PlayerDisconnectEvent {
-                    uuid: authenticated_player.id.to_string(),
-                    username: authenticated_player.username.clone(),
-                    last_server: None,
-                })
-                .await;
             return Ok(());
         };
 

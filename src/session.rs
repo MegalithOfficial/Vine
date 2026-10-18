@@ -57,6 +57,13 @@ impl SessionManager {
         }
     }
 
+    pub fn is_online(&self, username: &str, uuid: Uuid) -> bool {
+        self.sessions.read().is_ok_and(|lock| {
+            lock.contains_key(&username.to_ascii_lowercase())
+                || lock.values().any(|s| s.uuid == uuid)
+        })
+    }
+
     /// Registers the session unless the username or UUID is already online.
     /// The returned guard unregisters it when the connection ends.
     pub fn try_register(self: &Arc<Self>, session: PlayerSession) -> Option<SessionGuard> {
