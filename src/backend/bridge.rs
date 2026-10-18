@@ -1030,6 +1030,8 @@ impl BackendBridge {
                 Err(_) => return Err(SwitchError::Fatal(client_timeout())),
             }
         }
+        // The client is configuring from here on, so a failure below must disconnect it as such
+        phase.set(Phase::Config);
 
         let ack =
             encode_packet(&LoginAcknowledged, version).map_err(|e| SwitchError::Fatal(e.into()))?;
@@ -1037,7 +1039,6 @@ impl BackendBridge {
             .send(ack)
             .await
             .map_err(|e| SwitchError::Fatal(e.into()))?;
-        phase.set(Phase::Config);
         Ok((backend_reader, backend_writer))
     }
 
