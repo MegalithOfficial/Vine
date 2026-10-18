@@ -128,18 +128,31 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
+      # A version is published once; running again for it leaves latest and its tag alone
+      - name: Check Published Version
+        id: release
+        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master'
+        run: |
+          if docker buildx imagetools inspect "$REGISTRY/$REGISTRY_IMAGE:$VINE_VERSION" > /dev/null 2>&1; then
+            echo "Version $VINE_VERSION is already published"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Extract Metadata
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.REGISTRY_IMAGE }}
           # Pushes only move the branch and commit tags; latest and the version tag are set by a
-          # manual run on master so a published version never changes underneath its users
+          # manual run on master for a version not published yet, so a published version never
+          # changes underneath its users
           tags: |
             type=ref,event=branch
             type=sha
-            type=raw,value=latest,enable=${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master' }}
-            type=raw,value=${{ env.VINE_VERSION }},enable=${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master' }}
+            type=raw,value=latest,enable=${{ steps.release.outputs.publish == 'true' }}
+            type=raw,value=${{ env.VINE_VERSION }},enable=${{ steps.release.outputs.publish == 'true' }}
 
       - name: Create manifest list and push
         working-directory: ${{ runner.temp }}/digests
