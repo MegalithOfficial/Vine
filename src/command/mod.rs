@@ -218,7 +218,7 @@ pub struct CommandDispatcher {
 }
 
 enum PendingChange {
-    Register(CommandBuilder),
+    Register(CommandBuilder, Option<String>),
     Deactivate(String),
 }
 
@@ -258,7 +258,13 @@ impl CommandDispatcher {
 
     /// Registers a new command builder into the dispatcher
     pub fn register(&self, builder: CommandBuilder) {
-        self.change(PendingChange::Register(builder));
+        self.change(PendingChange::Register(builder, None));
+    }
+
+    /// Registers a plugin's command. Registering onto an existing node keeps that node, so its
+    /// owner is updated here to the plugin registering it now.
+    pub fn register_for(&self, builder: CommandBuilder, plugin: &str) {
+        self.change(PendingChange::Register(builder, Some(plugin.to_string())));
     }
 
     pub fn deactivate_source(&self, source: &str) {
@@ -279,8 +285,11 @@ impl CommandDispatcher {
         if let Ok(mut pending) = self.pending.lock() {
             for change in pending.drain(..) {
                 match change {
-                    PendingChange::Register(builder) => {
-                        dispatcher.register(builder);
+                    PendingChange::Register(builder, owner) => {
+                        let node = dispatcher.register(builder);
+                        if owner.is_some() {
+                            dispatcher.tree[node].meta.source = owner;
+                        }
                     }
                     PendingChange::Deactivate(source) => {
                         dispatcher.deactivate_commands_from_source(&source);
@@ -343,12 +352,20 @@ impl CommandDispatcher {
         }
     }
 
-    /// Returns who registered `name`: `Some(None)` for a built-in, the plugin name otherwise
-    pub fn owner(&self, name: &str) -> Option<Option<String>> {
+    /// Returns true if `plugin` may register `name`: it is free, already the plugin's, or was left
+    /// by a plugin that is no longer active. Built-in commands are never handed over.
+    pub fn can_claim(&self, name: &str, plugin: &str) -> bool {
         let clean = name.trim_start_matches('/').to_ascii_lowercase();
-        let lock = self.read()?;
-        let node = lock.tree.get(&clean)?;
-        Some(lock.tree[node].meta.source.as_deref().map(str::to_string))
+        let Some(lock) = self.read() else {
+            return false;
+        };
+        let Some(node) = lock.tree.get(&clean) else {
+            return true;
+        };
+        match lock.tree[node].meta.source.as_deref() {
+            None => false,
+            Some(owner) => owner == plugin || lock.is_disabled(&clean),
+        }
     }
 
     /// Returns true if the proxy should run this command for `source`: it exists, is active and

@@ -110,18 +110,20 @@ impl PluginManager {
         plugin: Arc<WasmPlugin>,
     ) {
         if let Some(proxy) = self.proxy_ctx.get() {
-            // A name owned by a built-in or another plugin would keep that owner's permission
+            // A name owned by a built-in or an active plugin would keep that owner's permission
             let names = std::iter::once(name.clone())
                 .chain(aliases)
-                .filter(|cmd_name| match proxy.command_dispatcher.owner(cmd_name) {
-                    Some(owner) if owner.as_deref() != Some(plugin.metadata.name.as_str()) => {
+                .filter(|cmd_name| {
+                    let free = proxy
+                        .command_dispatcher
+                        .can_claim(cmd_name, &plugin.metadata.name);
+                    if !free {
                         warn!(
                             "Plugin '{}' cannot register '/{}', which is already taken",
                             plugin.metadata.name, cmd_name
                         );
-                        false
                     }
-                    _ => true,
+                    free
                 })
                 .collect::<Vec<_>>();
             if let Ok(mut routes) = self.command_routes.write() {
@@ -169,7 +171,9 @@ impl PluginManager {
                             routes: self.command_routes.clone(),
                         }),
                     );
-                proxy.command_dispatcher.register(cmd_builder);
+                proxy
+                    .command_dispatcher
+                    .register_for(cmd_builder, &plugin.metadata.name);
             }
             info!(
                 "Registered command '/{}' from plugin '{}'",
