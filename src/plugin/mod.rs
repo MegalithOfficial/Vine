@@ -318,8 +318,9 @@ impl PluginManager {
         }
     }
 
-    /// Swaps a plugin for a fresh instance of its file; a file that fails to load leaves the
-    /// running instance untouched
+    /// Swaps a plugin for a fresh instance of its file. A file that fails to load or now reports
+    /// a name that is already taken leaves the running instance untouched; once the old instance
+    /// is unloaded, a new one that fails its on_load leaves the plugin unloaded.
     pub async fn reload_plugin(&self, name: &str) -> Result<PluginMetadata, String> {
         let path = self
             .loaded_plugins
@@ -334,13 +335,14 @@ impl PluginManager {
             .load(&path, self.proxy_ctx.get().cloned())
             .await
             .map_err(|e| format!("Failed to reload plugin '{}': {}", name, e))?;
-        self.unload_plugin(name).await;
         if metadata.name != name && self.is_loaded(&metadata.name).await {
+            plugin.shutdown().await;
             return Err(format!(
                 "Plugin '{}' now reports the name '{}', which is already loaded",
                 name, metadata.name
             ));
         }
+        self.unload_plugin(name).await;
         self.enable_plugin(plugin, path).await?;
         Ok(metadata)
     }
