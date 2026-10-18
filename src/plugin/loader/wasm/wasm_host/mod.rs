@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::{Engine, Store, UpdateDeadline};
 
@@ -67,9 +67,24 @@ pub struct WasmPlugin {
     pub store: LegacyStore,
     pub metadata: PluginMetadata,
     killed: Arc<AtomicBool>,
+    kill_signal: Arc<Notify>,
     // Set once the plugin is being stopped, so calls that fail because of it are not crashes
     stopping: AtomicBool,
     call_timeout: Duration,
+}
+
+/// Handed to a guest call, which begins it once the guest is about to run and keeps what it
+/// returns until the guest is done
+struct CallStart {
+    started: oneshot::Sender<()>,
+    running: oneshot::Sender<()>,
+}
+
+impl CallStart {
+    fn begin(self) -> oneshot::Sender<()> {
+        let _ = self.started.send(());
+        self.running
+    }
 }
 
 impl WasmPlugin {
@@ -86,35 +101,56 @@ impl WasmPlugin {
         .await;
     }
 
+    fn kill(&self) {
+        self.killed.store(true, Ordering::Relaxed);
+        self.kill_signal.notify_waiters();
+    }
+
     /// Runs a guest call, timing it from when the guest starts rather than while it waits for
-    /// other plugins to finish. The call signals its start through the given sender.
-    async fn guarded<R, F>(
-        &self,
-        call: impl FnOnce(oneshot::Sender<()>) -> F,
-    ) -> wasmtime::Result<R>
+    /// other plugins to finish. The guest is timed even if the caller stops waiting, and calls
+    /// still queued behind it fail once it is disabled.
+    async fn guarded<R, F>(&self, call: impl FnOnce(CallStart) -> F) -> wasmtime::Result<R>
     where
         F: Future<Output = wasmtime::Result<R>>,
     {
+        let disabled = self.kill_signal.notified();
+        tokio::pin!(disabled);
+        disabled.as_mut().enable();
         if self.killed.load(Ordering::Relaxed) {
             return Err(wasmtime::Error::msg(
                 "plugin is disabled; reload it to start it again",
             ));
         }
         let (started, admitted) = oneshot::channel();
-        let call = call(started);
-        let limit = async {
-            match admitted.await {
-                Ok(()) => tokio::time::sleep(self.call_timeout).await,
-                Err(_) => std::future::pending().await,
+        let (running, finished) = oneshot::channel();
+        let call = call(CallStart { started, running });
+
+        let killed = self.killed.clone();
+        let kill_signal = self.kill_signal.clone();
+        let name = self.metadata.name.clone();
+        let limit = self.call_timeout;
+        tokio::spawn(async move {
+            if admitted.await.is_err() {
+                return;
             }
-        };
+            if tokio::time::timeout(limit, finished).await.is_err() {
+                killed.store(true, Ordering::Relaxed);
+                kill_signal.notify_waiters();
+                tracing::error!(
+                    "Plugin '{}' took longer than {:?} and has been disabled",
+                    name,
+                    limit
+                );
+            }
+        });
+
         tokio::select! {
             result = call => {
                 // A trap leaves the store unusable, so the plugin is marked as such
                 if let Err(e) = &result
                     && !self.stopping.load(Ordering::Relaxed)
                 {
-                    self.killed.store(true, Ordering::Relaxed);
+                    self.kill();
                     tracing::error!(
                         "Plugin '{}' crashed and has been disabled: {}",
                         self.metadata.name,
@@ -123,15 +159,7 @@ impl WasmPlugin {
                 }
                 result
             }
-            () = limit => {
-                self.killed.store(true, Ordering::Relaxed);
-                tracing::error!(
-                    "Plugin '{}' took longer than {:?} and has been disabled",
-                    self.metadata.name,
-                    self.call_timeout
-                );
-                Err(wasmtime::Error::msg("plugin call timed out"))
-            }
+            () = disabled => Err(wasmtime::Error::msg("plugin has been disabled")),
         }
     }
 
@@ -141,7 +169,7 @@ impl WasmPlugin {
         self.guarded(|started| {
             self.store.call_guest(move |mut guest| {
                 Box::pin(async move {
-                    let _ = started.send(());
+                    let _running = started.begin();
                     let context_res =
                         guest.with(|mut store| store.data_mut().add_context(context_clone))?;
                     let (res,) = guest.call(func, (context_res,)).await?;
@@ -159,7 +187,7 @@ impl WasmPlugin {
         self.guarded(|started| {
             self.store.call_guest(move |mut guest| {
                 Box::pin(async move {
-                    let _ = started.send(());
+                    let _running = started.begin();
                     let context_res =
                         guest.with(|mut store| store.data_mut().add_context(context_clone))?;
                     let (res,) = guest.call(func, (context_res,)).await?;
@@ -180,7 +208,7 @@ impl WasmPlugin {
         self.guarded(|started| {
             self.store.call_guest(move |mut guest| {
                 Box::pin(async move {
-                    let _ = started.send(());
+                    let _running = started.begin();
                     let (res,) = guest.call(func, (handler_id, event)).await?;
                     Ok(res)
                 })
@@ -199,7 +227,7 @@ impl WasmPlugin {
         self.guarded(|started| {
             self.store.call_guest(move |mut guest| {
                 Box::pin(async move {
-                    let _ = started.send(());
+                    let _running = started.begin();
                     let (res,) = guest.call(func, (command_id, sender, args)).await?;
                     Ok(res)
                 })
@@ -218,7 +246,7 @@ impl WasmPlugin {
         self.guarded(|started| {
             self.store.call_guest(move |mut guest| {
                 Box::pin(async move {
-                    let _ = started.send(());
+                    let _running = started.begin();
                     let (res,) = guest.call(func, (command_id, sender, args)).await?;
                     Ok(res)
                 })
@@ -375,6 +403,7 @@ impl PluginRuntime {
             store: legacy_store,
             metadata: metadata.clone(),
             killed,
+            kill_signal: Arc::new(Notify::new()),
             stopping: AtomicBool::new(false),
             call_timeout: timeout,
         });
