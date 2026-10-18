@@ -152,9 +152,10 @@ impl wit::vine::plugin::translation::Host for PluginHostState {
         let locale = player_uuid
             .and_then(|uuid| uuid::Uuid::parse_str(&uuid).ok())
             .and_then(|uuid| self.proxy.as_ref()?.session_manager.locale_by_uuid(uuid));
-        let key = match key.strip_prefix("vine:") {
-            Some(own) => own.to_string(),
-            None if key.contains(':') => key,
+        // Namespaces are stored lowercase, like the folders they come from
+        let key = match key.split_once(':') {
+            Some((namespace, rest)) if namespace.eq_ignore_ascii_case("vine") => rest.to_string(),
+            Some((namespace, rest)) => format!("{}:{rest}", namespace.to_ascii_lowercase()),
             None => format!("{}:{key}", self.plugin_name.to_ascii_lowercase()),
         };
         let args: Vec<&(dyn std::fmt::Display + Sync)> = args
