@@ -269,7 +269,7 @@ impl Authenticator {
                 .append_pair("username", username)
                 .append_pair("serverId", server_hash);
             if prevent_proxy_connections {
-                query.append_pair("ip", &client_ip.to_string());
+                query.append_pair("ip", &client_ip.to_canonical().to_string());
             }
         }
         url

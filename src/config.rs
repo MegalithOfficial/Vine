@@ -392,7 +392,7 @@ impl Default for Config {
             server: ServerConfig {
                 bind_address: "0.0.0.0:25565".to_string(),
                 online_mode: true,
-                prevent_proxy_connections: true,
+                prevent_proxy_connections: false,
                 compression_threshold: 256,
                 compression_level: 6,
                 shutdown_timeout_secs: 10,
