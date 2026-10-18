@@ -136,25 +136,25 @@ fn format_template(template: &str, args: &[&(dyn Display + Sync)]) -> String {
     out
 }
 
-/// Turns a plugin name into the folder and key prefix its translations use
+/// Turns a plugin name into the folder and key prefix its translations use. Case is ignored;
+/// anything but letters, digits, '_', '-' and inner dots is percent-encoded, so different names
+/// stay apart and none can point at "." or "..".
 pub fn namespace(plugin: &str) -> String {
-    let name: String = plugin
-        .trim()
-        .to_ascii_lowercase()
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.') {
-                c
-            } else {
-                '_'
+    let mut name = String::new();
+    for c in plugin.trim().to_lowercase().chars() {
+        if c.is_alphanumeric() || matches!(c, '_' | '-') || (c == '.' && !name.is_empty()) {
+            name.push(c);
+        } else {
+            let mut bytes = [0; 4];
+            for byte in c.encode_utf8(&mut bytes).bytes() {
+                name.push_str(&format!("%{byte:02x}"));
             }
-        })
-        .collect();
-    let name = name.trim_start_matches('.');
+        }
+    }
     if name.is_empty() {
         "_".to_string()
     } else {
-        name.to_string()
+        name
     }
 }
 
@@ -165,15 +165,15 @@ pub fn register(
     locale: &str,
     entries: Vec<(String, String)>,
 ) -> std::io::Result<()> {
-    let valid = |name: &str| {
+    let valid = |name: &str, extra: &[char]| {
         !name.is_empty()
             && !name.starts_with('.')
             && name
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+                .chars()
+                .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-') || extra.contains(&c))
     };
     let locale = normalize(locale);
-    if !valid(namespace) || !valid(&locale) {
+    if !valid(namespace, &['%', '.']) || !valid(&locale, &['.']) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("invalid plugin name or locale '{namespace}/{locale}'"),
