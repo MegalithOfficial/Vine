@@ -15,7 +15,7 @@ use tokio::sync::{OnceCell, RwLock};
 use tracing::{error, info, warn};
 
 use crate::command::{CommandSender, ProxyCommandSource};
-use pumpkin_command::{ArgumentBuilder, CommandSource};
+use pumpkin_command::ArgumentBuilder;
 
 #[derive(Clone)]
 pub struct RegisteredEventHandler {
@@ -724,11 +724,7 @@ impl pumpkin_command::node::CommandExecutor<ProxyCommandSource> for PluginComman
 
         let Some(CommandRoute { plugin, command_id }) = resolve_route(&self.routes, &self.name)
         else {
-            context
-                .source
-                .send_message(pumpkin_util::text::TextComponent::text(
-                    "§cThis plugin command is no longer available.",
-                ));
+            context.source.reply("vine.plugin.command_unavailable", &[]);
             return Ok(0);
         };
         let handle = tokio::runtime::Handle::current();
@@ -741,17 +737,11 @@ impl pumpkin_command::node::CommandExecutor<ProxyCommandSource> for PluginComman
             Ok(Err(err_msg)) => {
                 context
                     .source
-                    .send_message(pumpkin_util::text::TextComponent::text(format!(
-                        "§cError: {err_msg}"
-                    )));
+                    .reply("vine.plugin.command_error", &[&err_msg]);
                 Ok(0)
             }
             Err(e) => {
-                context
-                    .source
-                    .send_message(pumpkin_util::text::TextComponent::text(format!(
-                        "§cPlugin command error: {e}"
-                    )));
+                context.source.reply("vine.plugin.command_error", &[&e]);
                 Ok(0)
             }
         }

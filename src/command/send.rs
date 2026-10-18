@@ -6,7 +6,6 @@ use pumpkin_command::dispatcher::CommandDispatcher as RawCommandDispatcher;
 use pumpkin_command::node::{CommandExecutor, CommandExecutorResult};
 use pumpkin_command::suggestion::provider::{SuggestionProvider, SuggestionProviderResult};
 use pumpkin_command::suggestion::suggestions::SuggestionsBuilder;
-use pumpkin_util::text::TextComponent;
 
 use super::{ProxyCommandSource, command_error};
 use crate::session::PlayerAction;
@@ -62,7 +61,9 @@ impl CommandExecutor<ProxyCommandSource> for SendCommandExecutor {
     fn execute(&self, context: &CommandContext<ProxyCommandSource>) -> CommandExecutorResult {
         if !context.source.has_permission("vine.command.send") {
             return Err(command_error(
-                "You do not have permission to execute this command (required: vine.command.send).",
+                context
+                    .source
+                    .tr("vine.command.no_permission", &[&"vine.command.send"]),
             ));
         }
 
@@ -80,22 +81,25 @@ impl CommandExecutor<ProxyCommandSource> for SendCommandExecutor {
             None => {
                 let mut available: Vec<&String> = context.source.config.servers.keys().collect();
                 available.sort();
-                return Err(command_error(format!(
-                    "Unknown backend server '{}'. Available servers: [{}]",
-                    server_name,
-                    available
-                        .into_iter()
-                        .map(|s| s.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )));
+                let available = available
+                    .into_iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(command_error(
+                    context
+                        .source
+                        .tr("vine.command.send.unknown", &[&server_name, &available]),
+                ));
             }
         };
 
         if target.eq_ignore_ascii_case("all") {
             let sessions = context.source.session_manager.list_sessions();
             if sessions.is_empty() {
-                return Err(command_error("No players currently online to send."));
+                return Err(command_error(
+                    context.source.tr("vine.command.send.nobody", &[]),
+                ));
             }
 
             let count = sessions.len();
@@ -105,22 +109,31 @@ impl CommandExecutor<ProxyCommandSource> for SendCommandExecutor {
                 });
             }
 
-            let msg = format!("Sent {} player(s) to '{}'", count, canonical_server);
-            context.source.send_message(TextComponent::text(msg));
+            context
+                .source
+                .reply("vine.command.send.sent_all", &[&count, &canonical_server]);
             Ok(count as i32)
         } else {
             let session = context
                 .source
                 .session_manager
                 .get_session(target)
-                .ok_or_else(|| command_error(format!("Player '{}' is not online.", target)))?;
+                .ok_or_else(|| {
+                    command_error(
+                        context
+                            .source
+                            .tr("vine.command.send.not_online", &[&target]),
+                    )
+                })?;
 
             let _ = session.action_tx.send(PlayerAction::Connect {
                 server_name: canonical_server.clone(),
             });
 
-            let msg = format!("Sent '{}' to '{}'", session.username, canonical_server);
-            context.source.send_message(TextComponent::text(msg));
+            context.source.reply(
+                "vine.command.send.sent",
+                &[&session.username, &canonical_server],
+            );
             Ok(1)
         }
     }

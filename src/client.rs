@@ -16,6 +16,7 @@ use crate::auth::{
 use crate::backend::{BackendBridge, Router};
 use crate::command::CommandDispatcher;
 use crate::config::Config;
+use crate::i18n::translate;
 use crate::network::PrefixedRead;
 use crate::plugin::PluginManager;
 use crate::plugin::api::{PlayerLoginEvent, PlayerPreLoginEvent, ProxyPingEvent};
@@ -217,9 +218,10 @@ impl ClientHandler {
                 "[{}] Rejecting unsupported client version {}",
                 self.peer_addr, client_version
             );
-            let reason = format!(
-                "Unsupported Minecraft version. This proxy supports {}.",
-                ProtocolVersion::supported_range()
+            let reason = translate(
+                None,
+                "vine.login.unsupported_version",
+                &[&ProtocolVersion::supported_range()],
             );
             Self::kick(&mut writer, client_version, &reason).await?;
             return Ok(());
@@ -245,7 +247,7 @@ impl ClientHandler {
                 Self::kick(
                     &mut writer,
                     client_version,
-                    "Invalid signature for profile public key. Try restarting your game.",
+                    &translate(None, "vine.login.invalid_key_signature", &[]),
                 )
                 .await?;
                 return Ok(());
@@ -259,7 +261,12 @@ impl ClientHandler {
                     "[{}] Invalid profile key for '{}'",
                     self.peer_addr, username
                 );
-                Self::kick(&mut writer, client_version, "Invalid profile public key.").await?;
+                Self::kick(
+                    &mut writer,
+                    client_version,
+                    &translate(None, "vine.login.invalid_key", &[]),
+                )
+                .await?;
                 return Ok(());
             }
         } else if (ProtocolVersion::V1_19..ProtocolVersion::V1_19_3).contains(&client_version)
@@ -269,7 +276,7 @@ impl ClientHandler {
             Self::kick(
                 &mut writer,
                 client_version,
-                "Missing profile public key. This server requires secure profiles.",
+                &translate(None, "vine.login.missing_key", &[]),
             )
             .await?;
             return Ok(());
@@ -289,13 +296,13 @@ impl ClientHandler {
         if pre_login_event.cancelled {
             let reason = pre_login_event
                 .cancel_reason
-                .as_deref()
-                .unwrap_or("Connection cancelled by plugin");
+                .clone()
+                .unwrap_or_else(|| translate(None, "vine.plugin.cancelled_connection", &[]));
             warn!(
                 "[{}] Player '{}' pre-login cancelled by plugin: {}",
                 self.peer_addr, username, reason
             );
-            Self::kick(&mut writer, client_version, reason).await?;
+            Self::kick(&mut writer, client_version, &reason).await?;
             return Ok(());
         }
 
@@ -307,7 +314,7 @@ impl ClientHandler {
             Self::kick(
                 &mut writer,
                 client_version,
-                "Invalid username characters or length (must be 2-16 alphanumeric or _)",
+                &translate(None, "vine.login.invalid_username", &[]),
             )
             .await?;
             return Ok(());
@@ -348,7 +355,12 @@ impl ClientHandler {
                     self.peer_addr,
                     shared_secret.len()
                 );
-                Self::kick(&mut writer, client_version, "Invalid encryption key length").await?;
+                Self::kick(
+                    &mut writer,
+                    client_version,
+                    &translate(None, "vine.login.invalid_shared_secret", &[]),
+                )
+                .await?;
                 return Err(ClientError::AuthError("Invalid key length".to_string()));
             }
 
@@ -378,7 +390,7 @@ impl ClientHandler {
                 Self::kick(
                     &mut writer,
                     client_version,
-                    "Failed to verify encryption token",
+                    &translate(None, "vine.login.invalid_verify_token", &[]),
                 )
                 .await?;
                 return Err(ClientError::AuthError("Token mismatch".to_string()));
@@ -402,13 +414,11 @@ impl ClientHandler {
                         "[{}] Mojang authentication failed for '{}': {}",
                         self.peer_addr, username, e
                     );
-                    let reason = match e {
-                        AuthError::NotJoined => "Failed to verify username!",
-                        _ => {
-                            "Failed to verify username with Mojang session servers! Please try again later."
-                        }
+                    let key = match e {
+                        AuthError::NotJoined => "vine.login.not_joined",
+                        _ => "vine.login.auth_failed",
                     };
-                    Self::kick(&mut writer, client_version, reason).await?;
+                    Self::kick(&mut writer, client_version, &translate(None, key, &[])).await?;
                     return Err(ClientError::AuthError(e.to_string()));
                 }
             };
@@ -432,7 +442,12 @@ impl ClientHandler {
                 key.holder.is_some() || key.add_holder(player_id)
             };
             if !linked && online {
-                Self::kick(&mut writer, client_version, "Invalid profile public key.").await?;
+                Self::kick(
+                    &mut writer,
+                    client_version,
+                    &translate(None, "vine.login.invalid_key", &[]),
+                )
+                .await?;
                 return Ok(());
             }
             if !linked {
@@ -457,13 +472,13 @@ impl ClientHandler {
         if login_event.cancelled {
             let reason = login_event
                 .cancel_reason
-                .as_deref()
-                .unwrap_or("Login cancelled by plugin");
+                .clone()
+                .unwrap_or_else(|| translate(None, "vine.plugin.cancelled_login", &[]));
             warn!(
                 "[{}] Player '{}' login cancelled by plugin: {}",
                 self.peer_addr, authenticated_player.username, reason
             );
-            Self::kick(&mut writer, client_version, reason).await?;
+            Self::kick(&mut writer, client_version, &reason).await?;
             return Ok(());
         }
 
@@ -493,7 +508,7 @@ impl ClientHandler {
                 Self::kick(
                     &mut writer,
                     client_version,
-                    "No default or matching backend Minecraft server is configured on the proxy.",
+                    &translate(None, "vine.login.no_server", &[]),
                 )
                 .await?;
                 return Ok(());
@@ -532,7 +547,7 @@ impl ClientHandler {
             Self::kick(
                 &mut writer,
                 client_version,
-                "You are already connected to this proxy.",
+                &translate(None, "vine.login.already_connected", &[]),
             )
             .await?;
             return Ok(());
@@ -566,7 +581,7 @@ impl ClientHandler {
         reason: &str,
     ) -> Result<(), ClientError> {
         let disconnect = LoginDisconnect {
-            reason_json: kick_reason(reason, version).to_string(),
+            reason_json: kick_reason(None, reason, version).to_string(),
         };
         let bytes = encode_packet(&disconnect, version)?;
         let _ = writer.send(bytes).await;
@@ -574,6 +589,11 @@ impl ClientHandler {
     }
 }
 
-pub(crate) fn kick_reason(reason: &str, version: ProtocolVersion) -> serde_json::Value {
-    component_json(&parse_message(&format!("§c[Vine Proxy] {reason}")), version)
+pub(crate) fn kick_reason(
+    locale: Option<&str>,
+    reason: &str,
+    version: ProtocolVersion,
+) -> serde_json::Value {
+    let text = translate(locale, "vine.kick", &[&reason]);
+    component_json(&parse_message(&text), version)
 }

@@ -83,6 +83,10 @@ impl SessionManager {
         }
     }
 
+    pub fn locale(&self, username: &str) -> Option<String> {
+        self.get_session(username).and_then(|s| s.locale)
+    }
+
     /// Looks up an active session by username (case-insensitive)
     pub fn get_session(&self, username: &str) -> Option<PlayerSession> {
         if let Ok(lock) = self.sessions.read() {

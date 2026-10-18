@@ -4,6 +4,7 @@ pub mod bedrock;
 pub mod client;
 pub mod command;
 pub mod config;
+pub mod i18n;
 pub mod network;
 pub mod permissions;
 pub mod plugin;

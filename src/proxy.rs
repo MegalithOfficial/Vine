@@ -12,6 +12,7 @@ use crate::backend::forwarding::ForwardingHelper;
 use crate::client::ClientHandler;
 use crate::command::{CommandDispatcher, CommandSender, ProxyCommandSource};
 use crate::config::{Config, ForwardingMode};
+use crate::i18n::translate;
 use crate::network;
 use crate::security::ConnectionRateLimiter;
 use crate::session::{PlayerAction, SessionManager};
@@ -379,9 +380,8 @@ impl ProxyServer {
 
     async fn disconnect_players(&self) {
         for session in self.session_manager.list_sessions() {
-            let _ = session.action_tx.send(PlayerAction::Disconnect(
-                "Proxy is shutting down.".to_string(),
-            ));
+            let reason = translate(session.locale.as_deref(), "vine.shutdown", &[]);
+            let _ = session.action_tx.send(PlayerAction::Disconnect(reason));
         }
         let deadline = tokio::time::Instant::now()
             + Duration::from_secs(self.config.server.shutdown_timeout_secs.max(1));

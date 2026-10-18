@@ -33,6 +33,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    let lang_dir = config_path
+        .parent()
+        .unwrap_or(std::path::Path::new(""))
+        .join("lang");
+    if let Err(e) = vine::i18n::init(&lang_dir, &config.server.default_locale) {
+        error!(
+            "Failed to load translations from '{}': {}",
+            lang_dir.display(),
+            e
+        );
+    }
+
     let server = ProxyServer::new(config)?;
 
     let (shutdown_tx, _) = broadcast::channel(1);

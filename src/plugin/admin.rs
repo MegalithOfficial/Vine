@@ -63,16 +63,16 @@ impl CommandExecutor<ProxyCommandSource> for ListPlugins {
             let listed = plugins
                 .iter()
                 .map(|(metadata, disabled)| {
-                    let state = if *disabled { " (disabled)" } else { "" };
+                    let state = if *disabled {
+                        source.tr("vine.command.plugins.disabled", &[])
+                    } else {
+                        String::new()
+                    };
                     format!("{} v{}{}", metadata.name, metadata.version, state)
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
-            source.send_message(TextComponent::text(format!(
-                "Plugins ({}): {}",
-                plugins.len(),
-                listed
-            )));
+            source.reply("vine.command.plugins", &[&plugins.len(), &listed]);
         });
         Ok(1)
     }
@@ -97,19 +97,19 @@ impl CommandExecutor<ProxyCommandSource> for ReloadPlugins {
                 None => manager.plugin_names().await,
             };
             if names.is_empty() {
-                source.send_message(TextComponent::text("No plugins are loaded."));
+                source.reply("vine.command.plugins.none", &[]);
                 return;
             }
             for name in names {
-                let message = match manager.reload_plugin(&name).await {
-                    Ok(metadata) => TextComponent::text(format!(
-                        "Reloaded {} v{}",
-                        metadata.name, metadata.version
-                    ))
-                    .color_named(NamedColor::Green),
-                    Err(e) => TextComponent::text(e).color_named(NamedColor::Red),
-                };
-                source.send_message(message);
+                match manager.reload_plugin(&name).await {
+                    Ok(metadata) => source.reply(
+                        "vine.command.plugins.reloaded",
+                        &[&metadata.name, &metadata.version],
+                    ),
+                    Err(e) => {
+                        source.send_message(TextComponent::text(e).color_named(NamedColor::Red))
+                    }
+                }
             }
         });
         Ok(1)

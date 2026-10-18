@@ -23,16 +23,15 @@ use pumpkin_command::suggestion::suggestions::SuggestionsBuilder;
 use pumpkin_util::text::TextComponent;
 
 use crate::config::Config;
+use crate::i18n::translate;
+use crate::protocol::text::parse_message;
 use crate::session::{PlayerAction, SessionManager};
 
 pub static PROXY_COMMAND_ERROR: LiteralCommandErrorType =
     LiteralCommandErrorType::new("Proxy command execution failed");
 
 pub fn command_error(msg: impl Into<String>) -> CommandSyntaxError {
-    CommandSyntaxError::create_without_context(
-        &PROXY_COMMAND_ERROR,
-        TextComponent::text(msg.into()),
-    )
+    CommandSyntaxError::create_without_context(&PROXY_COMMAND_ERROR, parse_message(&msg.into()))
 }
 
 /// Represents the origin that invoked a command
@@ -81,6 +80,20 @@ impl ProxyCommandSource {
         }
     }
 
+    /// Translates `key` into the sender's language
+    pub fn tr(&self, key: &str, args: &[&(dyn std::fmt::Display + Sync)]) -> String {
+        let locale = match &self.sender {
+            CommandSender::Console => None,
+            CommandSender::Player { username, .. } => self.session_manager.locale(username),
+        };
+        translate(locale.as_deref(), key, args)
+    }
+
+    /// Replies with a translated message
+    pub fn reply(&self, key: &str, args: &[&(dyn std::fmt::Display + Sync)]) {
+        self.send_message(parse_message(&self.tr(key, args)));
+    }
+
     /// Returns true if the command sender has administrative privileges (node `vine.admin` or `*`)
     pub fn is_admin(&self) -> bool {
         self.has_permission("vine.admin")
@@ -106,8 +119,7 @@ pub struct HelpCommandExecutor;
 
 impl CommandExecutor<ProxyCommandSource> for HelpCommandExecutor {
     fn execute(&self, context: &CommandContext<ProxyCommandSource>) -> CommandExecutorResult {
-        let text = "Available commands:\n  - /server [server]            : View current server or switch to another backend\n  - /send <player|all> <server> : Send players to another backend (Admin)\n  - /list                       : List connected players\n  - /glist                      : List players grouped by server\n  - /help [command]             : Show this help or info about a command\n  - /vine plugins|reload [name] : List or reload plugins (Admin)";
-        context.source.send_message(TextComponent::text(text));
+        context.source.reply("vine.command.help", &[]);
         Ok(1)
     }
 }
@@ -152,25 +164,15 @@ struct CommandSpecificHelpExecutor;
 impl CommandExecutor<ProxyCommandSource> for CommandSpecificHelpExecutor {
     fn execute(&self, context: &CommandContext<ProxyCommandSource>) -> CommandExecutorResult {
         let cmd = StringArgumentType::get(context, "command")?;
-        let msg = match cmd.to_ascii_lowercase().as_str() {
-            "server" => {
-                "Command /server:\n  Usage: /server [server]\n  Description: View your current server or switch to another backend server."
-            }
-            "send" => {
-                "Command /send:\n  Usage: /send <player|all> <server>\n  Description: Send players to another backend server (Requires vine.command.send / admin)."
-            }
-            "list" => {
-                "Command /list:\n  Usage: /list\n  Description: List all online players connected to the proxy."
-            }
-            "glist" => {
-                "Command /glist:\n  Usage: /glist\n  Description: List online players grouped by backend server."
-            }
-            "help" => {
-                "Command /help:\n  Usage: /help [command]\n  Description: Show help information for available proxy commands."
-            }
-            _ => "Unknown command. Use /help to see all available proxy commands.",
+        let key = match cmd.to_ascii_lowercase().as_str() {
+            "server" => "vine.command.help.server",
+            "send" => "vine.command.help.send",
+            "list" => "vine.command.help.list",
+            "glist" => "vine.command.help.glist",
+            "help" => "vine.command.help.help",
+            _ => "vine.command.help.unknown",
         };
-        context.source.send_message(TextComponent::text(msg));
+        context.source.reply(key, &[]);
         Ok(1)
     }
 }
@@ -182,9 +184,7 @@ impl CommandExecutor<ProxyCommandSource> for ListCommandExecutor {
     fn execute(&self, context: &CommandContext<ProxyCommandSource>) -> CommandExecutorResult {
         let sessions = context.source.session_manager.list_sessions();
         if sessions.is_empty() {
-            context
-                .source
-                .send_message(TextComponent::text("There are 0 players online."));
+            context.source.reply("vine.command.list.empty", &[]);
             return Ok(0);
         }
 
@@ -193,11 +193,10 @@ impl CommandExecutor<ProxyCommandSource> for ListCommandExecutor {
             .map(|s| format!("{} ({})", s.username, s.current_server))
             .collect();
 
-        context.source.send_message(TextComponent::text(format!(
-            "Online players ({}): {}",
-            players_info.len(),
-            players_info.join(", ")
-        )));
+        context.source.reply(
+            "vine.command.list.players",
+            &[&players_info.len(), &players_info.join(", ")],
+        );
         Ok(players_info.len() as i32)
     }
 }

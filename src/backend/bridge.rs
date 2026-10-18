@@ -19,6 +19,7 @@ use crate::backend::forwarding::{
 };
 use crate::command::{CommandDispatcher, CommandSender, ProxyCommandSource};
 use crate::config::{BackendConfig, Config, ForwardingMode, NetworkConfig};
+use crate::i18n::translate;
 use crate::network;
 use crate::plugin::PluginManager;
 use crate::plugin::api::{
@@ -377,9 +378,13 @@ impl BackendBridge {
             .fire_server_connect(&mut connect_event)
             .await;
         if connect_event.cancelled {
-            let reason = connect_event
-                .cancel_reason
-                .unwrap_or_else(|| "Connection cancelled by plugin".to_string());
+            let reason = connect_event.cancel_reason.unwrap_or_else(|| {
+                translate(
+                    self.locale().as_deref(),
+                    "vine.plugin.cancelled_connection",
+                    &[],
+                )
+            });
             warn!(
                 "Player '{}' connection to '{}' cancelled by plugin: {}",
                 self.player.username, connect_event.target_server, reason
@@ -502,6 +507,7 @@ impl BackendBridge {
                         &mut client_writer,
                         self.client_version,
                         phase.get(),
+                        self.locale().as_deref(),
                         &reason,
                     )
                     .await;
@@ -532,10 +538,13 @@ impl BackendBridge {
                         .fire_server_connect(&mut connect_event)
                         .await;
                     if connect_event.cancelled {
-                        let reason = connect_event
-                            .cancel_reason
-                            .as_deref()
-                            .unwrap_or("Server switch cancelled by plugin");
+                        let reason = connect_event.cancel_reason.unwrap_or_else(|| {
+                            translate(
+                                self.locale().as_deref(),
+                                "vine.plugin.cancelled_switch",
+                                &[],
+                            )
+                        });
                         self.notify(&mut client_writer, &phase, format!("§c{reason}"))
                             .await;
                         continue;
@@ -547,7 +556,11 @@ impl BackendBridge {
                         self.notify(
                             &mut client_writer,
                             &phase,
-                            format!("§cServer '{server_name}' does not exist."),
+                            translate(
+                                self.locale().as_deref(),
+                                "vine.server.unknown",
+                                &[&server_name],
+                            ),
                         )
                         .await;
                         continue;
@@ -594,7 +607,11 @@ impl BackendBridge {
                             self.notify(
                                 &mut client_writer,
                                 &phase,
-                                format!("§cFailed to connect to server '{server_name}': {e}"),
+                                translate(
+                                    self.locale().as_deref(),
+                                    "vine.server.connect_failed",
+                                    &[&server_name, &e],
+                                ),
                             )
                             .await;
                         }
@@ -607,7 +624,12 @@ impl BackendBridge {
                                 &mut client_writer,
                                 self.client_version,
                                 phase.get(),
-                                &format!("Failed to connect to server '{server_name}'"),
+                                self.locale().as_deref(),
+                                &translate(
+                                    self.locale().as_deref(),
+                                    "vine.server.switch_failed",
+                                    &[&server_name],
+                                ),
                             )
                             .await;
                             break;
@@ -619,7 +641,9 @@ impl BackendBridge {
                         "Backend server '{}' disconnected player '{}': {:?}",
                         current_server_name, self.player.username, reason
                     );
-                    let reason = reason.unwrap_or_else(|| "Lost connection to server".to_string());
+                    let reason = reason.unwrap_or_else(|| {
+                        translate(self.locale().as_deref(), "vine.server.lost_connection", &[])
+                    });
 
                     let fallback = self
                         .fallback_server
@@ -630,6 +654,7 @@ impl BackendBridge {
                             &mut client_writer,
                             self.client_version,
                             phase.get(),
+                            self.locale().as_deref(),
                             &reason,
                         )
                         .await;
@@ -643,7 +668,11 @@ impl BackendBridge {
                     self.notify(
                         &mut client_writer,
                         &phase,
-                        format!("§eConnecting to fallback server '{fb_name}'... (§c{reason}§e)"),
+                        translate(
+                            self.locale().as_deref(),
+                            "vine.server.fallback",
+                            &[&fb_name, &reason],
+                        ),
                     )
                     .await;
 
@@ -681,8 +710,11 @@ impl BackendBridge {
                                 &mut client_writer,
                                 self.client_version,
                                 phase.get(),
-                                &format!(
-                                    "Lost connection to '{current_server_name}' and fallback unavailable: {e}"
+                                self.locale().as_deref(),
+                                &translate(
+                                    self.locale().as_deref(),
+                                    "vine.server.fallback_failed",
+                                    &[&current_server_name, &e],
                                 ),
                             )
                             .await;
@@ -831,6 +863,7 @@ impl BackendBridge {
         version: ProtocolVersion,
         backend_writer: &mut PacketWriter<W>,
         username: &str,
+        locale: Option<&str>,
     ) -> Option<TunnelExit> {
         let kind = if PacketKind::ChatCommand.matches(packet.id, version) {
             PacketKind::ChatCommand
@@ -846,8 +879,7 @@ impl BackendBridge {
                 username
             );
             return Some(TunnelExit::Kicked {
-                reason: "A proxy plugin cancelled a signed chat message. Contact your network administrator."
-                    .to_string(),
+                reason: translate(locale, "vine.chat.signed_cancelled", &[]),
             });
         }
         if signing.acknowledged > 0
@@ -869,6 +901,7 @@ impl BackendBridge {
         version: ProtocolVersion,
         text: &str,
         username: &str,
+        locale: Option<&str>,
     ) -> Option<TunnelExit> {
         let kind = if PacketKind::ChatCommand.matches(packet.id, version) {
             PacketKind::ChatCommand
@@ -886,8 +919,7 @@ impl BackendBridge {
                 username
             );
             return Some(TunnelExit::Kicked {
-                reason: "A proxy plugin changed a signed chat message. Contact your network administrator."
-                    .to_string(),
+                reason: translate(locale, "vine.chat.signed_changed", &[]),
             });
         }
         if text.encode_utf16().count() > chat_length_limit(version) {
@@ -939,6 +971,10 @@ impl BackendBridge {
         true
     }
 
+    fn locale(&self) -> Option<String> {
+        self.session_manager.locale(&self.player.username)
+    }
+
     async fn notify<W: AsyncWrite + Unpin>(
         &self,
         writer: &mut PacketWriter<W>,
@@ -960,17 +996,18 @@ impl BackendBridge {
         writer: &mut PacketWriter<W>,
         version: ProtocolVersion,
         phase: Phase,
+        locale: Option<&str>,
         reason: &str,
     ) {
         match phase {
             Phase::Login => {
                 let kick = LoginDisconnect {
-                    reason_json: crate::client::kick_reason(reason, version).to_string(),
+                    reason_json: crate::client::kick_reason(locale, reason, version).to_string(),
                 };
                 send_best_effort(writer, &kick, version).await;
             }
             Phase::Config => {
-                let reason = crate::client::kick_reason(reason, version);
+                let reason = crate::client::kick_reason(locale, reason, version);
                 send_best_effort(writer, &ConfigDisconnect { reason }, version).await;
             }
             Phase::Play => {
@@ -1255,6 +1292,7 @@ impl BackendBridge {
                                         client_version,
                                         backend_writer,
                                         username,
+                                        session_manager.locale(username).as_deref(),
                                     )
                                     .await
                                     {
@@ -1283,6 +1321,7 @@ impl BackendBridge {
                                         client_version,
                                         backend_writer,
                                         username,
+                                        session_manager.locale(username).as_deref(),
                                     )
                                     .await
                                     {
@@ -1302,6 +1341,7 @@ impl BackendBridge {
                                         client_version,
                                         &text,
                                         username,
+                                        session_manager.locale(username).as_deref(),
                                     ) {
                                         return exit;
                                     }
@@ -1320,6 +1360,7 @@ impl BackendBridge {
                                         client_version,
                                         backend_writer,
                                         username,
+                                        session_manager.locale(username).as_deref(),
                                     )
                                     .await
                                     {
@@ -1333,6 +1374,7 @@ impl BackendBridge {
                                         client_version,
                                         &chat_event.message,
                                         username,
+                                        session_manager.locale(username).as_deref(),
                                     )
                                 {
                                     return exit;

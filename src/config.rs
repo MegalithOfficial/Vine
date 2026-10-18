@@ -52,6 +52,10 @@ fn default_forwarding_secret_file() -> String {
     "forwarding.secret".to_string()
 }
 
+fn default_locale() -> String {
+    "en_us".to_string()
+}
+
 fn generate_forwarding_secret() -> String {
     hex::encode(rand::random::<[u8; 32]>())
 }
@@ -134,6 +138,9 @@ pub struct ServerConfig {
     /// Require 1.19-1.19.2 clients to present a Mojang-signed chat key in online mode
     #[serde(default = "default_true")]
     pub force_key_authentication: bool,
+    /// Language used when a player's own language has no translation, e.g. `en_us`
+    #[serde(default = "default_locale")]
+    pub default_locale: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -383,6 +390,7 @@ impl Default for Config {
                 shutdown_timeout_secs: 10,
                 forwarding_secret_file: default_forwarding_secret_file(),
                 force_key_authentication: true,
+                default_locale: default_locale(),
             },
             network: NetworkConfig::default(),
             motd: MotdConfig {

@@ -1,11 +1,11 @@
 use std::collections::BTreeMap;
 
+use crate::protocol::text::parse_message;
 use pumpkin_command::CommandSource;
 use pumpkin_command::argument_builder::{ArgumentBuilder, command};
 use pumpkin_command::context::command_context::CommandContext;
 use pumpkin_command::dispatcher::CommandDispatcher as RawCommandDispatcher;
 use pumpkin_command::node::{CommandExecutor, CommandExecutorResult};
-use pumpkin_util::text::TextComponent;
 
 use super::{ProxyCommandSource, command_error};
 
@@ -16,7 +16,9 @@ impl CommandExecutor<ProxyCommandSource> for GlistCommandExecutor {
     fn execute(&self, context: &CommandContext<ProxyCommandSource>) -> CommandExecutorResult {
         if !context.source.has_permission("vine.command.glist") {
             return Err(command_error(
-                "You do not have permission to execute this command (required: vine.command.glist).",
+                context
+                    .source
+                    .tr("vine.command.no_permission", &[&"vine.command.glist"]),
             ));
         }
 
@@ -39,21 +41,27 @@ impl CommandExecutor<ProxyCommandSource> for GlistCommandExecutor {
         for (server_name, mut players) in server_players {
             players.sort_unstable();
             if players.is_empty() {
-                lines.push(format!("[{}] (0):", server_name));
+                lines.push(
+                    context
+                        .source
+                        .tr("vine.command.glist.empty_server", &[&server_name]),
+                );
             } else {
-                lines.push(format!(
-                    "[{}] ({}): {}",
-                    server_name,
-                    players.len(),
-                    players.join(", ")
+                lines.push(context.source.tr(
+                    "vine.command.glist.server",
+                    &[&server_name, &players.len(), &players.join(", ")],
                 ));
             }
         }
 
-        lines.push(format!("Total players online: {}", total_players));
+        lines.push(
+            context
+                .source
+                .tr("vine.command.glist.total", &[&total_players]),
+        );
         context
             .source
-            .send_message(TextComponent::text(lines.join("\n")));
+            .send_message(parse_message(&lines.join("\n")));
         Ok(total_players as i32)
     }
 }

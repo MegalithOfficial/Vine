@@ -7,7 +7,6 @@ use pumpkin_command::dispatcher::CommandDispatcher as RawCommandDispatcher;
 use pumpkin_command::node::{CommandExecutor, CommandExecutorResult};
 use pumpkin_command::suggestion::provider::{SuggestionProvider, SuggestionProviderResult};
 use pumpkin_command::suggestion::suggestions::SuggestionsBuilder;
-use pumpkin_util::text::TextComponent;
 
 use super::{CommandSender, ProxyCommandSource, command_error};
 use crate::session::PlayerAction;
@@ -38,7 +37,9 @@ impl CommandExecutor<ProxyCommandSource> for ServerInfoCommandExecutor {
     fn execute(&self, context: &CommandContext<ProxyCommandSource>) -> CommandExecutorResult {
         if !context.source.has_permission("vine.command.server") {
             return Err(command_error(
-                "You do not have permission to execute this command (required: vine.command.server).",
+                context
+                    .source
+                    .tr("vine.command.no_permission", &[&"vine.command.server"]),
             ));
         }
 
@@ -59,16 +60,14 @@ impl CommandExecutor<ProxyCommandSource> for ServerInfoCommandExecutor {
                     .map(|s| s.current_server)
                     .unwrap_or_else(|| "unknown".to_string());
 
-                context.source.send_message(TextComponent::text(format!(
-                    "§6[Vine] §fYou are currently connected to server '§a{}§f'.\n§6[Vine] §7Available servers: §e{}",
-                    current, servers_str
-                )));
+                context
+                    .source
+                    .reply("vine.command.server.current", &[&current, &servers_str]);
             }
             CommandSender::Console => {
-                context.source.send_message(TextComponent::text(format!(
-                    "Available backend servers: {}",
-                    servers_str
-                )));
+                context
+                    .source
+                    .reply("vine.command.server.available", &[&servers_str]);
             }
         }
 
@@ -83,7 +82,9 @@ impl CommandExecutor<ProxyCommandSource> for ServerSwitchCommandExecutor {
     fn execute(&self, context: &CommandContext<ProxyCommandSource>) -> CommandExecutorResult {
         if !context.source.has_permission("vine.command.server") {
             return Err(command_error(
-                "You do not have permission to execute this command (required: vine.command.server).",
+                context
+                    .source
+                    .tr("vine.command.no_permission", &[&"vine.command.server"]),
             ));
         }
 
@@ -96,7 +97,7 @@ impl CommandExecutor<ProxyCommandSource> for ServerSwitchCommandExecutor {
             } => (username.clone(), action_tx.clone()),
             CommandSender::Console => {
                 return Err(command_error(
-                    "Console cannot switch servers. Use '/send <player> <server>' instead.",
+                    context.source.tr("vine.command.server.console", &[]),
                 ));
             }
         };
@@ -112,31 +113,32 @@ impl CommandExecutor<ProxyCommandSource> for ServerSwitchCommandExecutor {
             None => {
                 let mut available: Vec<&String> = context.source.config.servers.keys().collect();
                 available.sort();
-                return Err(command_error(format!(
-                    "Unknown server '{}'. Available servers: [{}]",
-                    server_name,
-                    available
-                        .into_iter()
-                        .map(|s| s.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )));
+                let available = available
+                    .into_iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(command_error(
+                    context
+                        .source
+                        .tr("vine.command.server.unknown", &[&server_name, &available]),
+                ));
             }
         };
 
         if let Some(session) = context.source.session_manager.get_session(&username)
             && session.current_server.eq_ignore_ascii_case(&target_server)
         {
-            return Err(command_error(format!(
-                "You are already connected to '{}'!",
-                target_server
-            )));
+            return Err(command_error(
+                context
+                    .source
+                    .tr("vine.command.server.already_connected", &[&target_server]),
+            ));
         }
 
-        context.source.send_message(TextComponent::text(format!(
-            "§6[Vine] §eConnecting you to '§a{}§e'...",
-            target_server
-        )));
+        context
+            .source
+            .reply("vine.command.server.connecting", &[&target_server]);
 
         let _ = action_tx.send(PlayerAction::Connect {
             server_name: target_server,
