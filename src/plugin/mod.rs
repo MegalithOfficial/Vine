@@ -39,12 +39,17 @@ struct CommandRoute {
 // Command nodes outlive a reload, so they look up the plugin that currently owns the name
 type CommandRoutes = Arc<std::sync::RwLock<HashMap<String, CommandRoute>>>;
 
+// Senders with a plugin command still running; each may run one at a time, so spamming
+// commands cannot pile up work or run them out of order
+type RunningCommands = Arc<std::sync::Mutex<std::collections::HashSet<String>>>;
+
 pub struct PluginManager {
     plugins_dir: PathBuf,
     loader: WasmPluginLoader,
     loaded_plugins: RwLock<Vec<LoadedPlugin>>,
     event_handlers: RwLock<HashMap<EventType, Vec<RegisteredEventHandler>>>,
     command_routes: CommandRoutes,
+    running_commands: RunningCommands,
     proxy_ctx: OnceCell<ProxyPluginContext>,
     // Loading and reloading run one at a time so a plugin cannot end up loaded twice
     lifecycle: tokio::sync::Mutex<()>,
@@ -62,6 +67,7 @@ impl PluginManager {
             loaded_plugins: RwLock::new(Vec::new()),
             event_handlers: RwLock::new(HashMap::new()),
             command_routes: Arc::default(),
+            running_commands: Arc::default(),
             proxy_ctx: OnceCell::new(),
             lifecycle: tokio::sync::Mutex::new(()),
         }))
@@ -156,6 +162,7 @@ impl PluginManager {
                     .executes(PluginCommandExecutor {
                         name: route.clone(),
                         routes: self.command_routes.clone(),
+                        running: self.running_commands.clone(),
                     })
                     .then(
                         pumpkin_command::argument_builder::argument(
@@ -169,6 +176,7 @@ impl PluginManager {
                         .executes(PluginCommandExecutor {
                             name: route,
                             routes: self.command_routes.clone(),
+                            running: self.running_commands.clone(),
                         }),
                     );
                 proxy
@@ -718,6 +726,20 @@ impl PluginManager {
 struct PluginCommandExecutor {
     name: String,
     routes: CommandRoutes,
+    running: RunningCommands,
+}
+
+struct RunningGuard {
+    running: RunningCommands,
+    sender: String,
+}
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        if let Ok(mut running) = self.running.lock() {
+            running.remove(&self.sender);
+        }
+    }
 }
 
 fn resolve_route(routes: &CommandRoutes, name: &str) -> Option<CommandRoute> {
@@ -767,8 +789,22 @@ impl pumpkin_command::node::CommandExecutor<ProxyCommandSource> for PluginComman
             return Ok(0);
         };
         // Runs on its own task so a slow plugin doesn't hold up the player's connection
+        let sender_name = sender.name.clone();
+        if !self
+            .running
+            .lock()
+            .is_ok_and(|mut running| running.insert(sender_name.clone()))
+        {
+            context.source.reply("vine.plugin.command_busy", &[]);
+            return Ok(0);
+        }
+        let guard = RunningGuard {
+            running: self.running.clone(),
+            sender: sender_name,
+        };
         let source = context.source.clone();
         tokio::spawn(async move {
+            let _guard = guard;
             match plugin.handle_command(command_id, sender, args).await {
                 Ok(Ok(_)) => {}
                 Ok(Err(err_msg)) => source.reply("vine.plugin.command_error", &[&err_msg]),

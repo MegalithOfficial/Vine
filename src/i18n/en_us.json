@@ -17,6 +17,7 @@
   "vine.plugin.cancelled_switch": "Server switch cancelled by plugin",
   "vine.plugin.command_unavailable": "§cThis plugin command is no longer available.",
   "vine.plugin.command_error": "§cError: %s",
+  "vine.plugin.command_busy": "§cYour previous command is still running.",
   "vine.chat.signed_cancelled": "A proxy plugin cancelled a signed chat message. Contact your network administrator.",
   "vine.chat.signed_changed": "A proxy plugin changed a signed chat message. Contact your network administrator.",
   "vine.server.initial_connect_failed": "Could not reach %s right now. Try again in a moment.",
