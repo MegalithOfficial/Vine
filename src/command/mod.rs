@@ -212,9 +212,14 @@ type CommandBuilder = pumpkin_command::argument_builder::CommandArgumentBuilder<
 /// Central registry and dispatcher for commands using `pumpkin-command`
 pub struct CommandDispatcher {
     inner: RwLock<RawCommandDispatcher<ProxyCommandSource>>,
-    // Plugins register commands from their store task, which a running plugin command may be
-    // waiting on while the dispatcher is read-locked
-    pending: Mutex<Vec<CommandBuilder>>,
+    // Changes never wait for the write lock: a plugin call holding the read lock may need the
+    // very worker thread a blocked writer would sit on. They queue and apply on the next access.
+    pending: Mutex<Vec<PendingChange>>,
+}
+
+enum PendingChange {
+    Register(CommandBuilder),
+    Deactivate(String),
 }
 
 impl Default for CommandDispatcher {
@@ -253,31 +258,34 @@ impl CommandDispatcher {
 
     /// Registers a new command builder into the dispatcher
     pub fn register(&self, builder: CommandBuilder) {
-        match self.inner.try_write() {
-            Ok(mut lock) => {
-                self.drain_pending(&mut lock);
-                lock.register(builder);
-            }
-            Err(TryLockError::WouldBlock) => {
-                if let Ok(mut pending) = self.pending.lock() {
-                    pending.push(builder);
-                }
-            }
-            Err(TryLockError::Poisoned(_)) => {}
-        }
+        self.change(PendingChange::Register(builder));
     }
 
     pub fn deactivate_source(&self, source: &str) {
-        if let Ok(mut lock) = self.inner.write() {
-            self.drain_pending(&mut lock);
-            lock.deactivate_commands_from_source(source);
+        self.change(PendingChange::Deactivate(source.to_string()));
+    }
+
+    fn change(&self, change: PendingChange) {
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.push(change);
+        }
+        match self.inner.try_write() {
+            Ok(mut lock) => self.drain_pending(&mut lock),
+            Err(TryLockError::WouldBlock | TryLockError::Poisoned(_)) => {}
         }
     }
 
     fn drain_pending(&self, dispatcher: &mut RawCommandDispatcher<ProxyCommandSource>) {
         if let Ok(mut pending) = self.pending.lock() {
-            for builder in pending.drain(..) {
-                dispatcher.register(builder);
+            for change in pending.drain(..) {
+                match change {
+                    PendingChange::Register(builder) => {
+                        dispatcher.register(builder);
+                    }
+                    PendingChange::Deactivate(source) => {
+                        dispatcher.deactivate_commands_from_source(&source);
+                    }
+                }
             }
         }
     }
