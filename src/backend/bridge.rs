@@ -78,6 +78,8 @@ enum TunnelExit {
     Kicked { reason: String },
     /// The backend being switched to finished logging in, or failed to
     Prepared(Box<Result<PreparedBackend, BridgeError>>),
+    /// The client finished configuring while a switch was waiting for it
+    ReachedPlay,
 }
 
 type BackendReader = PacketReader<OwnedReadHalf>;
@@ -510,6 +512,8 @@ impl BackendBridge {
         let (client_tx, mut client_rx) = ClientQueue::new();
         let bridge = &self;
         let mut connecting: Option<(String, Connecting<'_>)> = None;
+        // A switch asked for while the client is still configuring waits until it is playing
+        let mut deferred: Option<String> = None;
 
         loop {
             let tunnel_res = Self::bridge_tunnel(
@@ -534,6 +538,7 @@ impl BackendBridge {
                 &keep_alive_challenge,
                 &leftovers,
                 connecting.as_mut().map(|(_, future)| future),
+                deferred.is_some(),
             )
             .await;
 
@@ -573,7 +578,16 @@ impl BackendBridge {
                     );
                     break;
                 }
+                TunnelExit::ReachedPlay => {
+                    if let Some(server_name) = deferred.take() {
+                        let _ = action_tx.send(PlayerAction::Connect { server_name });
+                    }
+                }
                 TunnelExit::Connect { server_name } => {
+                    if phase.get() == Phase::Config {
+                        deferred = Some(server_name);
+                        continue;
+                    }
                     if connecting.is_some() {
                         self.notify(
                             &mut client_writer,
@@ -742,6 +756,7 @@ impl BackendBridge {
                 TunnelExit::BackendDisconnected { reason } => {
                     // The current backend is gone, so a switch in progress is abandoned
                     connecting = None;
+                    deferred = None;
                     warn!(
                         "Backend server '{}' disconnected player '{}': {:?}",
                         current_server_name, self.player.username, reason
@@ -1420,6 +1435,7 @@ impl BackendBridge {
         keep_alive_challenge: &std::sync::Mutex<Option<i64>>,
         leftovers: &std::sync::Mutex<Leftovers>,
         connecting: Option<&mut Connecting<'_>>,
+        wake_on_play: bool,
     ) -> Result<TunnelExit, BridgeError>
     where
         R1: AsyncRead + Unpin,
@@ -1454,6 +1470,7 @@ impl BackendBridge {
             loop {
                 match client_reader.read_packet().await {
                     Ok(mut raw_packet) => {
+                        let mut reached_play = false;
                         if !client_rate_limiter.record_packet() {
                             warn!(
                                 "Player '{}' exceeded packet rate limit (flood protection kicked in)",
@@ -1470,6 +1487,7 @@ impl BackendBridge {
                             serverbound_transition(current, raw_packet.id, client_version)
                         {
                             phase.set(next);
+                            reached_play = next == Phase::Play;
                         } else if current == Phase::Config
                             && PacketKind::ConfigServerboundPluginMessage
                                 .matches(raw_packet.id, client_version)
@@ -1781,6 +1799,9 @@ impl BackendBridge {
                         if let Err(e) = backend_writer.send(raw_packet.to_bytes()).await {
                             debug!("Backend write failed for '{}': {:?}", username, e);
                             return TunnelExit::BackendDisconnected { reason: None };
+                        }
+                        if reached_play && wake_on_play {
+                            return TunnelExit::ReachedPlay;
                         }
                     }
                     Err(e) => {
