@@ -47,6 +47,7 @@ fn default_listen_backlog() -> u32 {
 
 const LEGACY_PLACEHOLDER_SECRET: &str = "vine-velocity-secret-change-me";
 const FORWARDING_SECRET_ENV: &str = "VINE_FORWARDING_SECRET";
+const BIND_ADDRESS_ENV: &str = "VINE_BIND_ADDRESS";
 
 fn default_forwarding_secret_file() -> String {
     "forwarding.secret".to_string()
@@ -485,6 +486,12 @@ impl Config {
             .into_iter()
             .map(|(host, server)| (normalize_host(&host), server))
             .collect();
+        // Hosting panels assign the port at start, so it wins over the file
+        if let Ok(bind) = std::env::var(BIND_ADDRESS_ENV)
+            && !bind.trim().is_empty()
+        {
+            config.server.bind_address = bind.trim().to_string();
+        }
         let env_secret = std::env::var(FORWARDING_SECRET_ENV).ok();
         config.resolve_forwarding_secret(path.parent().unwrap_or(Path::new("")), env_secret)?;
         config.validate()?;

@@ -14,9 +14,9 @@
         "Debian": "ghcr.io/pterodactyl/yolks:debian"
     },
     "file_denylist": [],
-    "startup": "./vine",
+    "startup": "VINE_BIND_ADDRESS=0.0.0.0:{{SERVER_PORT}} ./vine",
     "config": {
-        "files": "{\r\n    \"vine.toml\": {\r\n        \"parser\": \"file\",\r\n        \"find\": {\r\n            \"bind_address = \\\"0.0.0.0:25565\\\"\": \"bind_address = \\\"0.0.0.0:{{server.build.default.port}}\\\"\"\r\n        }\r\n    }\r\n}",
+        "files": "{}",
         "startup": "{\r\n    \"done\": \"Vine Minecraft Proxy is listening on\"\r\n}",
         "logs": "{}",
         "stop": "stop"
