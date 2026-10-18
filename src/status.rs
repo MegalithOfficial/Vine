@@ -10,6 +10,9 @@ use crate::config::{BackendConfig, MotdConfig};
 use crate::protocol::ProtocolVersion;
 use crate::protocol::packets::status::StatusResponse;
 use crate::protocol::text::{component_json, parse_message};
+use tracing::warn;
+
+const MAX_STATUS_LEN: usize = 32767;
 pub use icon::StatusIconManager;
 
 #[derive(Serialize)]
@@ -139,7 +142,16 @@ impl StatusHandler {
             favicon: icon_uri.as_deref(),
         };
 
-        let json = serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string());
+        let mut json = serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string());
+        // Clients reject a status response longer than this, so the icon is the first to go
+        if json.encode_utf16().count() > MAX_STATUS_LEN && status.favicon.is_some() {
+            warn!("The status response is too long for clients; sending it without the icon");
+            json = serde_json::to_string(&StatusJson {
+                favicon: None,
+                ..status
+            })
+            .unwrap_or_else(|_| "{}".to_string());
+        }
         StatusResponse { json }
     }
 }

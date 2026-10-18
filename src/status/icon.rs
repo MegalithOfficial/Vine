@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
 use base64::prelude::*;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 pub const PNG_SIGNATURE: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
 
@@ -53,12 +53,12 @@ impl StatusIcon {
         let height = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
 
         if width != 64 || height != 64 {
-            warn!(
-                "Status icon '{}' dimensions are {}x{} pixels. Minecraft requires exactly 64x64 PNG images for server list icons.",
+            return Err(format!(
+                "Status icon '{}' is {}x{} pixels; the server list only shows 64x64 PNG images",
                 path.display(),
                 width,
                 height
-            );
+            ));
         }
 
         let b64 = BASE64_STANDARD.encode(&bytes);
