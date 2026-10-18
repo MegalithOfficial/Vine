@@ -34,11 +34,10 @@ impl BedrockStatusHandler {
     /// Formats the official Bedrock MCPE advertisement string
     pub fn build_advertisement_string(&self) -> String {
         let online = self.online_players.load(Ordering::Relaxed) as i32;
-        let motd = format!("{}\n{}", self.config.motd, self.config.sub_motd);
 
         format!(
             "MCPE;{};{};{};{};{};{};{};{};{};{};{};0;",
-            motd,
+            self.config.motd,
             self.config.protocol_version,
             self.config.version_name,
             online,
@@ -76,8 +75,7 @@ mod tests {
         let config = BedrockConfig {
             enabled: true,
             bind_address: "0.0.0.0:19132".to_string(),
-            motd: "Vine Server".to_string(),
-            sub_motd: "Bedrock Proxy".to_string(),
+            motd: "Vine Server\nBedrock Proxy".to_string(),
             protocol_version: 2169,
             version_name: "1.26.45".to_string(),
             level_name: "Lobby".to_string(),

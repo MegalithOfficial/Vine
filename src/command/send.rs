@@ -164,8 +164,7 @@ mod tests {
                 address: "127.0.0.1:25567".to_string(),
                 forwarding: ForwardingMode::None,
                 secret: None,
-                motd_line1: None,
-                motd_line2: None,
+                motd: None,
                 icon_path: None,
             },
         );
@@ -252,8 +251,7 @@ mod tests {
                 address: "127.0.0.1:25567".to_string(),
                 forwarding: ForwardingMode::None,
                 secret: None,
-                motd_line1: None,
-                motd_line2: None,
+                motd: None,
                 icon_path: None,
             },
         );
@@ -285,8 +283,7 @@ mod tests {
                 address: "127.0.0.1:25567".to_string(),
                 forwarding: ForwardingMode::None,
                 secret: None,
-                motd_line1: None,
-                motd_line2: None,
+                motd: None,
                 icon_path: None,
             },
         );
@@ -296,8 +293,7 @@ mod tests {
                 address: "127.0.0.1:25565".to_string(),
                 forwarding: ForwardingMode::None,
                 secret: None,
-                motd_line1: None,
-                motd_line2: None,
+                motd: None,
                 icon_path: None,
             },
         );

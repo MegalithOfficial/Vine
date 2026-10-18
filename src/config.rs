@@ -219,10 +219,8 @@ impl Default for NetworkConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MotdConfig {
-    /// Line 1 of the server list ping description
-    pub line1: String,
-    /// Line 2 of the server list ping description
-    pub line2: String,
+    /// Server list description; use \n for a second line
+    pub text: String,
     /// Maximum players shown in the server list ping
     pub max_players: u32,
     /// Custom version display string (e.g. "Vine 1.7.x - 26.x")
@@ -292,12 +290,9 @@ pub struct BackendConfig {
     /// Optional custom 64x64 PNG status icon path for this backend / virtual host
     #[serde(default)]
     pub icon_path: Option<String>,
-    /// Optional custom MOTD Line 1 for this backend / virtual host
+    /// Optional server list description for this backend / virtual host
     #[serde(default)]
-    pub motd_line1: Option<String>,
-    /// Optional custom MOTD Line 2 for this backend / virtual host
-    #[serde(default)]
-    pub motd_line2: Option<String>,
+    pub motd: Option<String>,
 }
 
 fn default_telemetry_interval() -> u64 {
@@ -350,8 +345,7 @@ impl Default for Config {
                 forwarding: ForwardingMode::Velocity,
                 secret: None,
                 icon_path: None,
-                motd_line1: None,
-                motd_line2: None,
+                motd: None,
             },
         );
         servers.insert(
@@ -361,8 +355,7 @@ impl Default for Config {
                 forwarding: ForwardingMode::BungeeCord,
                 secret: None,
                 icon_path: None,
-                motd_line1: Some("§b§lVine Survival §7» §fWelcome back!".to_string()),
-                motd_line2: Some("§7Custom world • Economy • Land Claims".to_string()),
+                motd: None,
             },
         );
         servers.insert(
@@ -372,8 +365,7 @@ impl Default for Config {
                 forwarding: ForwardingMode::None,
                 secret: None,
                 icon_path: None,
-                motd_line1: None,
-                motd_line2: None,
+                motd: None,
             },
         );
 
@@ -394,15 +386,11 @@ impl Default for Config {
             },
             network: NetworkConfig::default(),
             motd: MotdConfig {
-                line1: "§a§lVine §7» §fHigh-Performance Minecraft Proxy".to_string(),
-                line2: "§7Multi-version support §8• §e1.7.x - 26.x".to_string(),
+                text: "A Vine Server".to_string(),
                 max_players: 100,
                 version_name: "Vine 1.7.x - 26.x".to_string(),
                 protocol_version: 776,
-                sample_players: vec![
-                    "§aVine Multi-Version Proxy".to_string(),
-                    "§7Secure • Fast • Reliable".to_string(),
-                ],
+                sample_players: Vec::new(),
                 icon_path: None,
                 show_sample_players: true,
             },

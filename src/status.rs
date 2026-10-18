@@ -88,15 +88,13 @@ impl StatusHandler {
 
             if let Some(server_name) = target_server
                 && let Some(cfg) = self.servers.get(server_name)
-                && (cfg.motd_line1.is_some() || cfg.motd_line2.is_some())
+                && let Some(motd) = &cfg.motd
             {
-                let l1 = cfg.motd_line1.as_deref().unwrap_or(&self.motd.line1);
-                let l2 = cfg.motd_line2.as_deref().unwrap_or(&self.motd.line2);
-                return format!("{}\n{}", l1, l2);
+                return motd.clone();
             }
         }
 
-        format!("{}\n{}", self.motd.line1, self.motd.line2)
+        self.motd.text.clone()
     }
 
     /// Create custom status response with overridden fields from plugins
@@ -180,8 +178,7 @@ mod tests {
                 forwarding: ForwardingMode::None,
                 secret: None,
                 icon_path: None,
-                motd_line1: Some("Survival Line 1".to_string()),
-                motd_line2: Some("Survival Line 2".to_string()),
+                motd: Some("Survival Line 1\nSurvival Line 2".to_string()),
             },
         );
 
@@ -196,8 +193,7 @@ mod tests {
         ));
 
         let motd = MotdConfig {
-            line1: "Global Line 1".to_string(),
-            line2: "Global Line 2".to_string(),
+            text: "Global Line 1\nGlobal Line 2".to_string(),
             max_players: 50,
             version_name: "Vine Proxy".to_string(),
             protocol_version: 776,

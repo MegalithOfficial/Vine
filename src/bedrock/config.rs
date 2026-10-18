@@ -8,10 +8,8 @@ pub struct BedrockConfig {
     pub enabled: bool,
     /// UDP address and port for the Bedrock listener (default Minecraft Bedrock port is 19132)
     pub bind_address: String,
-    /// Primary MOTD line shown in Bedrock server lists
+    /// Server list description; use \n for a second line
     pub motd: String,
-    /// Secondary MOTD line / subtitle shown in Bedrock server lists
-    pub sub_motd: String,
     /// Protocol version advertised (2169 corresponds to Bedrock 1.26.45)
     pub protocol_version: u32,
     /// Bedrock version string advertised (e.g. "1.26.45")
@@ -33,8 +31,7 @@ impl Default for BedrockConfig {
         Self {
             enabled: false,
             bind_address: "0.0.0.0:19132".to_string(),
-            motd: "§a§lVine §7» §fHigh-Performance Minecraft Proxy".to_string(),
-            sub_motd: "Bedrock Support • 1.26.x".to_string(),
+            motd: "A Vine Server".to_string(),
             protocol_version: 2169,
             version_name: "1.26.45".to_string(),
             level_name: "Vine Proxy".to_string(),
