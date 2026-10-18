@@ -29,12 +29,11 @@ const DATA_DIR: &str = "/data";
 const MAX_TABLE_ELEMENTS: usize = 1_000_000;
 
 /// Caps what a plugin allocates across all of its memories and tables, not per memory
+// Failed grows stay counted, since wasmtime also reports failures it never asked about
 pub struct PluginLimiter {
     memory_limit: usize,
     memory_used: usize,
     table_elements: usize,
-    last_growth: usize,
-    last_table_growth: usize,
 }
 
 impl PluginLimiter {
@@ -43,8 +42,6 @@ impl PluginLimiter {
             memory_limit,
             memory_used: 0,
             table_elements: 0,
-            last_growth: 0,
-            last_table_growth: 0,
         }
     }
 }
@@ -61,13 +58,7 @@ impl wasmtime::ResourceLimiter for PluginLimiter {
             return Ok(false);
         }
         self.memory_used += growth;
-        self.last_growth = growth;
         Ok(true)
-    }
-
-    fn memory_grow_failed(&mut self, _error: wasmtime::Error) -> wasmtime::Result<()> {
-        self.memory_used -= std::mem::take(&mut self.last_growth);
-        Ok(())
     }
 
     fn table_growing(
@@ -81,13 +72,7 @@ impl wasmtime::ResourceLimiter for PluginLimiter {
             return Ok(false);
         }
         self.table_elements += growth;
-        self.last_table_growth = growth;
         Ok(true)
-    }
-
-    fn table_grow_failed(&mut self, _error: wasmtime::Error) -> wasmtime::Result<()> {
-        self.table_elements -= std::mem::take(&mut self.last_table_growth);
-        Ok(())
     }
 }
 
