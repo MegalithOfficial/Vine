@@ -1282,8 +1282,8 @@ impl BackendBridge {
                                 )
                             {
                                 let mut msg_event = PluginMessageEvent {
-                                    channel: custom_payload.channel,
-                                    data: custom_payload.data,
+                                    channel: custom_payload.channel.clone(),
+                                    data: custom_payload.data.clone(),
                                     player_uuid: Some(player_uuid.to_string()),
                                     server_name: Some(current_server_name.clone()),
                                     cancelled: false,
@@ -1291,6 +1291,16 @@ impl BackendBridge {
                                 plugin_manager.fire_plugin_message(&mut msg_event).await;
                                 if msg_event.cancelled {
                                     continue;
+                                }
+                                if msg_event.data != custom_payload.data {
+                                    let rewritten = ServerboundPluginMessage {
+                                        channel: custom_payload.channel,
+                                        data: msg_event.data,
+                                    };
+                                    let mut payload = Vec::new();
+                                    if rewritten.write(&mut payload, client_version).is_ok() {
+                                        raw_packet.payload = payload.into();
+                                    }
                                 }
                             }
 
