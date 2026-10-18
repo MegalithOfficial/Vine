@@ -63,12 +63,23 @@ pub async fn parse_proxy_protocol<R: AsyncRead + Unpin>(
     fallback_addr: SocketAddr,
 ) -> Result<ProxyHeaderResult, io::Error> {
     let mut initial_buf = [0u8; 512];
-    let n = reader.read(&mut initial_buf).await?;
-    if n == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "Stream closed before reading PROXY header",
-        ));
+    let mut n = 0;
+    // A header can arrive split over several reads; keep reading while what we have could
+    // still be the start of one, so a short first read isn't mistaken for a bad header
+    loop {
+        let read = reader.read(&mut initial_buf[n..]).await?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Stream closed before reading PROXY header",
+            ));
+        }
+        n += read;
+        let v2_prefix = n < PROXY_V2_MAGIC.len() && PROXY_V2_MAGIC.starts_with(&initial_buf[..n]);
+        let v1_prefix = n < 6 && b"PROXY ".starts_with(&initial_buf[..n]);
+        if !v2_prefix && !v1_prefix {
+            break;
+        }
     }
 
     if n >= 12 && initial_buf[..12] == PROXY_V2_MAGIC {
@@ -328,6 +339,26 @@ mod tests {
             "198.51.100.22:54321".parse::<SocketAddr>().unwrap()
         );
         assert_eq!(res.leftover_bytes, b"Hello");
+    }
+
+    #[tokio::test]
+    async fn test_proxy_header_split_across_reads() {
+        use tokio::io::AsyncWriteExt;
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let header = b"PROXY TCP4 198.51.100.22 192.0.2.1 54321 25565\r\nHello";
+        let writer = tokio::spawn(async move {
+            client.write_all(&header[..3]).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            client.write_all(&header[3..]).await.unwrap();
+            client
+        });
+        let fallback = "127.0.0.1:1234".parse().unwrap();
+        let res = parse_proxy_protocol(&mut server, fallback).await.unwrap();
+        assert_eq!(
+            res.client_addr,
+            "198.51.100.22:54321".parse::<SocketAddr>().unwrap()
+        );
+        drop(writer.await);
     }
 
     #[tokio::test]
