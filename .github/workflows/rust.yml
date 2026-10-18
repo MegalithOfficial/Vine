@@ -42,7 +42,7 @@ jobs:
         with:
           submodules: recursive
       - run: rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
-      - uses: bnjbvr/cargo-machete@main
+      - uses: bnjbvr/cargo-machete@ac30a525c0a8d163a92d727b3ff079ee3f6ecb08 # v0.9.2
 
   audit:
     name: Audit dependencies
