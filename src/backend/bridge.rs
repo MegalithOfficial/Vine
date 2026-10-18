@@ -780,9 +780,12 @@ impl BackendBridge {
                     // A switch already on its way finishes instead, so a server that stops right
                     // after sending its players elsewhere still delivers them there
                     if let Some(prepared) = early.take() {
-                        backend_gone = true;
-                        pending_exit = Some(TunnelExit::Prepared(prepared));
-                        continue;
+                        if prepared.is_ok() {
+                            backend_gone = true;
+                            pending_exit = Some(TunnelExit::Prepared(prepared));
+                            continue;
+                        }
+                        connecting = None;
                     }
                     if let Some((_, future)) = connecting.as_mut() {
                         let prepared = future.as_mut().await;
