@@ -404,6 +404,7 @@ impl BackendBridge {
                 &reason,
             )
             .await;
+            self.fire_disconnect(None).await;
             return Ok(());
         }
         current_server_name = connect_event.target_server;
@@ -457,6 +458,7 @@ impl BackendBridge {
                     self.client_version,
                 )
                 .await;
+                self.fire_disconnect(None).await;
                 return Err(e);
             }
         };
@@ -812,14 +814,7 @@ impl BackendBridge {
             }
         }
 
-        let disconnect_event = PlayerDisconnectEvent {
-            uuid: self.player.id.to_string(),
-            username: self.player.username.clone(),
-            last_server: Some(current_server_name.clone()),
-        };
-        self.plugin_manager
-            .fire_player_disconnect(&disconnect_event)
-            .await;
+        self.fire_disconnect(Some(current_server_name)).await;
 
         self.online_players.fetch_sub(1, Ordering::Relaxed);
         info!(
@@ -1108,6 +1103,16 @@ impl BackendBridge {
             packet.payload = payload.into();
         }
         true
+    }
+
+    /// Every player that got past PlayerLogin gets a PlayerDisconnect, even if no backend took them
+    async fn fire_disconnect(&self, last_server: Option<String>) {
+        let event = PlayerDisconnectEvent {
+            uuid: self.player.id.to_string(),
+            username: self.player.username.clone(),
+            last_server,
+        };
+        self.plugin_manager.fire_player_disconnect(&event).await;
     }
 
     /// Sends whatever the last tunnel left in the client queue

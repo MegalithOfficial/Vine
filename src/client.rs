@@ -19,7 +19,9 @@ use crate::config::Config;
 use crate::i18n::translate;
 use crate::network::PrefixedRead;
 use crate::plugin::PluginManager;
-use crate::plugin::api::{PlayerLoginEvent, PlayerPreLoginEvent, ProxyPingEvent};
+use crate::plugin::api::{
+    PlayerDisconnectEvent, PlayerLoginEvent, PlayerPreLoginEvent, ProxyPingEvent,
+};
 use crate::protocol::packets::handshake::{Handshake, HandshakeIntent};
 use crate::protocol::packets::login::{
     EncryptionRequest, EncryptionResponse, LoginDisconnect, LoginStart, SetCompression,
@@ -511,6 +513,13 @@ impl ClientHandler {
                     &translate(None, "vine.login.no_server", &[]),
                 )
                 .await?;
+                self.plugin_manager
+                    .fire_player_disconnect(&PlayerDisconnectEvent {
+                        uuid: authenticated_player.id.to_string(),
+                        username: authenticated_player.username.clone(),
+                        last_server: None,
+                    })
+                    .await;
                 return Ok(());
             }
         };
@@ -551,6 +560,13 @@ impl ClientHandler {
                 &translate(None, "vine.login.already_connected", &[]),
             )
             .await?;
+            self.plugin_manager
+                .fire_player_disconnect(&PlayerDisconnectEvent {
+                    uuid: authenticated_player.id.to_string(),
+                    username: authenticated_player.username.clone(),
+                    last_server: None,
+                })
+                .await;
             return Ok(());
         };
 
