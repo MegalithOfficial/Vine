@@ -1,0 +1,32 @@
+Vine
+Copyright (C) Vine contributors
+Licensed under the GNU General Public License v3.0, see LICENSE.
+
+Vine contains code derived from the following projects.
+
+Velocity
+https://github.com/PaperMC/Velocity
+Copyright (C) 2018-2023 Velocity Contributors
+Licensed under the GNU General Public License v3.0.
+  - src/backend/forwarding.rs: modern forwarding version selection and the
+    keyed forwarding payload
+  - src/auth.rs, src/client.rs: validation of 1.19-1.19.2 profile keys and
+    linking them to their holder
+  - src/protocol/packets/switch.rs: the packet sequence used to move pre-1.20.2
+    clients between backends and clear what the previous backend left behind
+
+Pumpkin
+https://github.com/Pumpkin-MC/Pumpkin
+Copyright (C) Pumpkin contributors
+Licensed under the GNU General Public License v3.0.
+  - src/telemetry.rs
+
+Gate
+https://github.com/minekube/gate
+Copyright (C) Minekube
+Licensed under the Apache License, Version 2.0.
+  - src/auth.rs: the Mojang-signed profile key used as a test vector
+
+Mojang Studios
+  - src/yggdrasil_session_pubkey.der: Mojang's public session key, used to
+    verify profile keys
