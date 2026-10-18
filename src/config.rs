@@ -515,6 +515,24 @@ impl Config {
                 ));
             }
         }
+        let routes = std::iter::once(("routing.default_server", &self.routing.default_server))
+            .chain(
+                self.routing
+                    .fallback_server
+                    .iter()
+                    .map(|name| ("routing.fallback_server", name)),
+            )
+            .chain(
+                self.routing
+                    .forced_hosts
+                    .values()
+                    .map(|name| ("routing.forced_hosts", name)),
+            );
+        for (field, name) in routes {
+            if !self.servers.contains_key(name) {
+                return Err(format!("{field} points to unknown server '{name}'"));
+            }
+        }
         for (name, server) in &self.servers {
             if !matches!(
                 server.forwarding,
