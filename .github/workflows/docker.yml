@@ -134,12 +134,12 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.REGISTRY_IMAGE }}
           # Pushes only move the branch and commit tags; latest and the version tag are set by a
-          # manual run so a published version never changes underneath its users
+          # manual run on master so a published version never changes underneath its users
           tags: |
             type=ref,event=branch
             type=sha
-            type=raw,value=latest,enable=${{ github.event_name == 'workflow_dispatch' }}
-            type=raw,value=${{ env.VINE_VERSION }},enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=raw,value=latest,enable=${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master' }}
+            type=raw,value=${{ env.VINE_VERSION }},enable=${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master' }}
 
       - name: Create manifest list and push
         working-directory: ${{ runner.temp }}/digests
