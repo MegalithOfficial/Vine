@@ -19,6 +19,7 @@
   "vine.plugin.command_error": "§cError: %s",
   "vine.chat.signed_cancelled": "A proxy plugin cancelled a signed chat message. Contact your network administrator.",
   "vine.chat.signed_changed": "A proxy plugin changed a signed chat message. Contact your network administrator.",
+  "vine.server.initial_connect_failed": "Could not reach %s right now. Try again in a moment.",
   "vine.server.unknown": "§cServer '%s' does not exist.",
   "vine.server.connect_failed": "§cFailed to connect to server '%s': %s",
   "vine.server.switch_failed": "Failed to connect to server '%s'",

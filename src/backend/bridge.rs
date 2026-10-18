@@ -389,9 +389,18 @@ impl BackendBridge {
                 "Player '{}' connection to '{}' cancelled by plugin: {}",
                 self.player.username, connect_event.target_server, reason
             );
-            return Err(BridgeError::VineError(reason));
+            Self::disconnect_client(
+                &mut client_writer,
+                self.client_version,
+                Phase::Login,
+                self.locale().as_deref(),
+                &reason,
+            )
+            .await;
+            return Ok(());
         }
         current_server_name = connect_event.target_server;
+        let requested_server = current_server_name.clone();
 
         let initial_backend_cfg = if current_server_name == self.server_name {
             self.config.clone()
@@ -401,26 +410,47 @@ impl BackendBridge {
             self.config.clone()
         };
 
-        let (mut backend_reader, mut backend_writer, success_bytes) = match self
+        let mut login = self
             .login_backend(&current_server_name, &initial_backend_cfg)
-            .await
+            .await;
+        if let Err(e) = &login
+            && let Some((fb_name, fb_cfg)) = &self.fallback_server
+            && fb_name != &current_server_name
         {
+            warn!(
+                "Primary server '{}' unreachable ({}), attempting failover to fallback server '{}' at {}",
+                current_server_name, e, fb_name, fb_cfg.address
+            );
+            current_server_name = fb_name.clone();
+            login = self.login_backend(&current_server_name, fb_cfg).await;
+        }
+        let (mut backend_reader, mut backend_writer, success_bytes) = match login {
             Ok(res) => res,
             Err(e) => {
-                if let Some((fb_name, fb_cfg)) = &self.fallback_server {
-                    if fb_name != &current_server_name {
-                        warn!(
-                            "Primary server '{}' unreachable ({}), attempting failover to fallback server '{}' at {}",
-                            current_server_name, e, fb_name, fb_cfg.address
-                        );
-                        current_server_name = fb_name.clone();
-                        self.login_backend(&current_server_name, fb_cfg).await?
-                    } else {
-                        return Err(e);
+                let reason_json = match &e {
+                    BridgeError::LoginDisconnected(json)
+                        if serde_json::from_str::<serde_json::Value>(json).is_ok() =>
+                    {
+                        json.clone()
                     }
-                } else {
-                    return Err(e);
-                }
+                    _ => {
+                        let locale = self.locale();
+                        let reason = translate(
+                            locale.as_deref(),
+                            "vine.server.initial_connect_failed",
+                            &[&requested_server],
+                        );
+                        crate::client::kick_reason(locale.as_deref(), &reason, self.client_version)
+                            .to_string()
+                    }
+                };
+                send_best_effort(
+                    &mut client_writer,
+                    &LoginDisconnect { reason_json },
+                    self.client_version,
+                )
+                .await;
+                return Err(e);
             }
         };
 
