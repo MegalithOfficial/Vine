@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -42,6 +42,8 @@ impl PlayerSession {
 /// Thread-safe registry of connected player sessions
 pub struct SessionManager {
     sessions: RwLock<HashMap<String, PlayerSession>>,
+    // Accounts between passing the duplicate check and registering their session
+    logging_in: Mutex<Vec<(String, Uuid)>>,
 }
 
 impl Default for SessionManager {
@@ -54,13 +56,27 @@ impl SessionManager {
     pub fn new() -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
+            logging_in: Mutex::new(Vec::new()),
         }
     }
 
-    pub fn is_online(&self, username: &str, uuid: Uuid) -> bool {
-        self.sessions.read().is_ok_and(|lock| {
-            lock.contains_key(&username.to_ascii_lowercase())
-                || lock.values().any(|s| s.uuid == uuid)
+    /// Holds the account for a login in progress, unless it is already online or logging in
+    /// elsewhere. Released when the returned guard drops.
+    pub fn try_begin_login(self: &Arc<Self>, username: &str, uuid: Uuid) -> Option<LoginGuard> {
+        let key = username.to_ascii_lowercase();
+        let sessions = self.sessions.read().ok()?;
+        let mut logging_in = self.logging_in.lock().ok()?;
+        if sessions.contains_key(&key)
+            || sessions.values().any(|s| s.uuid == uuid)
+            || logging_in.iter().any(|(k, u)| *k == key || *u == uuid)
+        {
+            return None;
+        }
+        logging_in.push((key.clone(), uuid));
+        Some(LoginGuard {
+            manager: Arc::clone(self),
+            key,
+            uuid,
         })
     }
 
@@ -146,6 +162,20 @@ impl SessionManager {
             lock.len()
         } else {
             0
+        }
+    }
+}
+
+pub struct LoginGuard {
+    manager: Arc<SessionManager>,
+    key: String,
+    uuid: Uuid,
+}
+
+impl Drop for LoginGuard {
+    fn drop(&mut self) {
+        if let Ok(mut lock) = self.manager.logging_in.lock() {
+            lock.retain(|(k, u)| !(*k == self.key && *u == self.uuid));
         }
     }
 }

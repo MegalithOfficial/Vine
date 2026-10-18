@@ -462,11 +462,11 @@ impl ClientHandler {
         authenticated_player.profile_key = profile_key;
 
         // Checked before PlayerLogin so plugins never see a login, or a disconnect, for a player
-        // whose account is already playing
-        if self
+        // whose account is already playing or logging in on another connection
+        let Some(_login_guard) = self
             .session_manager
-            .is_online(&authenticated_player.username, authenticated_player.id)
-        {
+            .try_begin_login(&authenticated_player.username, authenticated_player.id)
+        else {
             warn!(
                 "[{}] Rejecting duplicate login for '{}' ({})",
                 self.peer_addr, authenticated_player.username, authenticated_player.id
@@ -478,7 +478,7 @@ impl ClientHandler {
             )
             .await?;
             return Ok(());
-        }
+        };
 
         let mut login_event = PlayerLoginEvent {
             uuid: authenticated_player.id.to_string(),
