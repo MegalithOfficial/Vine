@@ -407,16 +407,19 @@ impl BackendBridge {
             self.fire_disconnect(None).await;
             return Ok(());
         }
-        current_server_name = connect_event.target_server;
-        let requested_server = current_server_name.clone();
-
-        let initial_backend_cfg = if current_server_name == self.server_name {
+        let initial_backend_cfg = if connect_event.target_server == self.server_name {
             self.config.clone()
-        } else if let Some(cfg) = self.proxy_config.servers.get(&current_server_name) {
+        } else if let Some(cfg) = self.proxy_config.servers.get(&connect_event.target_server) {
+            current_server_name = connect_event.target_server;
             cfg.clone()
         } else {
+            warn!(
+                "A plugin sent '{}' to unknown server '{}'; using '{}'",
+                self.player.username, connect_event.target_server, self.server_name
+            );
             self.config.clone()
         };
+        let requested_server = current_server_name.clone();
 
         let mut login = self
             .login_backend(&current_server_name, &initial_backend_cfg)
