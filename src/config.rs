@@ -544,6 +544,19 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        let security = &self.security;
+        if security.max_packets_per_sec == 0 {
+            return Err("security.max_packets_per_sec must be at least 1".to_string());
+        }
+        if security.rate_limit_enabled
+            && (security.max_connections_per_sec == 0 || security.connection_burst == 0)
+        {
+            return Err(
+                "security.max_connections_per_sec and security.connection_burst must be at least 1 \
+                 while rate limiting is on"
+                    .to_string(),
+            );
+        }
         if self.network.proxy_protocol && self.network.proxy_protocol_trusted_proxies.is_empty() {
             return Err(
                 "network.proxy_protocol is on, but network.proxy_protocol_trusted_proxies is empty; \
