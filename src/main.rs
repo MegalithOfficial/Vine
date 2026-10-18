@@ -15,8 +15,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let config_path = std::env::args()
-        .nth(1)
+    // `--init` writes the default files and exits without starting the proxy
+    let mut args = std::env::args().skip(1).peekable();
+    let init_only = args.next_if(|arg| arg == "--init").is_some();
+    let config_path = args
+        .next()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("vine.toml"));
 
@@ -43,6 +46,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             lang_dir.display(),
             e
         );
+    }
+
+    if init_only {
+        info!(
+            "Wrote the default files next to '{}'",
+            config_path.display()
+        );
+        return Ok(());
     }
 
     let server = ProxyServer::new(config)?;
