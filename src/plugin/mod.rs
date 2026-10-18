@@ -46,6 +46,8 @@ pub struct PluginManager {
     event_handlers: RwLock<HashMap<EventType, Vec<RegisteredEventHandler>>>,
     command_routes: CommandRoutes,
     proxy_ctx: OnceCell<ProxyPluginContext>,
+    // Loading and reloading run one at a time so a plugin cannot end up loaded twice
+    lifecycle: tokio::sync::Mutex<()>,
 }
 
 impl PluginManager {
@@ -61,6 +63,7 @@ impl PluginManager {
             event_handlers: RwLock::new(HashMap::new()),
             command_routes: Arc::default(),
             proxy_ctx: OnceCell::new(),
+            lifecycle: tokio::sync::Mutex::new(()),
         }))
     }
 
@@ -176,6 +179,7 @@ impl PluginManager {
     }
 
     pub async fn load_plugins(&self) -> Result<usize, Box<dyn std::error::Error>> {
+        let _lifecycle = self.lifecycle.lock().await;
         if !self.plugins_dir.exists() {
             let _ = fs::create_dir_all(&self.plugins_dir);
             info!("Created plugins directory '{}'", self.plugins_dir.display());
@@ -322,6 +326,7 @@ impl PluginManager {
     /// a name that is already taken leaves the running instance untouched; once the old instance
     /// is unloaded, a new one that fails its on_load leaves the plugin unloaded.
     pub async fn reload_plugin(&self, name: &str) -> Result<PluginMetadata, String> {
+        let _lifecycle = self.lifecycle.lock().await;
         let path = self
             .loaded_plugins
             .read()
