@@ -750,6 +750,39 @@ impl BackendBridge {
                         break;
                     };
 
+                    // Plugins see this move like any other; with the old backend gone a cancelled
+                    // one ends the session, and a different target must be a configured server
+                    let mut connect_event = ServerConnectEvent {
+                        uuid: self.player.id.to_string(),
+                        username: self.player.username.clone(),
+                        current_server: Some(current_server_name.clone()),
+                        target_server: fb_name.clone(),
+                        cancelled: false,
+                        cancel_reason: None,
+                    };
+                    self.plugin_manager
+                        .fire_server_connect(&mut connect_event)
+                        .await;
+                    if connect_event.cancelled {
+                        let reason = connect_event.cancel_reason.unwrap_or(reason);
+                        Self::disconnect_client(
+                            &mut client_writer,
+                            self.client_version,
+                            phase.get(),
+                            self.locale().as_deref(),
+                            &reason,
+                        )
+                        .await;
+                        break;
+                    }
+                    let (fb_name, fb_cfg) =
+                        match self.proxy_config.servers.get(&connect_event.target_server) {
+                            Some(cfg) if connect_event.target_server != fb_name => {
+                                (connect_event.target_server, cfg.clone())
+                            }
+                            _ => (fb_name, fb_cfg),
+                        };
+
                     info!(
                         "Rerouting player '{}' to fallback server '{}' (kicked from '{}': {})",
                         self.player.username, fb_name, current_server_name, reason
@@ -789,6 +822,14 @@ impl BackendBridge {
                                 "Player '{}' successfully recovered to fallback '{}'",
                                 self.player.username, current_server_name
                             );
+                            let connected_event = ServerConnectedEvent {
+                                uuid: self.player.id.to_string(),
+                                username: self.player.username.clone(),
+                                server_name: current_server_name.clone(),
+                            };
+                            self.plugin_manager
+                                .fire_server_connected(&connected_event)
+                                .await;
                         }
                         Err(SwitchError::Unreachable(e) | SwitchError::Fatal(e)) => {
                             warn!(
