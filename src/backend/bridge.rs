@@ -24,7 +24,7 @@ use crate::network;
 use crate::plugin::PluginManager;
 use crate::plugin::api::{
     PlayerChatEvent, PlayerCommandEvent, PlayerDisconnectEvent, PlayerJoinEvent,
-    PluginMessageEvent, ServerConnectEvent, ServerConnectedEvent,
+    PluginMessageEvent, PluginMessageSource, ServerConnectEvent, ServerConnectedEvent,
 };
 use crate::protocol::packets::config::ConfigDisconnect;
 use crate::protocol::packets::handshake::{Handshake, HandshakeIntent};
@@ -1286,6 +1286,7 @@ impl BackendBridge {
                                     data: custom_payload.data.clone(),
                                     player_uuid: Some(player_uuid.to_string()),
                                     server_name: Some(current_server_name.clone()),
+                                    source: PluginMessageSource::Player,
                                     cancelled: false,
                                 };
                                 plugin_manager.fire_plugin_message(&mut msg_event).await;
@@ -1431,7 +1432,7 @@ impl BackendBridge {
         let backend_to_client = async {
             loop {
                 match backend_reader.read_packet().await {
-                    Ok(raw_packet) => {
+                    Ok(mut raw_packet) => {
                         let current = phase.get();
                         if current == Phase::Config
                             && PacketKind::ConfigDisconnect.matches(raw_packet.id, client_version)
@@ -1501,6 +1502,37 @@ impl BackendBridge {
                                         return TunnelExit::ClientDisconnected;
                                     }
                                     continue;
+                                }
+                            }
+
+                            if PacketKind::ClientboundPluginMessage
+                                .matches(raw_packet.id, client_version)
+                                && let Ok(custom_payload) = decode_packet::<ClientboundPluginMessage>(
+                                    &raw_packet.payload,
+                                    client_version,
+                                )
+                            {
+                                let mut msg_event = PluginMessageEvent {
+                                    channel: custom_payload.channel.clone(),
+                                    data: custom_payload.data.clone(),
+                                    player_uuid: Some(player_uuid.to_string()),
+                                    server_name: Some(current_server_name.clone()),
+                                    source: PluginMessageSource::Server,
+                                    cancelled: false,
+                                };
+                                plugin_manager.fire_plugin_message(&mut msg_event).await;
+                                if msg_event.cancelled {
+                                    continue;
+                                }
+                                if msg_event.data != custom_payload.data {
+                                    let rewritten = ClientboundPluginMessage {
+                                        channel: custom_payload.channel,
+                                        data: msg_event.data,
+                                    };
+                                    let mut payload = Vec::new();
+                                    if rewritten.write(&mut payload, client_version).is_ok() {
+                                        raw_packet.payload = payload.into();
+                                    }
                                 }
                             }
 

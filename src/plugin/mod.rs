@@ -651,6 +651,14 @@ impl PluginManager {
                     data: event.data.clone(),
                     player_uuid: event.player_uuid.clone(),
                     server_name: event.server_name.clone(),
+                    source: match event.source {
+                        PluginMessageSource::Player => {
+                            loader::wasm::wasm_host::wit::vine::plugin::event::PluginMessageSource::Player
+                        }
+                        PluginMessageSource::Server => {
+                            loader::wasm::wasm_host::wit::vine::plugin::event::PluginMessageSource::Server
+                        }
+                    },
                     cancelled: event.cancelled,
                 },
             );
@@ -957,6 +965,7 @@ mod tests {
             data: vec![1, 2, 3],
             player_uuid: Some("00000000-0000-0000-0000-000000000001".to_string()),
             server_name: Some("lobby".to_string()),
+            source: PluginMessageSource::Player,
             cancelled: false,
         };
         manager.fire_plugin_message(&mut msg).await;

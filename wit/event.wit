@@ -83,11 +83,16 @@ interface event {
         cancelled: bool,
     }
 
+    enum plugin-message-source {
+        player,
+        server,
+    }
     record plugin-message-event {
         channel: string,
         data: list<u8>,
         player-uuid: option<string>,
         server-name: option<string>,
+        source: plugin-message-source,
         cancelled: bool,
     }
 

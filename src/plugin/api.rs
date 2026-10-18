@@ -123,7 +123,14 @@ pub struct PluginMessageEvent {
     pub data: Vec<u8>,
     pub player_uuid: Option<String>,
     pub server_name: Option<String>,
+    pub source: PluginMessageSource,
     pub cancelled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginMessageSource {
+    Player,
+    Server,
 }
 
 pub struct PluginContext {
