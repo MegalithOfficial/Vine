@@ -518,6 +518,8 @@ impl BackendBridge {
         let mut early: Option<Box<Result<PreparedBackend, BridgeError>>> = None;
         // An exit to handle next without running the tunnel again
         let mut pending_exit: Option<TunnelExit> = None;
+        // Set when the current backend is gone, so a waiting switch must finish right away
+        let mut backend_gone = false;
 
         loop {
             let tunnel_res = if let Some(exit) = pending_exit.take() {
@@ -687,7 +689,7 @@ impl BackendBridge {
                     ));
                 }
                 TunnelExit::Prepared(prepared) => {
-                    if phase.get() != Phase::Play {
+                    if phase.get() != Phase::Play && !std::mem::take(&mut backend_gone) {
                         // Keep the slot taken so another switch waits; the result is replayed
                         // once the client is playing
                         if let Some((_, future)) = connecting.as_mut() {
@@ -774,10 +776,23 @@ impl BackendBridge {
                     }
                 }
                 TunnelExit::BackendDisconnected { reason } => {
-                    // The current backend is gone, so a switch in progress is abandoned
-                    connecting = None;
+                    // A switch already on its way finishes instead, so a server that stops right
+                    // after sending its players elsewhere still delivers them there
+                    if let Some(prepared) = early.take() {
+                        backend_gone = true;
+                        pending_exit = Some(TunnelExit::Prepared(prepared));
+                        continue;
+                    }
+                    if let Some((_, future)) = connecting.as_mut() {
+                        let prepared = future.as_mut().await;
+                        if prepared.is_ok() {
+                            backend_gone = true;
+                            pending_exit = Some(TunnelExit::Prepared(Box::new(prepared)));
+                            continue;
+                        }
+                        connecting = None;
+                    }
                     deferred = None;
-                    early = None;
                     warn!(
                         "Backend server '{}' disconnected player '{}': {:?}",
                         current_server_name, self.player.username, reason
