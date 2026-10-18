@@ -131,7 +131,7 @@ impl wit::vine::plugin::translation::Host for PluginHostState {
         entries: Vec<(String, String)>,
     ) -> wasmtime::Result<()> {
         if let Err(e) =
-            crate::i18n::register(&self.plugin_name.to_ascii_lowercase(), &locale, entries)
+            crate::i18n::register(&crate::i18n::namespace(&self.plugin_name), &locale, entries)
         {
             tracing::warn!(
                 "[Plugin: {}] Could not register '{}' translations: {}",
@@ -155,8 +155,8 @@ impl wit::vine::plugin::translation::Host for PluginHostState {
         // Namespaces are stored lowercase, like the folders they come from
         let key = match key.split_once(':') {
             Some((namespace, rest)) if namespace.eq_ignore_ascii_case("vine") => rest.to_string(),
-            Some((namespace, rest)) => format!("{}:{rest}", namespace.to_ascii_lowercase()),
-            None => format!("{}:{key}", self.plugin_name.to_ascii_lowercase()),
+            Some((namespace, rest)) => format!("{}:{rest}", crate::i18n::namespace(namespace)),
+            None => format!("{}:{key}", crate::i18n::namespace(&self.plugin_name)),
         };
         let args: Vec<&(dyn std::fmt::Display + Sync)> = args
             .iter()

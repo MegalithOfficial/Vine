@@ -136,6 +136,28 @@ fn format_template(template: &str, args: &[&(dyn Display + Sync)]) -> String {
     out
 }
 
+/// Turns a plugin name into the folder and key prefix its translations use
+pub fn namespace(plugin: &str) -> String {
+    let name: String = plugin
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let name = name.trim_start_matches('.');
+    if name.is_empty() {
+        "_".to_string()
+    } else {
+        name.to_string()
+    }
+}
+
 /// Registers a plugin's default texts, writing them to `lang/<namespace>/<locale>.json` if that file
 /// is missing. Texts in the file win over the defaults.
 pub fn register(
