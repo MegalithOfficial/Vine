@@ -34,6 +34,7 @@ pub struct PluginLimiter {
     memory_used: usize,
     table_elements: usize,
     last_growth: usize,
+    last_table_growth: usize,
 }
 
 impl PluginLimiter {
@@ -43,6 +44,7 @@ impl PluginLimiter {
             memory_used: 0,
             table_elements: 0,
             last_growth: 0,
+            last_table_growth: 0,
         }
     }
 }
@@ -79,7 +81,13 @@ impl wasmtime::ResourceLimiter for PluginLimiter {
             return Ok(false);
         }
         self.table_elements += growth;
+        self.last_table_growth = growth;
         Ok(true)
+    }
+
+    fn table_grow_failed(&mut self, _error: wasmtime::Error) -> wasmtime::Result<()> {
+        self.table_elements -= std::mem::take(&mut self.last_table_growth);
+        Ok(())
     }
 }
 
