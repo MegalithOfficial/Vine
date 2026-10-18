@@ -124,6 +124,66 @@ impl wit::vine::plugin::logging::Host for PluginHostState {
     }
 }
 
+impl wit::vine::plugin::translation::Host for PluginHostState {
+    async fn register_translations(
+        &mut self,
+        locale: String,
+        entries: Vec<(String, String)>,
+    ) -> wasmtime::Result<()> {
+        if let Err(e) =
+            crate::i18n::register(&self.plugin_name.to_ascii_lowercase(), &locale, entries)
+        {
+            tracing::warn!(
+                "[Plugin: {}] Could not register '{}' translations: {}",
+                self.plugin_name,
+                locale,
+                e
+            );
+        }
+        Ok(())
+    }
+
+    async fn translate(
+        &mut self,
+        player_uuid: Option<String>,
+        key: String,
+        args: Vec<String>,
+    ) -> wasmtime::Result<String> {
+        let locale = player_uuid
+            .and_then(|uuid| uuid::Uuid::parse_str(&uuid).ok())
+            .and_then(|uuid| self.proxy.as_ref()?.session_manager.locale_by_uuid(uuid));
+        let key = match key.strip_prefix("vine:") {
+            Some(own) => own.to_string(),
+            None if key.contains(':') => key,
+            None => format!("{}:{key}", self.plugin_name.to_ascii_lowercase()),
+        };
+        let args: Vec<&(dyn std::fmt::Display + Sync)> = args
+            .iter()
+            .map(|arg| arg as &(dyn std::fmt::Display + Sync))
+            .collect();
+        Ok(crate::i18n::translate(locale.as_deref(), &key, &args))
+    }
+
+    async fn get_player_locale(&mut self, player_uuid: String) -> wasmtime::Result<Option<String>> {
+        Ok(uuid::Uuid::parse_str(&player_uuid)
+            .ok()
+            .and_then(|uuid| self.proxy.as_ref()?.session_manager.locale_by_uuid(uuid)))
+    }
+
+    async fn set_player_locale(
+        &mut self,
+        player_uuid: String,
+        locale: Option<String>,
+    ) -> wasmtime::Result<bool> {
+        let (Some(proxy), Ok(uuid)) = (&self.proxy, uuid::Uuid::parse_str(&player_uuid)) else {
+            return Ok(false);
+        };
+        Ok(proxy
+            .session_manager
+            .set_locale_override(uuid, locale.as_deref()))
+    }
+}
+
 impl wit::vine::plugin::command::Host for PluginHostState {
     async fn reply(
         &mut self,

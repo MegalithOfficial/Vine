@@ -10,6 +10,7 @@ world plugin {
     import proxy;
     import context;
     import command;
+    import translation;
 
     /// Called once by the host to initialize the plugin instance.
     export init-plugin: func();

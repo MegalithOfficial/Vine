@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, OnceLock, RwLock};
 
 use tracing::warn;
@@ -15,6 +15,7 @@ static BUILTIN: LazyLock<Table> = LazyLock::new(|| serde_json::from_str(EN_US).u
 static TRANSLATIONS: OnceLock<Translations> = OnceLock::new();
 
 struct Translations {
+    dir: PathBuf,
     default_locale: String,
     locales: RwLock<HashMap<String, Table>>,
 }
@@ -25,6 +26,7 @@ pub fn init(dir: &Path, default_locale: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     write_if_missing(&dir.join(format!("{FALLBACK_LOCALE}.json")), EN_US)?;
     let translations = Translations {
+        dir: dir.to_path_buf(),
         default_locale: normalize(default_locale),
         locales: RwLock::new(HashMap::new()),
     };
@@ -51,25 +53,17 @@ impl Translations {
             let Some(locale) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            let table: Table = match std::fs::read_to_string(&path)
-                .map_err(|e| e.to_string())
-                .and_then(|text| serde_json::from_str(&text).map_err(|e| e.to_string()))
-            {
-                Ok(table) => table,
-                Err(e) => {
-                    warn!("Skipping translation file '{}': {}", path.display(), e);
-                    continue;
-                }
-            };
-            let table = table.into_iter().map(|(key, text)| match namespace {
-                Some(namespace) => (format!("{namespace}:{key}"), text),
-                None => (key, text),
-            });
-            if let Ok(mut locales) = self.locales.write() {
-                locales.entry(normalize(locale)).or_default().extend(table);
+            if let Some(table) = load_file(&path, namespace) {
+                self.insert(locale, table);
             }
         }
         Ok(())
+    }
+
+    fn insert(&self, locale: &str, table: Table) {
+        if let Ok(mut locales) = self.locales.write() {
+            locales.entry(normalize(locale)).or_default().extend(table);
+        }
     }
 
     fn lookup(&self, locale: Option<&str>, key: &str) -> Option<String> {
@@ -142,6 +136,68 @@ fn format_template(template: &str, args: &[&(dyn Display + Sync)]) -> String {
     out
 }
 
+/// Registers a plugin's default texts, writing them to `lang/<namespace>/<locale>.json` if that file
+/// is missing. Texts in the file win over the defaults.
+pub fn register(
+    namespace: &str,
+    locale: &str,
+    entries: Vec<(String, String)>,
+) -> std::io::Result<()> {
+    let valid = |name: &str| {
+        !name.is_empty()
+            && !name.starts_with('.')
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+    };
+    let locale = normalize(locale);
+    if !valid(namespace) || !valid(&locale) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid plugin name or locale '{namespace}/{locale}'"),
+        ));
+    }
+    let Some(translations) = TRANSLATIONS.get() else {
+        return Ok(());
+    };
+    let dir = translations.dir.join(namespace);
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{locale}.json"));
+    let defaults: std::collections::BTreeMap<String, String> = entries.into_iter().collect();
+    let json = serde_json::to_string_pretty(&defaults).map_err(std::io::Error::other)?;
+    write_if_missing(&path, &json)?;
+
+    let mut table: Table = defaults
+        .into_iter()
+        .map(|(key, text)| (format!("{namespace}:{key}"), text))
+        .collect();
+    table.extend(load_file(&path, Some(namespace)).unwrap_or_default());
+    translations.insert(&locale, table);
+    Ok(())
+}
+
+fn load_file(path: &Path, namespace: Option<&str>) -> Option<Table> {
+    let table: Table = match std::fs::read_to_string(path)
+        .map_err(|e| e.to_string())
+        .and_then(|text| serde_json::from_str(&text).map_err(|e| e.to_string()))
+    {
+        Ok(table) => table,
+        Err(e) => {
+            warn!("Skipping translation file '{}': {}", path.display(), e);
+            return None;
+        }
+    };
+    Some(
+        table
+            .into_iter()
+            .map(|(key, text)| match namespace {
+                Some(namespace) => (format!("{namespace}:{key}"), text),
+                None => (key, text),
+            })
+            .collect(),
+    )
+}
+
 fn normalize(locale: &str) -> String {
     locale.trim().to_ascii_lowercase().replace('-', "_")
 }
@@ -176,6 +232,7 @@ mod tests {
     #[test]
     fn test_lookup_falls_back_by_language() {
         let translations = Translations {
+            dir: PathBuf::new(),
             default_locale: "de_de".to_string(),
             locales: RwLock::new(HashMap::from([
                 (

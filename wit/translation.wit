@@ -1,0 +1,13 @@
+interface translation {
+    /// Registers this plugin's default texts for a language such as "en_us".
+    /// They are written to lang/<plugin>/<locale>.json if that file is missing; the file wins afterwards.
+    register-translations: func(locale: string, entries: list<tuple<string, string>>);
+    /// Returns the text for `key` in the player's language, or the default language without a player.
+    /// Keys without a namespace are this plugin's own; "vine:" or another plugin's name reaches theirs.
+    /// `%s` and `%1$s` placeholders are filled from `args`.
+    translate: func(player-uuid: option<string>, key: string, args: list<string>) -> string;
+    /// Returns the language the player sees messages in.
+    get-player-locale: func(player-uuid: string) -> option<string>;
+    /// Overrides the player's language; none goes back to the client's own.
+    set-player-locale: func(player-uuid: string, locale: option<string>) -> bool;
+}

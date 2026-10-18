@@ -167,6 +167,7 @@ mod tests {
                 client_ip: "127.0.0.1".to_string(),
                 protocol_version: 765,
                 locale: None,
+                locale_override: None,
             })
             .unwrap();
         let _guard2 = session_manager
@@ -178,6 +179,7 @@ mod tests {
                 client_ip: "127.0.0.1".to_string(),
                 protocol_version: 765,
                 locale: None,
+                locale_override: None,
             })
             .unwrap();
 

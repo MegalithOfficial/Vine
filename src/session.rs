@@ -29,6 +29,14 @@ pub struct PlayerSession {
     pub protocol_version: u32,
     /// Language reported by the client, e.g. `en_us`
     pub locale: Option<String>,
+    /// Language set by a plugin, which wins over the client's
+    pub locale_override: Option<String>,
+}
+
+impl PlayerSession {
+    pub fn effective_locale(&self) -> Option<&str> {
+        self.locale_override.as_deref().or(self.locale.as_deref())
+    }
 }
 
 /// Thread-safe registry of connected player sessions
@@ -84,7 +92,27 @@ impl SessionManager {
     }
 
     pub fn locale(&self, username: &str) -> Option<String> {
-        self.get_session(username).and_then(|s| s.locale)
+        self.get_session(username)
+            .and_then(|s| s.effective_locale().map(str::to_string))
+    }
+
+    pub fn locale_by_uuid(&self, uuid: Uuid) -> Option<String> {
+        let lock = self.sessions.read().ok()?;
+        let session = lock.values().find(|s| s.uuid == uuid)?;
+        session.effective_locale().map(str::to_string)
+    }
+
+    pub fn set_locale_override(&self, uuid: Uuid, locale: Option<&str>) -> bool {
+        let Ok(mut lock) = self.sessions.write() else {
+            return false;
+        };
+        match lock.values_mut().find(|s| s.uuid == uuid) {
+            Some(session) => {
+                session.locale_override = locale.map(|l| l.to_ascii_lowercase().replace('-', "_"));
+                true
+            }
+            None => false,
+        }
     }
 
     /// Looks up an active session by username (case-insensitive)
@@ -148,6 +176,7 @@ mod tests {
                 client_ip: "127.0.0.1".to_string(),
                 protocol_version: 769,
                 locale: None,
+                locale_override: None,
             }
         };
 

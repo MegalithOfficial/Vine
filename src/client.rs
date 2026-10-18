@@ -539,6 +539,7 @@ impl ClientHandler {
             client_ip: client_ip.to_string(),
             protocol_version: client_version.0,
             locale: None,
+            locale_override: None,
         }) else {
             warn!(
                 "[{}] Rejecting duplicate login for '{}' ({})",

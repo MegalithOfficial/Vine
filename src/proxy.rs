@@ -380,7 +380,7 @@ impl ProxyServer {
 
     async fn disconnect_players(&self) {
         for session in self.session_manager.list_sessions() {
-            let reason = translate(session.locale.as_deref(), "vine.shutdown", &[]);
+            let reason = translate(session.effective_locale(), "vine.shutdown", &[]);
             let _ = session.action_tx.send(PlayerAction::Disconnect(reason));
         }
         let deadline = tokio::time::Instant::now()
