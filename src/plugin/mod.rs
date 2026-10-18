@@ -116,13 +116,20 @@ impl PluginManager {
         plugin: Arc<WasmPlugin>,
     ) {
         if let Some(proxy) = self.proxy_ctx.get() {
-            // A name owned by a built-in or an active plugin would keep that owner's permission
+            // A name owned by a built-in or another loaded plugin would keep that owner's
+            // permission. Owners are looked up in the routes, which change right away unlike
+            // the dispatcher.
             let names = std::iter::once(name.clone())
                 .chain(aliases)
                 .filter(|cmd_name| {
-                    let free = proxy
-                        .command_dispatcher
-                        .can_claim(cmd_name, &plugin.metadata.name);
+                    let free = !proxy.command_dispatcher.is_builtin(cmd_name)
+                        && self.command_routes.read().is_ok_and(|routes| {
+                            routes
+                                .get(&cmd_name.to_ascii_lowercase())
+                                .is_none_or(|route| {
+                                    route.plugin.metadata.name == plugin.metadata.name
+                                })
+                        });
                     if !free {
                         warn!(
                             "Plugin '{}' cannot register '/{}', which is already taken",

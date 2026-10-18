@@ -352,20 +352,14 @@ impl CommandDispatcher {
         }
     }
 
-    /// Returns true if `plugin` may register `name`: it is free, already the plugin's, or was left
-    /// by a plugin that is no longer active. Built-in commands are never handed over.
-    pub fn can_claim(&self, name: &str, plugin: &str) -> bool {
+    /// Returns true if `name` is one of the proxy's own commands, which plugins cannot take over
+    pub fn is_builtin(&self, name: &str) -> bool {
         let clean = name.trim_start_matches('/').to_ascii_lowercase();
-        let Some(lock) = self.read() else {
-            return false;
-        };
-        let Some(node) = lock.tree.get(&clean) else {
-            return true;
-        };
-        match lock.tree[node].meta.source.as_deref() {
-            None => false,
-            Some(owner) => owner == plugin || lock.is_disabled(&clean),
-        }
+        self.read().is_some_and(|lock| {
+            lock.tree
+                .get(&clean)
+                .is_some_and(|node| lock.tree[node].meta.source.is_none())
+        })
     }
 
     /// Returns true if the proxy should run this command for `source`: it exists, is active and
