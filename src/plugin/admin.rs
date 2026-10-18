@@ -1,14 +1,12 @@
 use std::sync::{Arc, Weak};
 
+use pumpkin_command::Requirement;
 use pumpkin_command::argument_builder::{ArgumentBuilder, argument, command, literal};
 use pumpkin_command::argument_types::core::string::StringArgumentType;
 use pumpkin_command::context::command_context::CommandContext;
 use pumpkin_command::node::{CommandExecutor, CommandExecutorResult};
 use pumpkin_command::suggestion::provider::{SuggestionProvider, SuggestionProviderResult};
 use pumpkin_command::suggestion::suggestions::SuggestionsBuilder;
-use pumpkin_command::{CommandSource, Requirement};
-use pumpkin_util::text::TextComponent;
-use pumpkin_util::text::color::NamedColor;
 
 use super::PluginManager;
 use crate::command::{CommandDispatcher, ProxyCommandSource};
@@ -68,7 +66,10 @@ impl CommandExecutor<ProxyCommandSource> for ListPlugins {
                     } else {
                         String::new()
                     };
-                    format!("{} v{}{}", metadata.name, metadata.version, state)
+                    source.tr(
+                        "vine.command.plugins.entry",
+                        &[&metadata.name, &metadata.version, &state],
+                    )
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -106,9 +107,7 @@ impl CommandExecutor<ProxyCommandSource> for ReloadPlugins {
                         "vine.command.plugins.reloaded",
                         &[&metadata.name, &metadata.version],
                     ),
-                    Err(e) => {
-                        source.send_message(TextComponent::text(e).color_named(NamedColor::Red))
-                    }
+                    Err(e) => source.reply("vine.command.plugins.reload_failed", &[&e]),
                 }
             }
         });

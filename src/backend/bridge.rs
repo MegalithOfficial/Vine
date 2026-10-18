@@ -575,8 +575,16 @@ impl BackendBridge {
                                 &[],
                             )
                         });
-                        self.notify(&mut client_writer, &phase, format!("§c{reason}"))
-                            .await;
+                        self.notify(
+                            &mut client_writer,
+                            &phase,
+                            translate(
+                                self.locale().as_deref(),
+                                "vine.server.switch_cancelled",
+                                &[&reason],
+                            ),
+                        )
+                        .await;
                         continue;
                     }
                     let server_name = connect_event.target_server;

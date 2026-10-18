@@ -190,7 +190,11 @@ impl CommandExecutor<ProxyCommandSource> for ListCommandExecutor {
 
         let players_info: Vec<String> = sessions
             .into_iter()
-            .map(|s| format!("{} ({})", s.username, s.current_server))
+            .map(|s| {
+                context
+                    .source
+                    .tr("vine.command.list.entry", &[&s.username, &s.current_server])
+            })
             .collect();
 
         context.source.reply(
