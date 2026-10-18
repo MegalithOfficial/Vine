@@ -133,11 +133,13 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.REGISTRY_IMAGE }}
+          # Pushes only move the branch and commit tags; latest and the version tag are set by a
+          # manual run so a published version never changes underneath its users
           tags: |
             type=ref,event=branch
-            type=raw,value=latest
             type=sha
-            type=raw,value=${{ env.VINE_VERSION }}
+            type=raw,value=latest,enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=raw,value=${{ env.VINE_VERSION }},enable=${{ github.event_name == 'workflow_dispatch' }}
 
       - name: Create manifest list and push
         working-directory: ${{ runner.temp }}/digests
