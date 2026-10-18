@@ -17,6 +17,17 @@ use crate::plugin::api::{PluginContext, PluginMetadata};
 use concurrent_store::{LegacyStore, LegacySyncReentry, TokioSpawner};
 use state::{PluginHostState, PluginLimiter, ProxyPluginContext};
 
+/// The folder a plugin file gets as /data. It is kept next to the plugin files, so it follows
+/// plugins.plugin_dir, and its name is cleaned up so a file like "...wasm" cannot point it at
+/// ".." or ".".
+pub fn data_folder(path: &Path) -> PathBuf {
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+    path.parent()
+        .unwrap_or(Path::new("."))
+        .join("data")
+        .join(crate::i18n::namespace(&stem))
+}
+
 #[derive(Error, Debug)]
 pub enum PluginInitError {
     #[error("Failed to read plugin file '{0}': {1}")]
@@ -322,13 +333,7 @@ impl PluginRuntime {
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
-        // Kept next to the plugin files, so it follows plugins.plugin_dir. The folder name is
-        // cleaned up so a file like "...wasm" cannot point it at ".." or "."
-        let data_folder = path
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join("data")
-            .join(crate::i18n::namespace(&filename));
+        let data_folder = data_folder(path);
         let _ = fs::create_dir_all(&data_folder);
 
         let mut state = PluginHostState::new(filename, data_folder, proxy);

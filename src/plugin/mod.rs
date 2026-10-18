@@ -234,6 +234,21 @@ impl PluginManager {
     }
 
     async fn load_plugin(&self, path: &Path) -> Result<PluginMetadata, String> {
+        // Files like Foo.wasm and foo.wasm would share a data folder
+        let data_folder = loader::wasm::wasm_host::data_folder(path);
+        if let Some(other) = self
+            .loaded_plugins
+            .read()
+            .await
+            .iter()
+            .find(|loaded| loader::wasm::wasm_host::data_folder(&loaded.path) == data_folder)
+        {
+            return Err(format!(
+                "Plugin '{}' would share its data folder with '{}', which is already loaded",
+                path.display(),
+                other.path.display()
+            ));
+        }
         let (plugin, metadata) = self
             .loader
             .load(path, self.proxy_ctx.get().cloned())
