@@ -864,13 +864,11 @@ impl pumpkin_command::suggestion::provider::SuggestionProvider<ProxyCommandSourc
         else {
             return builder.build();
         };
-        let handle = tokio::runtime::Handle::current();
-        let suggestions_res = tokio::task::block_in_place(|| {
-            handle.block_on(async move {
-                plugin
-                    .handle_command_suggestion(command_id, sender, args)
-                    .await
-            })
+        // Suggestions are worked out on a blocking thread, so waiting for the plugin here is fine
+        let suggestions_res = tokio::runtime::Handle::current().block_on(async move {
+            plugin
+                .handle_command_suggestion(command_id, sender, args)
+                .await
         });
 
         let mut builder = builder;
