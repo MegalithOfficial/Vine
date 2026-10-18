@@ -1,6 +1,6 @@
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -1306,23 +1306,44 @@ enum Phase {
     Play,
 }
 
-struct PhaseCell(AtomicU8);
+struct PhaseCell {
+    phase: AtomicU8,
+    // A backend that asks for reconfiguration switches what it sends at once, before the client
+    // acknowledges, so its packets are read as configuration from then on
+    backend_configuring: AtomicBool,
+}
 
 impl PhaseCell {
     fn new(phase: Phase) -> Self {
-        Self(AtomicU8::new(phase as u8))
+        Self {
+            phase: AtomicU8::new(phase as u8),
+            backend_configuring: AtomicBool::new(false),
+        }
     }
 
     fn get(&self) -> Phase {
-        match self.0.load(Ordering::Acquire) {
+        match self.phase.load(Ordering::Acquire) {
             0 => Phase::Login,
             1 => Phase::Config,
             _ => Phase::Play,
         }
     }
 
+    /// The phase of what the backend is sending
+    fn backend(&self) -> Phase {
+        match self.get() {
+            Phase::Play if self.backend_configuring.load(Ordering::Acquire) => Phase::Config,
+            phase => phase,
+        }
+    }
+
     fn set(&self, phase: Phase) {
-        self.0.store(phase as u8, Ordering::Release);
+        self.phase.store(phase as u8, Ordering::Release);
+        self.backend_configuring.store(false, Ordering::Release);
+    }
+
+    fn backend_started_configuration(&self) {
+        self.backend_configuring.store(true, Ordering::Release);
     }
 }
 
@@ -1774,7 +1795,12 @@ impl BackendBridge {
             loop {
                 match backend_reader.read_packet().await {
                     Ok(mut raw_packet) => {
-                        let current = phase.get();
+                        let current = phase.backend();
+                        if current == Phase::Play
+                            && PacketKind::StartConfiguration.matches(raw_packet.id, client_version)
+                        {
+                            phase.backend_started_configuration();
+                        }
                         if current == Phase::Config
                             && PacketKind::ConfigDisconnect.matches(raw_packet.id, client_version)
                         {
