@@ -17,11 +17,8 @@ Licensed under the GNU General Public License v3.0.
   - src/backend/bridge.rs: passing on chat acknowledgements from commands and
     messages the proxy drops, and refusing to drop signed ones
 
-Pumpkin
-https://github.com/Pumpkin-MC/Pumpkin
-Copyright (C) Pumpkin contributors
-Licensed under the GNU General Public License v3.0.
-  - src/telemetry.rs
+Parts of Vine are adapted from Pumpkin (https://github.com/Pumpkin-MC/Pumpkin),
+also maintained by Pumpkin-MC.
 
 Gate
 https://github.com/minekube/gate
