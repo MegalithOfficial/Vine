@@ -131,7 +131,7 @@ pub struct ServerConfig {
     /// Shared secret for velocity and vine backends without their own `secret`
     #[serde(default = "default_forwarding_secret_file")]
     pub forwarding_secret_file: String,
-    /// Require 1.19-1.19.2 clients to present a Mojang-signed chat key
+    /// Require 1.19-1.19.2 clients to present a Mojang-signed chat key in online mode
     #[serde(default = "default_true")]
     pub force_key_authentication: bool,
 }

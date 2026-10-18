@@ -262,6 +262,7 @@ impl ClientHandler {
                 return Ok(());
             }
         } else if (ProtocolVersion::V1_19..ProtocolVersion::V1_19_3).contains(&client_version)
+            && self.config.server.online_mode
             && self.config.server.force_key_authentication
         {
             Self::kick(
