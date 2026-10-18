@@ -1415,6 +1415,14 @@ fn serverbound_transition(phase: Phase, id: i32, version: ProtocolVersion) -> Op
 const CLIENT_QUEUE_BYTES: usize = 8 * 1024 * 1024;
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
+struct SuggestingGuard(Arc<AtomicBool>);
+
+impl Drop for SuggestingGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 struct TunnelAlive(Arc<AtomicBool>);
 
 impl Drop for TunnelAlive {
@@ -1493,6 +1501,9 @@ impl BackendBridge {
         // may have moved to another backend or phase by then
         let alive = Arc::new(AtomicBool::new(true));
         let _alive = TunnelAlive(alive.clone());
+        // One argument suggestion is worked out at a time; the client only uses the newest answer,
+        // so requests that arrive meanwhile are skipped
+        let suggesting = Arc::new(AtomicBool::new(false));
 
         let pending_suggestions: Arc<
             tokio::sync::Mutex<std::collections::HashMap<i32, PendingSuggestion>>,
@@ -1745,6 +1756,10 @@ impl BackendBridge {
                                     && command_dispatcher.handles(first_word, &source)
                                 {
                                     // Plugins answer these, so they run off the tunnel to keep its traffic flowing
+                                    if suggesting.swap(true, Ordering::AcqRel) {
+                                        continue;
+                                    }
+                                    let busy = SuggestingGuard(suggesting.clone());
                                     let offset = if raw_cmd.starts_with('/') { 1 } else { 0 };
                                     let id = suggestion_req.id;
                                     let input = clean_cmd.to_string();
@@ -1752,6 +1767,7 @@ impl BackendBridge {
                                     let client_tx = client_tx.clone();
                                     let alive = alive.clone();
                                     tokio::spawn(async move {
+                                        let _busy = busy;
                                         let Ok(suggestions) =
                                             tokio::task::spawn_blocking(move || {
                                                 dispatcher.suggest_with_range(&input, &source)
