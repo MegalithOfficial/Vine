@@ -1,5 +1,3 @@
-use std::net::SocketAddr;
-
 use pumpkin_command::CommandSource;
 use pumpkin_command::argument_builder::{ArgumentBuilder, argument, command};
 use pumpkin_command::argument_types::core::string::StringArgumentType;
@@ -12,19 +10,6 @@ use pumpkin_util::text::TextComponent;
 
 use super::{ProxyCommandSource, command_error};
 use crate::session::PlayerAction;
-
-/// Parses a host:port address string
-pub fn parse_address(addr: &str) -> Option<(String, u16)> {
-    if let Ok(socket_addr) = addr.parse::<SocketAddr>() {
-        return Some((socket_addr.ip().to_string(), socket_addr.port()));
-    }
-    if let Some((host, port_str)) = addr.rsplit_once(':')
-        && let Ok(port) = port_str.parse::<u16>()
-    {
-        return Some((host.to_string(), port));
-    }
-    None
-}
 
 struct TargetSuggestionProvider;
 
@@ -170,19 +155,6 @@ mod tests {
     use crate::config::{BackendConfig, Config, ForwardingMode};
     use crate::session::{PlayerSession, SessionManager};
 
-    #[test]
-    fn test_parse_address() {
-        assert_eq!(
-            parse_address("127.0.0.1:25565"),
-            Some(("127.0.0.1".to_string(), 25565))
-        );
-        assert_eq!(
-            parse_address("mc.example.com:25577"),
-            Some(("mc.example.com".to_string(), 25577))
-        );
-        assert_eq!(parse_address("invalid"), None);
-    }
-
     #[tokio::test]
     async fn test_send_command_execution() {
         let mut config = Config::default();
@@ -200,14 +172,16 @@ mod tests {
 
         let session_manager = Arc::new(SessionManager::new());
         let (tx, mut rx) = mpsc::unbounded_channel();
-        session_manager.register(PlayerSession {
-            username: "Steve".to_string(),
-            uuid: Uuid::new_v4(),
-            current_server: "lobby".to_string(),
-            action_tx: tx,
-            client_ip: "127.0.0.1".to_string(),
-            protocol_version: 765,
-        });
+        let _guard1 = session_manager
+            .try_register(PlayerSession {
+                username: "Steve".to_string(),
+                uuid: Uuid::new_v4(),
+                current_server: "lobby".to_string(),
+                action_tx: tx,
+                client_ip: "127.0.0.1".to_string(),
+                protocol_version: 765,
+            })
+            .unwrap();
 
         let source = ProxyCommandSource {
             sender: CommandSender::Console,
@@ -330,14 +304,16 @@ mod tests {
 
         let session_manager = Arc::new(SessionManager::new());
         let (tx, _rx) = mpsc::unbounded_channel();
-        session_manager.register(PlayerSession {
-            username: "Steve".to_string(),
-            uuid: Uuid::new_v4(),
-            current_server: "lobby".to_string(),
-            action_tx: tx,
-            client_ip: "127.0.0.1".to_string(),
-            protocol_version: 765,
-        });
+        let _guard2 = session_manager
+            .try_register(PlayerSession {
+                username: "Steve".to_string(),
+                uuid: Uuid::new_v4(),
+                current_server: "lobby".to_string(),
+                action_tx: tx,
+                client_ip: "127.0.0.1".to_string(),
+                protocol_version: 765,
+            })
+            .unwrap();
 
         let source = ProxyCommandSource {
             sender: CommandSender::Console,

@@ -6,7 +6,6 @@ use super::generated::RELEASES;
 pub struct ProtocolVersion(pub u32);
 
 impl ProtocolVersion {
-    pub const V1_7_6: Self = Self(5);
     pub const V1_8: Self = Self(47);
     pub const V1_11: Self = Self(315);
     pub const V1_12_2: Self = Self(340);
@@ -21,14 +20,6 @@ impl ProtocolVersion {
 
     pub fn from_handshake(raw: i32) -> Self {
         Self(raw.max(0) as u32)
-    }
-
-    pub fn oldest() -> Self {
-        Self(RELEASES[0].0)
-    }
-
-    pub fn latest() -> Self {
-        Self(RELEASES[RELEASES.len() - 1].0)
     }
 
     pub fn is_known(self) -> bool {
@@ -69,6 +60,5 @@ mod tests {
         assert_eq!(ProtocolVersion(47).name(), "1.8-1.8.9");
         assert!(!ProtocolVersion(4).is_known());
         assert!(!ProtocolVersion(9999).is_known());
-        assert!(ProtocolVersion::oldest() < ProtocolVersion::latest());
     }
 }

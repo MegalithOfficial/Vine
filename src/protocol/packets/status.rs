@@ -2,21 +2,6 @@ use super::{Packet, PacketKind};
 use crate::protocol::wire::{ReadExt, WriteExt};
 use crate::protocol::{ProtocolError, ProtocolVersion};
 
-#[derive(Clone, Copy, Debug)]
-pub struct StatusRequest;
-
-impl Packet for StatusRequest {
-    const KIND: PacketKind = PacketKind::StatusRequest;
-
-    fn read(_buf: &mut &[u8], _version: ProtocolVersion) -> Result<Self, ProtocolError> {
-        Ok(Self)
-    }
-
-    fn write(&self, _buf: &mut Vec<u8>, _version: ProtocolVersion) -> Result<(), ProtocolError> {
-        Ok(())
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct StatusResponse {
     pub json: String,

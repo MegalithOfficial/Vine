@@ -559,7 +559,7 @@ mod tests {
 
     #[test]
     fn test_1_7_tab_list_is_cleared_by_name() {
-        let version = ProtocolVersion::V1_7_6;
+        let version = ProtocolVersion(5);
         let mut leftovers = Leftovers::default();
         let mut add = Vec::new();
         add.write_string("Alex");

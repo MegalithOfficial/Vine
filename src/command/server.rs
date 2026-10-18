@@ -185,7 +185,7 @@ mod tests {
             client_ip: "127.0.0.1".to_string(),
             protocol_version: 765,
         };
-        session_manager.register(session);
+        let _guard = session_manager.try_register(session).unwrap();
 
         let source = ProxyCommandSource {
             sender: CommandSender::Player {

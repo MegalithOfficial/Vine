@@ -12,7 +12,6 @@ const MAX_CHAT_LEN: usize = 256;
 const MAX_SUGGESTION_INPUT_LEN: usize = 32500;
 
 empty_packet!(StartConfiguration, StartConfiguration);
-empty_packet!(ConfigurationAcknowledged, ConfigurationAcknowledged);
 
 macro_rules! leading_string_packet {
     ($name:ident, $kind:ident, $field:ident) => {

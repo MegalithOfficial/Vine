@@ -62,7 +62,6 @@ impl ProxyServer {
 
         let status_handler = Arc::new(StatusHandler::new(
             config.motd.clone(),
-            online_players.clone(),
             icon_manager,
             config.servers.clone(),
             config.routing.forced_hosts.clone(),

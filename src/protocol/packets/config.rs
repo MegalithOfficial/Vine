@@ -2,7 +2,6 @@ use serde_json::Value;
 
 use super::{Packet, PacketKind};
 use crate::protocol::text::{read_component, write_component};
-use crate::protocol::wire::{ReadExt, WriteExt};
 use crate::protocol::{ProtocolError, ProtocolVersion};
 
 macro_rules! empty_packet {
@@ -30,10 +29,6 @@ macro_rules! empty_packet {
 
 pub(crate) use empty_packet;
 
-empty_packet!(ConfigFinish, ConfigFinish);
-empty_packet!(ConfigFinishAck, ConfigFinishAck);
-empty_packet!(ConfigAcceptCodeOfConduct, ConfigAcceptCodeOfConduct);
-
 #[derive(Clone, Debug)]
 pub struct ConfigDisconnect {
     pub reason: Value,
@@ -50,106 +45,6 @@ impl Packet for ConfigDisconnect {
 
     fn write(&self, buf: &mut Vec<u8>, version: ProtocolVersion) -> Result<(), ProtocolError> {
         write_component(buf, &self.reason, version);
-        Ok(())
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct ConfigKeepAlive {
-    pub id: i64,
-}
-
-impl Packet for ConfigKeepAlive {
-    const KIND: PacketKind = PacketKind::ConfigKeepAlive;
-
-    fn read(buf: &mut &[u8], _version: ProtocolVersion) -> Result<Self, ProtocolError> {
-        Ok(Self {
-            id: buf.read_i64()?,
-        })
-    }
-
-    fn write(&self, buf: &mut Vec<u8>, _version: ProtocolVersion) -> Result<(), ProtocolError> {
-        buf.write_i64(self.id);
-        Ok(())
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct ConfigKeepAliveResponse {
-    pub id: i64,
-}
-
-impl Packet for ConfigKeepAliveResponse {
-    const KIND: PacketKind = PacketKind::ConfigKeepAliveResponse;
-
-    fn read(buf: &mut &[u8], _version: ProtocolVersion) -> Result<Self, ProtocolError> {
-        Ok(Self {
-            id: buf.read_i64()?,
-        })
-    }
-
-    fn write(&self, buf: &mut Vec<u8>, _version: ProtocolVersion) -> Result<(), ProtocolError> {
-        buf.write_i64(self.id);
-        Ok(())
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct ConfigPing {
-    pub id: i32,
-}
-
-impl Packet for ConfigPing {
-    const KIND: PacketKind = PacketKind::ConfigPing;
-
-    fn read(buf: &mut &[u8], _version: ProtocolVersion) -> Result<Self, ProtocolError> {
-        Ok(Self {
-            id: buf.read_i32()?,
-        })
-    }
-
-    fn write(&self, buf: &mut Vec<u8>, _version: ProtocolVersion) -> Result<(), ProtocolError> {
-        buf.write_i32(self.id);
-        Ok(())
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct ConfigPong {
-    pub id: i32,
-}
-
-impl Packet for ConfigPong {
-    const KIND: PacketKind = PacketKind::ConfigPong;
-
-    fn read(buf: &mut &[u8], _version: ProtocolVersion) -> Result<Self, ProtocolError> {
-        Ok(Self {
-            id: buf.read_i32()?,
-        })
-    }
-
-    fn write(&self, buf: &mut Vec<u8>, _version: ProtocolVersion) -> Result<(), ProtocolError> {
-        buf.write_i32(self.id);
-        Ok(())
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct ConfigCodeOfConduct {
-    pub text: String,
-}
-
-impl Packet for ConfigCodeOfConduct {
-    const KIND: PacketKind = PacketKind::ConfigCodeOfConduct;
-
-    fn read(buf: &mut &[u8], _version: ProtocolVersion) -> Result<Self, ProtocolError> {
-        Ok(Self {
-            text: buf.read_string_bounded(262_144)?,
-        })
-    }
-
-    fn write(&self, buf: &mut Vec<u8>, _version: ProtocolVersion) -> Result<(), ProtocolError> {
-        buf.write_string(&self.text);
         Ok(())
     }
 }
@@ -176,11 +71,5 @@ mod tests {
                 decode_packet(&bytes[1..], ProtocolVersion(protocol)).unwrap();
             assert_eq!(decoded.reason, packet.reason);
         }
-    }
-
-    #[test]
-    fn test_config_packets_missing_before_1_20_2() {
-        assert!(encode_packet(&ConfigFinishAck, ProtocolVersion(763)).is_err());
-        assert!(encode_packet(&ConfigFinishAck, ProtocolVersion(764)).is_ok());
     }
 }

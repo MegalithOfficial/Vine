@@ -64,11 +64,6 @@ impl BedrockStatusHandler {
             self.build_advertisement_string(),
         )
     }
-
-    #[must_use]
-    pub const fn server_guid(&self) -> u64 {
-        self.server_guid
-    }
 }
 
 #[cfg(test)]

@@ -18,13 +18,6 @@ impl<R> PrefixedRead<R> {
         };
         Self { prefix, inner }
     }
-
-    pub fn without_prefix(inner: R) -> Self {
-        Self {
-            prefix: None,
-            inner,
-        }
-    }
 }
 
 impl<R: AsyncRead + Unpin> AsyncRead for PrefixedRead<R> {
@@ -66,16 +59,5 @@ mod tests {
         stream.read_to_end(&mut output).await.unwrap();
 
         assert_eq!(output, b"PROXY HEADER MINECRAFT DATA");
-    }
-
-    #[tokio::test]
-    async fn test_empty_prefix() {
-        let inner = Cursor::new(b"ONLY DATA");
-        let mut stream = PrefixedRead::without_prefix(inner);
-
-        let mut output = Vec::new();
-        stream.read_to_end(&mut output).await.unwrap();
-
-        assert_eq!(output, b"ONLY DATA");
     }
 }

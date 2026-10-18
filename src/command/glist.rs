@@ -153,22 +153,26 @@ mod tests {
         let (tx1, _) = mpsc::unbounded_channel();
         let (tx2, _) = mpsc::unbounded_channel();
 
-        session_manager.register(PlayerSession {
-            username: "Steve".to_string(),
-            uuid: Uuid::new_v4(),
-            current_server: "lobby".to_string(),
-            action_tx: tx1,
-            client_ip: "127.0.0.1".to_string(),
-            protocol_version: 765,
-        });
-        session_manager.register(PlayerSession {
-            username: "Alex".to_string(),
-            uuid: Uuid::new_v4(),
-            current_server: "survival".to_string(),
-            action_tx: tx2,
-            client_ip: "127.0.0.1".to_string(),
-            protocol_version: 765,
-        });
+        let _guard1 = session_manager
+            .try_register(PlayerSession {
+                username: "Steve".to_string(),
+                uuid: Uuid::new_v4(),
+                current_server: "lobby".to_string(),
+                action_tx: tx1,
+                client_ip: "127.0.0.1".to_string(),
+                protocol_version: 765,
+            })
+            .unwrap();
+        let _guard2 = session_manager
+            .try_register(PlayerSession {
+                username: "Alex".to_string(),
+                uuid: Uuid::new_v4(),
+                current_server: "survival".to_string(),
+                action_tx: tx2,
+                client_ip: "127.0.0.1".to_string(),
+                protocol_version: 765,
+            })
+            .unwrap();
 
         let (action_tx, mut action_rx) = mpsc::unbounded_channel();
         let source = ProxyCommandSource {

@@ -47,13 +47,6 @@ impl SessionManager {
         }
     }
 
-    /// Registers a new active player session
-    pub fn register(&self, session: PlayerSession) {
-        if let Ok(mut lock) = self.sessions.write() {
-            lock.insert(session.username.to_ascii_lowercase(), session);
-        }
-    }
-
     /// Registers the session unless the username or UUID is already online.
     /// The returned guard unregisters it when the connection ends.
     pub fn try_register(self: &Arc<Self>, session: PlayerSession) -> Option<SessionGuard> {
@@ -69,15 +62,6 @@ impl SessionManager {
         };
         lock.insert(key, session);
         Some(guard)
-    }
-
-    /// Unregisters an active session by username
-    pub fn unregister(&self, username: &str) -> Option<PlayerSession> {
-        if let Ok(mut lock) = self.sessions.write() {
-            lock.remove(&username.to_ascii_lowercase())
-        } else {
-            None
-        }
     }
 
     /// Updates the current server for an active session
@@ -136,56 +120,6 @@ impl Drop for SessionGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_session_registration_and_lookup() {
-        let manager = SessionManager::new();
-        assert_eq!(manager.count(), 0);
-
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let session = PlayerSession {
-            username: "Steve".to_string(),
-            uuid: Uuid::new_v4(),
-            current_server: "lobby".to_string(),
-            action_tx: tx,
-            client_ip: "127.0.0.1:12345".to_string(),
-            protocol_version: 765,
-        };
-
-        manager.register(session);
-        assert_eq!(manager.count(), 1);
-
-        let found = manager.get_session("steve");
-        assert!(found.is_some());
-        assert_eq!(found.unwrap().username, "Steve");
-
-        let removed = manager.unregister("STEVE");
-        assert!(removed.is_some());
-        assert_eq!(manager.count(), 0);
-        assert!(manager.get_session("Steve").is_none());
-    }
-
-    #[test]
-    fn test_session_update_server() {
-        let manager = SessionManager::new();
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let session = PlayerSession {
-            username: "Alex".to_string(),
-            uuid: Uuid::new_v4(),
-            current_server: "lobby".to_string(),
-            action_tx: tx,
-            client_ip: "127.0.0.1:12346".to_string(),
-            protocol_version: 765,
-        };
-        manager.register(session);
-        assert_eq!(manager.get_session("Alex").unwrap().current_server, "lobby");
-
-        manager.update_server("alex", "survival");
-        assert_eq!(
-            manager.get_session("Alex").unwrap().current_server,
-            "survival"
-        );
-    }
 
     #[test]
     fn test_try_register_rejects_duplicates_until_guard_drops() {

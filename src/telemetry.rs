@@ -3,7 +3,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+#[cfg(test)]
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
@@ -30,6 +32,7 @@ pub const HEADER_SIGNATURE: &str = "X-Telemetry-Signature";
 pub const HEADER_TIMESTAMP: &str = "X-Telemetry-Timestamp";
 
 /// Maximum allowable clock drift between telemetry client and server (300 seconds / 5 minutes).
+#[cfg(test)]
 pub const MAX_CLOCK_DRIFT_SECS: u64 = 300;
 
 /// Information about an active plugin on the proxy / server.
@@ -119,6 +122,7 @@ pub fn sign_telemetry_payload(
 }
 
 /// Errors that can occur during telemetry request signature verification.
+#[cfg(test)]
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum TelemetryVerificationError {
     #[error("Invalid timestamp string format")]
@@ -142,6 +146,7 @@ pub enum TelemetryVerificationError {
 /// Verifies a signed telemetry request against an Ed25519 public key and timestamp.
 ///
 /// Ensures clock drift between `current_time_secs` and `timestamp_str` does not exceed `±300` seconds.
+#[cfg(test)]
 pub fn verify_telemetry_request(
     pubkey_hex: &str,
     sig_hex: &str,

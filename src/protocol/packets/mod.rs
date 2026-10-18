@@ -125,7 +125,6 @@ mod tests {
 
     const HANDLED_LAYOUTS: &[(PacketKind, &[u32])] = &[
         (PacketKind::Handshake, &[]),
-        (PacketKind::StatusRequest, &[]),
         (PacketKind::PingRequest, &[]),
         (PacketKind::StatusResponse, &[]),
         (PacketKind::PongResponse, &[]),
@@ -138,14 +137,6 @@ mod tests {
         (PacketKind::SetCompression, &[47]),
         (PacketKind::LoginPluginRequest, &[393]),
         (PacketKind::ConfigDisconnect, &[764, 765]),
-        (PacketKind::ConfigFinish, &[764]),
-        (PacketKind::ConfigKeepAlive, &[764]),
-        (PacketKind::ConfigPing, &[764]),
-        (PacketKind::ConfigCodeOfConduct, &[773]),
-        (PacketKind::ConfigFinishAck, &[764]),
-        (PacketKind::ConfigKeepAliveResponse, &[764]),
-        (PacketKind::ConfigPong, &[764]),
-        (PacketKind::ConfigAcceptCodeOfConduct, &[773]),
         (PacketKind::ConfigServerboundPluginMessage, &[764]),
         (PacketKind::ConfigClientboundPluginMessage, &[764]),
         // Read up to the acknowledgement offset, before the parts added later
@@ -154,7 +145,6 @@ mod tests {
         (PacketKind::ChatMessage, &[759, 760, 761, 770]),
         (PacketKind::CommandSuggestionRequest, &[47, 107, 393]),
         (PacketKind::ServerboundPluginMessage, &[47]),
-        (PacketKind::ConfigurationAcknowledged, &[764]),
         (PacketKind::PlayKeepAliveResponse, &[47, 340]),
         (PacketKind::PlayDisconnect, &[765]),
         (PacketKind::SystemChat, &[47, 735, 759, 760, 765]),
@@ -184,9 +174,19 @@ mod tests {
     ];
 
     const OPAQUE: &[PacketKind] = &[
+        PacketKind::StatusRequest,
         PacketKind::LoginSuccess,
+        PacketKind::ConfigFinish,
+        PacketKind::ConfigKeepAlive,
+        PacketKind::ConfigPing,
         PacketKind::ConfigKnownPacks,
+        PacketKind::ConfigCodeOfConduct,
+        PacketKind::ConfigFinishAck,
+        PacketKind::ConfigKeepAliveResponse,
+        PacketKind::ConfigPong,
         PacketKind::ConfigKnownPacksResponse,
+        PacketKind::ConfigAcceptCodeOfConduct,
+        PacketKind::ConfigurationAcknowledged,
     ];
 
     #[test]

@@ -2,7 +2,6 @@ pub mod icon;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde::Serialize;
 use uuid::Uuid;
@@ -49,7 +48,6 @@ struct StatusDescription {
 
 pub struct StatusHandler {
     motd: MotdConfig,
-    online_players: Arc<AtomicUsize>,
     icon_manager: Arc<StatusIconManager>,
     servers: HashMap<String, BackendConfig>,
     forced_hosts: HashMap<String, String>,
@@ -58,67 +56,16 @@ pub struct StatusHandler {
 impl StatusHandler {
     pub fn new(
         motd: MotdConfig,
-        online_players: Arc<AtomicUsize>,
         icon_manager: Arc<StatusIconManager>,
         servers: HashMap<String, BackendConfig>,
         forced_hosts: HashMap<String, String>,
     ) -> Self {
         Self {
             motd,
-            online_players,
             icon_manager,
             servers,
             forced_hosts,
         }
-    }
-
-    /// Build the JSON status response for the given client version and optional virtual host
-    pub fn build_status_response(
-        &self,
-        client_version: ProtocolVersion,
-        virtual_host: Option<&str>,
-    ) -> String {
-        let online = self.online_players.load(Ordering::Relaxed);
-
-        let motd_text = self.resolve_motd_text(virtual_host);
-
-        let icon_uri = self.icon_manager.get_icon_for_host(virtual_host);
-
-        let protocol = if client_version.is_known() {
-            client_version.0 as i32
-        } else {
-            self.motd.protocol_version
-        };
-
-        let sample: Vec<PlayerSample> = if self.motd.show_sample_players {
-            self.motd
-                .sample_players
-                .iter()
-                .map(|name| PlayerSample {
-                    name,
-                    id: Uuid::nil().to_string(),
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-        let status = StatusJson {
-            version: StatusVersion {
-                name: &self.motd.version_name,
-                protocol,
-            },
-            players: StatusPlayers {
-                max: self.motd.max_players,
-                online,
-                sample,
-            },
-            description: StatusDescription { text: motd_text },
-            enforce_secure_chat: false,
-            favicon: icon_uri.as_deref(),
-        };
-
-        serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string())
     }
 
     /// Resolves MOTD description for the virtual host or falls back to global default
@@ -259,45 +206,24 @@ mod tests {
             show_sample_players: true,
         };
 
-        let online = Arc::new(AtomicUsize::new(5));
-        let handler = StatusHandler::new(motd, online, icon_mgr, servers, forced_hosts);
+        let handler = StatusHandler::new(motd, icon_mgr, servers, forced_hosts);
 
-        let global_json = handler.build_status_response(ProtocolVersion(776), None);
-        assert!(global_json.contains("Global Line 1\\nGlobal Line 2"));
-        assert!(global_json.contains("\"online\":5"));
-        assert!(global_json.contains("\"favicon\":\"data:image/png;base64,"));
+        let global = handler.create_custom_status_packet(
+            ProtocolVersion(776),
+            &handler.resolve_motd_text(None),
+            50,
+            5,
+            "Vine Proxy",
+            None,
+        );
+        assert!(global.json.contains("Global Line 1\\nGlobal Line 2"));
+        assert!(global.json.contains("\"favicon\":\"data:image/png;base64,"));
 
-        let vhost_json =
-            handler.build_status_response(ProtocolVersion(776), Some("mc.survival.com"));
-        assert!(vhost_json.contains("Survival Line 1\\nSurvival Line 2"));
+        assert_eq!(
+            handler.resolve_motd_text(Some("mc.survival.com")),
+            "Survival Line 1\nSurvival Line 2"
+        );
 
         let _ = std::fs::remove_file(&temp_icon_path);
-    }
-
-    #[test]
-    fn test_status_response_default_without_icon() {
-        let icon_mgr = Arc::new(StatusIconManager::new(
-            None,
-            HashMap::new(),
-            HashMap::new(),
-            "lobby".to_string(),
-        ));
-
-        let motd = MotdConfig {
-            line1: "Vine Proxy".to_string(),
-            line2: "No Icon".to_string(),
-            max_players: 20,
-            version_name: "Vine".to_string(),
-            protocol_version: 776,
-            sample_players: Vec::new(),
-            icon_path: None,
-            show_sample_players: false,
-        };
-
-        let online = Arc::new(AtomicUsize::new(0));
-        let handler = StatusHandler::new(motd, online, icon_mgr, HashMap::new(), HashMap::new());
-
-        let json = handler.build_status_response(ProtocolVersion(776), None);
-        assert!(!json.contains("favicon"));
     }
 }
