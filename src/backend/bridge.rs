@@ -474,11 +474,14 @@ impl BackendBridge {
         // player, so only replies to the current backend's latest challenge are forwarded
         let keep_alive_challenge = std::sync::Mutex::new(None::<i64>);
         let leftovers = std::sync::Mutex::new(Leftovers::default());
-        let phase = PhaseCell::new(if self.client_version >= ProtocolVersion::V1_20_2 {
-            Phase::Login
-        } else {
-            Phase::Play
-        });
+        let phase = Arc::new(PhaseCell::new(
+            if self.client_version >= ProtocolVersion::V1_20_2 {
+                Phase::Login
+            } else {
+                Phase::Play
+            },
+        ));
+        let suggesting = Arc::new(std::sync::Mutex::new(Suggesting::default()));
 
         self.online_players.fetch_add(1, Ordering::Relaxed);
         info!(
@@ -544,6 +547,7 @@ impl BackendBridge {
                     self.player.id,
                     current_server_name.clone(),
                     &phase,
+                    &suggesting,
                     &keep_alive_challenge,
                     &leftovers,
                     connecting.as_mut().map(|(_, future)| future),
@@ -1424,12 +1428,20 @@ fn serverbound_transition(phase: Phase, id: i32, version: ProtocolVersion) -> Op
 const CLIENT_QUEUE_BYTES: usize = 8 * 1024 * 1024;
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
-struct SuggestingGuard(Arc<AtomicBool>);
+struct SuggestionRequest {
+    id: i32,
+    input: String,
+    offset: usize,
+    source: ProxyCommandSource,
+    alive: Arc<AtomicBool>,
+}
 
-impl Drop for SuggestingGuard {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
+/// One argument suggestion per player is worked out at a time. The client only uses the answer
+/// to its newest request, so only the newest one that arrives meanwhile is kept for next.
+#[derive(Default)]
+struct Suggesting {
+    busy: bool,
+    next: Option<SuggestionRequest>,
 }
 
 struct TunnelAlive(Arc<AtomicBool>);
@@ -1492,7 +1504,8 @@ impl BackendBridge {
         plugin_manager: Arc<PluginManager>,
         player_uuid: uuid::Uuid,
         current_server_name: String,
-        phase: &PhaseCell,
+        phase: &Arc<PhaseCell>,
+        suggesting: &Arc<std::sync::Mutex<Suggesting>>,
         keep_alive_challenge: &std::sync::Mutex<Option<i64>>,
         leftovers: &std::sync::Mutex<Leftovers>,
         connecting: Option<&mut Connecting<'_>>,
@@ -1510,10 +1523,6 @@ impl BackendBridge {
         // may have moved to another backend or phase by then
         let alive = Arc::new(AtomicBool::new(true));
         let _alive = TunnelAlive(alive.clone());
-        // One argument suggestion is worked out at a time; the client only uses the newest answer,
-        // so requests that arrive meanwhile are skipped
-        let suggesting = Arc::new(AtomicBool::new(false));
-
         let pending_suggestions: Arc<
             tokio::sync::Mutex<std::collections::HashMap<i32, PendingSuggestion>>,
         > = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
@@ -1765,46 +1774,79 @@ impl BackendBridge {
                                     && command_dispatcher.handles(first_word, &source)
                                 {
                                     // Plugins answer these, so they run off the tunnel to keep its traffic flowing
-                                    if suggesting.swap(true, Ordering::AcqRel) {
-                                        continue;
+                                    let request = SuggestionRequest {
+                                        id: suggestion_req.id,
+                                        input: clean_cmd.to_string(),
+                                        offset: if raw_cmd.starts_with('/') { 1 } else { 0 },
+                                        source,
+                                        alive: alive.clone(),
+                                    };
+                                    {
+                                        let mut state =
+                                            suggesting.lock().unwrap_or_else(|e| e.into_inner());
+                                        if state.busy {
+                                            state.next = Some(request);
+                                            continue;
+                                        }
+                                        state.busy = true;
                                     }
-                                    let busy = SuggestingGuard(suggesting.clone());
-                                    let offset = if raw_cmd.starts_with('/') { 1 } else { 0 };
-                                    let id = suggestion_req.id;
-                                    let input = clean_cmd.to_string();
                                     let dispatcher = command_dispatcher.clone();
                                     let client_tx = client_tx.clone();
-                                    let alive = alive.clone();
+                                    let suggesting = suggesting.clone();
                                     tokio::spawn(async move {
-                                        let _busy = busy;
-                                        let Ok(suggestions) =
-                                            tokio::task::spawn_blocking(move || {
-                                                dispatcher.suggest_with_range(&input, &source)
-                                            })
-                                            .await
-                                        else {
-                                            return;
-                                        };
-                                        let response = CommandSuggestions {
-                                            id,
-                                            start: (suggestions.range.start + offset) as i32,
-                                            length: suggestions.range.len() as i32,
-                                            matches: suggestions
-                                                .suggestions
-                                                .into_iter()
-                                                .map(|s| Suggestion {
-                                                    text: s.text.cached_text().clone(),
-                                                    tooltip: s.tooltip.map(|t| {
-                                                        component_json(&t, client_version)
-                                                    }),
+                                        let mut request = request;
+                                        loop {
+                                            let SuggestionRequest {
+                                                id,
+                                                input,
+                                                offset,
+                                                source,
+                                                alive,
+                                            } = request;
+                                            let dispatcher = dispatcher.clone();
+                                            let suggestions =
+                                                tokio::task::spawn_blocking(move || {
+                                                    dispatcher.suggest_with_range(&input, &source)
                                                 })
-                                                .collect(),
-                                        };
-                                        if alive.load(Ordering::Acquire)
-                                            && let Ok(bytes) =
-                                                encode_packet(&response, client_version)
-                                        {
-                                            client_tx.send(bytes).await;
+                                                .await;
+                                            let next = {
+                                                let mut state = suggesting
+                                                    .lock()
+                                                    .unwrap_or_else(|e| e.into_inner());
+                                                let next = state.next.take();
+                                                state.busy = next.is_some();
+                                                next
+                                            };
+                                            if next.is_none()
+                                                && alive.load(Ordering::Acquire)
+                                                && let Ok(suggestions) = suggestions
+                                            {
+                                                let response = CommandSuggestions {
+                                                    id,
+                                                    start: (suggestions.range.start + offset)
+                                                        as i32,
+                                                    length: suggestions.range.len() as i32,
+                                                    matches: suggestions
+                                                        .suggestions
+                                                        .into_iter()
+                                                        .map(|s| Suggestion {
+                                                            text: s.text.cached_text().clone(),
+                                                            tooltip: s.tooltip.map(|t| {
+                                                                component_json(&t, client_version)
+                                                            }),
+                                                        })
+                                                        .collect(),
+                                                };
+                                                if let Ok(bytes) =
+                                                    encode_packet(&response, client_version)
+                                                {
+                                                    client_tx.send(bytes).await;
+                                                }
+                                            }
+                                            match next {
+                                                Some(next) => request = next,
+                                                None => break,
+                                            }
                                         }
                                     });
                                     continue;
