@@ -77,11 +77,13 @@ pub fn chat_signing(
     version: ProtocolVersion,
 ) -> Result<ChatSigning, ProtocolError> {
     let command = match kind {
-        PacketKind::ChatCommand => true,
+        PacketKind::ChatCommand | PacketKind::SignedChatCommand => true,
         PacketKind::ChatMessage => false,
         _ => return Ok(ChatSigning::default()),
     };
-    if version < ProtocolVersion::V1_19 || (command && version >= ProtocolVersion::V1_20_5) {
+    if version < ProtocolVersion::V1_19
+        || (kind == PacketKind::ChatCommand && version >= ProtocolVersion::V1_20_5)
+    {
         return Ok(ChatSigning::default());
     }
     let session = version >= ProtocolVersion::V1_19_3;
@@ -645,6 +647,24 @@ mod tests {
         assert_eq!(
             chat_signing(PacketKind::ChatCommand, &command, ProtocolVersion::V1_20_5).unwrap(),
             ChatSigning::default()
+        );
+        let mut signed_command = chat_prefix("msg Alex hi");
+        signed_command.write_varint(1);
+        signed_command.write_string("message");
+        signed_command.extend_from_slice(&[7; SIGNATURE_LEN]);
+        signed_command.write_varint(4);
+        signed_command.extend_from_slice(&[0; 3]);
+        assert_eq!(
+            chat_signing(
+                PacketKind::SignedChatCommand,
+                &signed_command,
+                ProtocolVersion::V1_20_5
+            )
+            .unwrap(),
+            ChatSigning {
+                signed: true,
+                acknowledged: 4
+            }
         );
         assert_eq!(
             chat_signing(PacketKind::ChatMessage, &command, ProtocolVersion(758)).unwrap(),

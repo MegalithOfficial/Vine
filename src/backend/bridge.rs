@@ -35,8 +35,8 @@ use crate::protocol::packets::login::{
 use crate::protocol::packets::play::{
     ChatAcknowledgement, ChatCommand, ChatMessage, ClientboundPluginMessage,
     CommandSuggestionRequest, CommandSuggestions, InjectedCommand, PlayDisconnect, PlayKeepAlive,
-    PlayKeepAliveResponse, StartConfiguration, Suggestion, SystemChat, Transfer, chat_length_limit,
-    chat_signing, inject_commands, read_plugin_message, replace_leading_string,
+    PlayKeepAliveResponse, SignedChatCommand, StartConfiguration, Suggestion, SystemChat, Transfer,
+    chat_length_limit, chat_signing, inject_commands, read_plugin_message, replace_leading_string,
     write_plugin_message,
 };
 use crate::protocol::packets::switch::{Leftovers, join_game_sequence};
@@ -849,6 +849,8 @@ impl BackendBridge {
     ) -> Option<TunnelExit> {
         let kind = if PacketKind::ChatCommand.matches(packet.id, version) {
             PacketKind::ChatCommand
+        } else if PacketKind::SignedChatCommand.matches(packet.id, version) {
+            PacketKind::SignedChatCommand
         } else {
             PacketKind::ChatMessage
         };
@@ -885,6 +887,8 @@ impl BackendBridge {
     ) -> Option<TunnelExit> {
         let kind = if PacketKind::ChatCommand.matches(packet.id, version) {
             PacketKind::ChatCommand
+        } else if PacketKind::SignedChatCommand.matches(packet.id, version) {
+            PacketKind::SignedChatCommand
         } else {
             PacketKind::ChatMessage
         };
@@ -1213,6 +1217,15 @@ impl BackendBridge {
                                 decode_packet::<ChatCommand>(&raw_packet.payload, client_version)
                                     .ok()
                                     .map(|c| c.command)
+                            } else if PacketKind::SignedChatCommand
+                                .matches(raw_packet.id, client_version)
+                            {
+                                decode_packet::<SignedChatCommand>(
+                                    &raw_packet.payload,
+                                    client_version,
+                                )
+                                .ok()
+                                .map(|c| c.command)
                             } else if client_version < ProtocolVersion::V1_19 {
                                 // Before 1.19 commands arrive as chat messages starting with '/'
                                 chat_message
