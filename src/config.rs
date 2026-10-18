@@ -503,6 +503,9 @@ impl Config {
         config_dir: &Path,
         env_secret: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let had_velocity_secret = config_dir
+            .join(&self.server.forwarding_secret_file)
+            .exists();
         if self
             .servers
             .values()
@@ -528,8 +531,25 @@ impl Config {
             .values()
             .any(|s| needs_secret(s, ForwardingMode::Vine))
         {
+            let key_path = config_dir.join(&self.server.vine_key_file);
+            // Installs from before the key existed signed with the velocity secret, so their
+            // Pumpkin backends stop accepting players until they get the new public key
+            if !key_path.exists() && had_velocity_secret {
+                tracing::warn!(
+                    "Vine forwarding now signs with its own key in '{}' instead of '{}'; give each \
+                     Pumpkin backend the new Vine public key logged below",
+                    key_path.display(),
+                    self.server.forwarding_secret_file
+                );
+            }
+            if env_secret.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+                tracing::warn!(
+                    "{FORWARDING_SECRET_ENV} only applies to velocity servers; vine servers use '{}'",
+                    key_path.display()
+                );
+            }
             let key = load_or_create_secret_file(
-                &config_dir.join(&self.server.vine_key_file),
+                &key_path,
                 "give each Pumpkin backend the Vine public key logged below",
             )?;
             for server in self

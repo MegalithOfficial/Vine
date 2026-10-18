@@ -3,7 +3,8 @@ use tokio::sync::broadcast;
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
-use vine::config::Config;
+use vine::backend::forwarding::ForwardingHelper;
+use vine::config::{Config, ForwardingMode};
 use vine::proxy::ProxyServer;
 
 #[tokio::main]
@@ -53,6 +54,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "Wrote the default files next to '{}'",
             config_path.display()
         );
+        for (name, server) in &config.servers {
+            if server.forwarding == ForwardingMode::Vine
+                && let Some(key) = server
+                    .secret
+                    .as_deref()
+                    .and_then(|secret| ForwardingHelper::get_vine_public_key_hex(secret).ok())
+            {
+                info!(
+                    "Vine public key for '{name}': {key} (networking.proxy.vine.public_key on Pumpkin)"
+                );
+            }
+        }
         return Ok(());
     }
 
