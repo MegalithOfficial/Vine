@@ -233,13 +233,11 @@ impl TelemetryClient {
         {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(key_path, seed)?;
-
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(key_path, std::fs::Permissions::from_mode(0o600));
-        }
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        std::io::Write::write_all(&mut options.open(key_path)?, &seed)?;
 
         Ok(key)
     }
