@@ -994,6 +994,12 @@ impl BackendBridge {
         let Ok((channel, data)) = read_plugin_message(&mut &packet.payload[..], version) else {
             return true;
         };
+        // Backends trust this channel to come from the proxy, so players cannot use it
+        if source == PluginMessageSource::Player
+            && (channel == "BungeeCord" || channel == "bungeecord:main")
+        {
+            return false;
+        }
         let mut event = PluginMessageEvent {
             channel: channel.clone(),
             data: data.clone(),
