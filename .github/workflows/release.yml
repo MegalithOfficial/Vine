@@ -49,7 +49,7 @@ jobs:
       - name: Build Release
         shell: bash
         run: |
-          cargo build --verbose --release
+          cargo build --verbose --release --locked
           if [ "${{ runner.os }}" == "Linux" ]; then
             if [ "${{ runner.arch }}" == "X64" ]; then
               TARGET="x86_64-unknown-linux-musl"
@@ -57,7 +57,7 @@ jobs:
               TARGET="aarch64-unknown-linux-musl"
             fi
             rustup target add "$TARGET"
-            cargo build --verbose --release --target "$TARGET"
+            cargo build --verbose --release --locked --target "$TARGET"
           fi
 
       - name: Prepare artifacts

@@ -68,7 +68,7 @@ jobs:
       - run: rustup component add clippy
       - uses: Swatinem/rust-cache@v2
       - name: Clippy (debug)
-        run: cargo clippy --all-targets --all-features
+        run: cargo clippy --all-targets --locked --all-features
 
   clippy_release:
     name: Run lints (release)
@@ -85,7 +85,7 @@ jobs:
       - run: rustup component add clippy
       - uses: Swatinem/rust-cache@v2
       - name: Clippy (release)
-        run: cargo clippy --release --all-targets --all-features
+        run: cargo clippy --release --locked --all-targets --all-features
 
   build_and_test:
     name: Build project and test
@@ -111,9 +111,9 @@ jobs:
       - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
       - name: Cargo nextest
-        run: cargo nextest run --verbose
+        run: cargo nextest run --verbose --locked
       - name: Cargo doctest
-        run: cargo test --doc --verbose
+        run: cargo test --doc --verbose --locked
 
   build_release:
     name: Build project in release
@@ -147,7 +147,7 @@ jobs:
       - name: Build Release
         shell: bash
         run: |
-          cargo build --verbose --release
+          cargo build --verbose --release --locked
           if [ "${{ runner.os }}" == "Linux" ]; then
             if [ "${{ runner.arch }}" == "X64" ]; then
               TARGET="x86_64-unknown-linux-musl"
@@ -155,7 +155,7 @@ jobs:
               TARGET="aarch64-unknown-linux-musl"
             fi
             rustup target add "$TARGET"
-            cargo build --verbose --release --target "$TARGET"
+            cargo build --verbose --release --locked --target "$TARGET"
           fi
 
       - name: Prepare artifacts
