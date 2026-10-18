@@ -357,6 +357,7 @@ impl PluginManager {
     }
 
     pub async fn unload_plugins(&self) {
+        let _lifecycle = self.lifecycle.lock().await;
         for name in self.plugin_names().await {
             self.unload_plugin(&name).await;
         }
