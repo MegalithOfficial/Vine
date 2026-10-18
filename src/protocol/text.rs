@@ -1,4 +1,5 @@
 use pumpkin_util::text::TextComponent;
+use pumpkin_util::text::color::RGBColor;
 use pumpkin_util::version::JavaMinecraftVersion;
 use serde_json::{Map, Value};
 
@@ -21,6 +22,50 @@ const TAG_LIST: u8 = 9;
 const TAG_COMPOUND: u8 = 10;
 const TAG_INT_ARRAY: u8 = 11;
 const TAG_LONG_ARRAY: u8 = 12;
+
+/// Parses `§` formatting codes and `<#rrggbb>` hex colors.
+pub fn parse_message(input: &str) -> TextComponent {
+    let legacy = replace_hex_tags(input, |hex| {
+        let mut code = String::from("§x");
+        for c in hex.chars() {
+            code.push('§');
+            code.push(c);
+        }
+        code
+    });
+    TextComponent::from_legacy_string(&legacy)
+}
+
+/// Replaces `<#rrggbb>` with the closest `§` color code, for clients without hex colors.
+pub fn legacy_message(input: &str) -> String {
+    replace_hex_tags(input, |hex| {
+        let rgb = u32::from_str_radix(hex, 16).unwrap_or_default();
+        let color = RGBColor::new((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8);
+        format!("§{}", color.to_nearest_named().to_legacy_char())
+    })
+}
+
+fn replace_hex_tags(input: &str, code: impl Fn(&str) -> String) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find("<#") {
+        out.push_str(&rest[..start]);
+        let tag = &rest[start..];
+        let hex = tag
+            .get(2..8)
+            .filter(|hex| hex.bytes().all(|b| b.is_ascii_hexdigit()))
+            .filter(|_| tag.as_bytes().get(8) == Some(&b'>'));
+        if let Some(hex) = hex {
+            out.push_str(&code(hex));
+            rest = &tag[9..];
+        } else {
+            out.push_str("<#");
+            rest = &tag[2..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
 
 pub fn component_json(component: &TextComponent, version: ProtocolVersion) -> Value {
     component.to_json_value_for_version(&JavaMinecraftVersion::from_protocol(version.0))
@@ -347,6 +392,24 @@ mod tests {
         assert!(read_component(&mut cur, ProtocolVersion::V1_20_3).is_err());
         let mut cur: &[u8] = &[42];
         assert!(read_component(&mut cur, ProtocolVersion::V1_20_3).is_err());
+    }
+
+    #[test]
+    fn test_parse_message_hex_colors() {
+        let json = component_json(
+            &parse_message("<#FF8800>orange §agreen <#zz0000>x <#123456"),
+            ProtocolVersion(769),
+        );
+        let parts = json["extra"].as_array().unwrap();
+        assert_eq!(parts[0]["text"], "orange ");
+        assert_eq!(parts[0]["color"], "#FF8800");
+        assert_eq!(parts[1]["text"], "green <#zz0000>x <#123456");
+        assert_eq!(parts[1]["color"], "green");
+
+        let old = component_json(&parse_message("<#FF5555>red"), ProtocolVersion(47));
+        assert_eq!(old["extra"][0]["color"], "red");
+
+        assert_eq!(legacy_message("<#FF5555>red §ax"), "§cred §ax");
     }
 
     #[test]

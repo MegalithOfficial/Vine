@@ -145,7 +145,7 @@ impl wit::vine::plugin::command::Host for PluginHostState {
                             .find(|s| s.uuid == target_uuid)
                     {
                         let _ = session.action_tx.send(PlayerAction::Message(
-                            pumpkin_util::text::TextComponent::text(message),
+                            crate::protocol::text::parse_message(&message),
                         ));
                     }
                 }
@@ -250,7 +250,7 @@ impl wit::vine::plugin::proxy::Host for PluginHostState {
         if let Some(proxy) = &self.proxy {
             for session in proxy.session_manager.list_sessions() {
                 let _ = session.action_tx.send(PlayerAction::Message(
-                    pumpkin_util::text::TextComponent::text(message.clone()),
+                    crate::protocol::text::parse_message(&message),
                 ));
             }
             tracing::info!("[Broadcast] {}", message);
@@ -272,7 +272,7 @@ impl wit::vine::plugin::proxy::Host for PluginHostState {
                 .find(|s| s.uuid == target_uuid)
         {
             let _ = session.action_tx.send(PlayerAction::Message(
-                pumpkin_util::text::TextComponent::text(message),
+                crate::protocol::text::parse_message(&message),
             ));
             return Ok(true);
         }

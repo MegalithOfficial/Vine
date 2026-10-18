@@ -25,6 +25,7 @@ use crate::protocol::packets::login::{
     Verification,
 };
 use crate::protocol::packets::status::{PingRequest, PongResponse};
+use crate::protocol::text::{component_json, parse_message};
 use crate::protocol::{
     PacketKind, PacketReader, PacketWriter, ProtocolError, ProtocolVersion, decode_packet,
     encode_packet,
@@ -564,7 +565,7 @@ impl ClientHandler {
         reason: &str,
     ) -> Result<(), ClientError> {
         let disconnect = LoginDisconnect {
-            reason_json: kick_reason_json(reason),
+            reason_json: kick_reason(reason, version).to_string(),
         };
         let bytes = encode_packet(&disconnect, version)?;
         let _ = writer.send(bytes).await;
@@ -572,25 +573,6 @@ impl ClientHandler {
     }
 }
 
-pub(crate) fn kick_reason_json(reason: &str) -> String {
-    serde_json::json!({
-        "text": format!("[Vine Proxy] {reason}"),
-        "color": "red",
-    })
-    .to_string()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_kick_reason_json_escapes_special_characters() {
-        let reason = "bad \\ \"quote\"\nnext line";
-        let json = kick_reason_json(reason);
-
-        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
-        assert_eq!(parsed["text"], format!("[Vine Proxy] {reason}"));
-        assert_eq!(parsed["color"], "red");
-    }
+pub(crate) fn kick_reason(reason: &str, version: ProtocolVersion) -> serde_json::Value {
+    component_json(&parse_message(&format!("§c[Vine Proxy] {reason}")), version)
 }

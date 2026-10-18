@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::bedrock::config::BedrockConfig;
 use crate::protocol::bedrock::{OFFLINE_MAGIC, UnconnectedPing, encode_unconnected_pong};
+use crate::protocol::text::legacy_message;
 
 /// Handler for Bedrock RakNet status pings.
 pub struct BedrockStatusHandler {
@@ -37,7 +38,7 @@ impl BedrockStatusHandler {
 
         format!(
             "MCPE;{};{};{};{};{};{};{};{};{};{};{};0;",
-            self.config.motd,
+            legacy_message(&self.config.motd),
             self.config.protocol_version,
             self.config.version_name,
             online,

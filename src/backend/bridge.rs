@@ -5,7 +5,6 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use pumpkin_util::text::TextComponent;
-use pumpkin_util::text::color::NamedColor;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
@@ -40,7 +39,7 @@ use crate::protocol::packets::play::{
     write_plugin_message,
 };
 use crate::protocol::packets::switch::{Leftovers, join_game_sequence};
-use crate::protocol::text::{component_json, plain_text};
+use crate::protocol::text::{component_json, parse_message, plain_text};
 use crate::protocol::{
     Packet, PacketKind, PacketReader, PacketWriter, ProtocolError, ProtocolVersion, decode_packet,
     encode_packet,
@@ -947,7 +946,7 @@ impl BackendBridge {
         text: String,
     ) {
         if phase.get() == Phase::Play {
-            let content = component_json(&TextComponent::text(text), self.client_version);
+            let content = component_json(&parse_message(&text), self.client_version);
             let message = SystemChat {
                 content,
                 overlay: false,
@@ -966,19 +965,16 @@ impl BackendBridge {
         match phase {
             Phase::Login => {
                 let kick = LoginDisconnect {
-                    reason_json: crate::client::kick_reason_json(reason),
+                    reason_json: crate::client::kick_reason(reason, version).to_string(),
                 };
                 send_best_effort(writer, &kick, version).await;
             }
             Phase::Config => {
-                let reason = TextComponent::text(format!("[Vine Proxy] {reason}"))
-                    .color_named(NamedColor::Red);
-                let reason = component_json(&reason, version);
+                let reason = crate::client::kick_reason(reason, version);
                 send_best_effort(writer, &ConfigDisconnect { reason }, version).await;
             }
             Phase::Play => {
-                let reason = TextComponent::text(reason.to_string());
-                let reason = component_json(&reason, version);
+                let reason = component_json(&parse_message(reason), version);
                 send_best_effort(writer, &PlayDisconnect { reason }, version).await;
             }
         }

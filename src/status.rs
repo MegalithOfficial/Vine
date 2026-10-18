@@ -9,13 +9,14 @@ use uuid::Uuid;
 use crate::config::{BackendConfig, MotdConfig};
 use crate::protocol::ProtocolVersion;
 use crate::protocol::packets::status::StatusResponse;
+use crate::protocol::text::{component_json, parse_message};
 pub use icon::StatusIconManager;
 
 #[derive(Serialize)]
 struct StatusJson<'a> {
     version: StatusVersion<'a>,
     players: StatusPlayers<'a>,
-    description: StatusDescription,
+    description: serde_json::Value,
     #[serde(rename = "enforceSecureChat")]
     enforce_secure_chat: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -39,11 +40,6 @@ struct StatusPlayers<'a> {
 struct PlayerSample<'a> {
     name: &'a str,
     id: String,
-}
-
-#[derive(Serialize)]
-struct StatusDescription {
-    text: String,
 }
 
 pub struct StatusHandler {
@@ -138,9 +134,7 @@ impl StatusHandler {
                 online: online_players as usize,
                 sample,
             },
-            description: StatusDescription {
-                text: motd.to_string(),
-            },
+            description: component_json(&parse_message(motd), client_version),
             enforce_secure_chat: false,
             favicon: icon_uri.as_deref(),
         };
