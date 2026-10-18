@@ -21,6 +21,9 @@ jobs:
   build_release:
     name: Build & Sign Release
     runs-on: ${{ matrix.os }}
+    # Secrets cannot be read in step conditions, so the token is exposed as an env variable
+    env:
+      SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
     strategy:
       matrix:
         os:
