@@ -64,6 +64,7 @@ pub enum PacketKind {
     BossBar,
     Title,
     ClearTitles,
+    ChatAcknowledgement,
 }
 
 impl PacketKind {
@@ -143,7 +144,7 @@ mod tests {
         (PacketKind::ConfigKeepAliveResponse, &[764]),
         (PacketKind::ConfigPong, &[764]),
         (PacketKind::ConfigAcceptCodeOfConduct, &[773]),
-        // Only the leading command/message string is read from these
+        // Read up to the acknowledgement offset, before the parts added later
         (PacketKind::ChatCommand, &[759, 760, 761, 766]),
         (PacketKind::SignedChatCommand, &[766, 770, 774, 775]),
         (PacketKind::ChatMessage, &[759, 760, 761, 770]),
@@ -175,6 +176,7 @@ mod tests {
         (PacketKind::BossBar, &[107, 765]),
         (PacketKind::Title, &[47, 315, 755]),
         (PacketKind::ClearTitles, &[755]),
+        (PacketKind::ChatAcknowledgement, &[760, 761]),
     ];
 
     const OPAQUE: &[PacketKind] = &[

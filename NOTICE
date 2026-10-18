@@ -14,6 +14,8 @@ Licensed under the GNU General Public License v3.0.
     linking them to their holder
   - src/protocol/packets/switch.rs: the packet sequence used to move pre-1.20.2
     clients between backends and clear what the previous backend left behind
+  - src/backend/bridge.rs: passing on chat acknowledgements from commands and
+    messages the proxy drops, and refusing to drop signed ones
 
 Pumpkin
 https://github.com/Pumpkin-MC/Pumpkin

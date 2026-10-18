@@ -45,6 +45,85 @@ leading_string_packet!(ChatCommand, ChatCommand, command);
 leading_string_packet!(SignedChatCommand, SignedChatCommand, command);
 leading_string_packet!(ChatMessage, ChatMessage, message);
 
+const SIGNATURE_LEN: usize = 256;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChatSigning {
+    pub signed: bool,
+    pub acknowledged: i32,
+}
+
+pub fn chat_signing(
+    kind: PacketKind,
+    payload: &[u8],
+    version: ProtocolVersion,
+) -> Result<ChatSigning, ProtocolError> {
+    let command = match kind {
+        PacketKind::ChatCommand => true,
+        PacketKind::ChatMessage => false,
+        _ => return Ok(ChatSigning::default()),
+    };
+    if version < ProtocolVersion::V1_19 || (command && version >= ProtocolVersion::V1_20_5) {
+        return Ok(ChatSigning::default());
+    }
+    let session = version >= ProtocolVersion::V1_19_3;
+    let mut buf = payload;
+    buf.read_string()?;
+    buf.read_i64()?;
+    buf.read_i64()?;
+    let signed = if command {
+        let arguments = buf.read_varint()?;
+        for _ in 0..arguments {
+            buf.read_string()?;
+            if session {
+                buf.read_bytes(SIGNATURE_LEN)?;
+            } else {
+                buf.read_byte_array()?;
+            }
+        }
+        arguments > 0
+    } else if session {
+        let signed = buf.read_bool()?;
+        if signed {
+            buf.read_bytes(SIGNATURE_LEN)?;
+        }
+        signed
+    } else {
+        !buf.read_byte_array()?.is_empty()
+    };
+    let acknowledged = if session { buf.read_varint()? } else { 0 };
+    Ok(ChatSigning {
+        signed,
+        acknowledged,
+    })
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ChatAcknowledgement {
+    pub offset: i32,
+}
+
+impl Packet for ChatAcknowledgement {
+    const KIND: PacketKind = PacketKind::ChatAcknowledgement;
+
+    fn read(buf: &mut &[u8], version: ProtocolVersion) -> Result<Self, ProtocolError> {
+        if version < ProtocolVersion::V1_19_3 {
+            return Err(ProtocolError::UnsupportedPacket(Self::KIND, version));
+        }
+        Ok(Self {
+            offset: buf.read_varint()?,
+        })
+    }
+
+    fn write(&self, buf: &mut Vec<u8>, version: ProtocolVersion) -> Result<(), ProtocolError> {
+        if version < ProtocolVersion::V1_19_3 {
+            return Err(ProtocolError::UnsupportedPacket(Self::KIND, version));
+        }
+        buf.write_varint(self.offset);
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CommandSuggestionRequest {
     pub id: i32,
@@ -483,6 +562,92 @@ pub fn inject_commands(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn chat_prefix(text: &str) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.write_string(text);
+        buf.write_i64(1);
+        buf.write_i64(2);
+        buf
+    }
+
+    #[test]
+    fn test_chat_signing_reads_session_acknowledgements() {
+        let version = ProtocolVersion(763);
+
+        let mut command = chat_prefix("server lobby");
+        command.write_varint(0);
+        command.write_varint(3);
+        command.extend_from_slice(&[0; 3]);
+        assert_eq!(
+            chat_signing(PacketKind::ChatCommand, &command, version).unwrap(),
+            ChatSigning {
+                signed: false,
+                acknowledged: 3
+            }
+        );
+
+        let mut signed_command = chat_prefix("msg Alex hi");
+        signed_command.write_varint(1);
+        signed_command.write_string("message");
+        signed_command.extend_from_slice(&[7; SIGNATURE_LEN]);
+        signed_command.write_varint(1);
+        signed_command.extend_from_slice(&[0; 3]);
+        assert_eq!(
+            chat_signing(PacketKind::ChatCommand, &signed_command, version).unwrap(),
+            ChatSigning {
+                signed: true,
+                acknowledged: 1
+            }
+        );
+
+        let mut message = chat_prefix("hi");
+        message.write_bool(true);
+        message.extend_from_slice(&[7; SIGNATURE_LEN]);
+        message.write_varint(2);
+        message.extend_from_slice(&[0; 3]);
+        assert_eq!(
+            chat_signing(PacketKind::ChatMessage, &message, version).unwrap(),
+            ChatSigning {
+                signed: true,
+                acknowledged: 2
+            }
+        );
+    }
+
+    #[test]
+    fn test_chat_signing_before_and_after_sessions() {
+        let mut keyed = chat_prefix("hi");
+        keyed.write_byte_array(&[7; 256]);
+        keyed.write_bool(false);
+        assert_eq!(
+            chat_signing(PacketKind::ChatMessage, &keyed, ProtocolVersion(760)).unwrap(),
+            ChatSigning {
+                signed: true,
+                acknowledged: 0
+            }
+        );
+
+        let mut unsigned = chat_prefix("hi");
+        unsigned.write_byte_array(&[]);
+        unsigned.write_bool(false);
+        assert!(
+            !chat_signing(PacketKind::ChatMessage, &unsigned, ProtocolVersion(759))
+                .unwrap()
+                .signed
+        );
+
+        let mut command = Vec::new();
+        command.write_string("server lobby");
+        assert_eq!(
+            chat_signing(PacketKind::ChatCommand, &command, ProtocolVersion::V1_20_5).unwrap(),
+            ChatSigning::default()
+        );
+        assert_eq!(
+            chat_signing(PacketKind::ChatMessage, &command, ProtocolVersion(758)).unwrap(),
+            ChatSigning::default()
+        );
+    }
     use crate::protocol::{decode_packet, encode_packet};
     use serde_json::json;
 

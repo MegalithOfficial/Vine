@@ -463,6 +463,10 @@ pub(super) const PACKET_IDS: &[(PacketKind, &[(u32, i32)])] = &[
             (770, 14),
         ],
     ),
+    (
+        PacketKind::ChatAcknowledgement,
+        &[(5, -1), (760, 3), (768, 4), (771, 5), (775, 6)],
+    ),
 ];
 
 pub(super) const STRING_PARSER_IDS: &[(u32, i32)] = &[(5, -1), (759, 5)];
@@ -524,4 +528,5 @@ pub(super) const LAYOUT_CHANGES: &[(PacketKind, &[u32])] = &[
     (PacketKind::BossBar, &[107, 765]),
     (PacketKind::Title, &[47, 315, 755]),
     (PacketKind::ClearTitles, &[755]),
+    (PacketKind::ChatAcknowledgement, &[760, 761]),
 ];

@@ -12,7 +12,7 @@ use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::time::timeout;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::auth::AuthenticatedPlayer;
 use crate::backend::forwarding::{
@@ -33,10 +33,10 @@ use crate::protocol::packets::login::{
     SetCompression,
 };
 use crate::protocol::packets::play::{
-    ChatCommand, ChatMessage, ClientboundPluginMessage, CommandSuggestionRequest,
-    CommandSuggestions, InjectedCommand, PlayDisconnect, PlayKeepAlive, PlayKeepAliveResponse,
-    ServerboundPluginMessage, StartConfiguration, Suggestion, SystemChat, Transfer,
-    inject_commands,
+    ChatAcknowledgement, ChatCommand, ChatMessage, ClientboundPluginMessage,
+    CommandSuggestionRequest, CommandSuggestions, InjectedCommand, PlayDisconnect, PlayKeepAlive,
+    PlayKeepAliveResponse, ServerboundPluginMessage, StartConfiguration, Suggestion, SystemChat,
+    Transfer, chat_signing, inject_commands,
 };
 use crate::protocol::packets::switch::{Leftovers, join_game_sequence};
 use crate::protocol::text::{component_json, plain_text};
@@ -838,6 +838,44 @@ impl BackendBridge {
         Ok((backend_reader, backend_writer))
     }
 
+    // The backend tracks which chat messages the client has seen through these packets, so one the
+    // proxy drops must still hand its acknowledgements on, and a signed one cannot be dropped at all
+    async fn swallow_chat<W: AsyncWrite + Unpin>(
+        packet: &crate::protocol::RawPacket,
+        version: ProtocolVersion,
+        backend_writer: &mut PacketWriter<W>,
+        username: &str,
+    ) -> Option<TunnelExit> {
+        let kind = if PacketKind::ChatCommand.matches(packet.id, version) {
+            PacketKind::ChatCommand
+        } else {
+            PacketKind::ChatMessage
+        };
+        let signing = chat_signing(kind, &packet.payload, version).unwrap_or_default();
+        if signing.signed && version >= ProtocolVersion::V1_19_1 {
+            error!(
+                "Disconnecting '{}': a signed chat message was cancelled, which would break their chat with the backend",
+                username
+            );
+            return Some(TunnelExit::Kicked {
+                reason: "A proxy plugin cancelled a signed chat message. Contact your network administrator."
+                    .to_string(),
+            });
+        }
+        if signing.acknowledged > 0
+            && let Ok(ack) = encode_packet(
+                &ChatAcknowledgement {
+                    offset: signing.acknowledged,
+                },
+                version,
+            )
+            && backend_writer.send(ack).await.is_err()
+        {
+            return Some(TunnelExit::BackendDisconnected { reason: None });
+        }
+        None
+    }
+
     async fn notify<W: AsyncWrite + Unpin>(
         &self,
         writer: &mut PacketWriter<W>,
@@ -1106,7 +1144,17 @@ impl BackendBridge {
                                 };
                                 plugin_manager.fire_player_command(&mut cmd_event).await;
                                 if cmd_event.cancelled {
-                                    continue;
+                                    match Self::swallow_chat(
+                                        &raw_packet,
+                                        client_version,
+                                        backend_writer,
+                                        username,
+                                    )
+                                    .await
+                                    {
+                                        Some(exit) => return exit,
+                                        None => continue,
+                                    }
                                 }
 
                                 let first_word = cmd_event
@@ -1124,7 +1172,17 @@ impl BackendBridge {
                                         session_manager: session_manager.clone(),
                                     };
                                     command_dispatcher.handle_command(&source, &cmd_event.command);
-                                    continue;
+                                    match Self::swallow_chat(
+                                        &raw_packet,
+                                        client_version,
+                                        backend_writer,
+                                        username,
+                                    )
+                                    .await
+                                    {
+                                        Some(exit) => return exit,
+                                        None => continue,
+                                    }
                                 }
                             } else if let Some(message) = chat_message {
                                 let mut chat_event = PlayerChatEvent {
@@ -1135,7 +1193,17 @@ impl BackendBridge {
                                 };
                                 plugin_manager.fire_player_chat(&mut chat_event).await;
                                 if chat_event.cancelled {
-                                    continue;
+                                    match Self::swallow_chat(
+                                        &raw_packet,
+                                        client_version,
+                                        backend_writer,
+                                        username,
+                                    )
+                                    .await
+                                    {
+                                        Some(exit) => return exit,
+                                        None => continue,
+                                    }
                                 }
                             }
 
