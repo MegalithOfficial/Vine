@@ -33,6 +33,7 @@ struct LoadedPlugin {
 struct CommandRoute {
     plugin: Arc<WasmPlugin>,
     command_id: u32,
+    permission: Option<String>,
 }
 
 // Command nodes outlive a reload, so they look up the plugin that currently owns the name
@@ -106,8 +107,19 @@ impl PluginManager {
         plugin: Arc<WasmPlugin>,
     ) {
         if let Some(proxy) = self.proxy_ctx.get() {
+            // A name owned by a built-in or another plugin would keep that owner's permission
             let names = std::iter::once(name.clone())
                 .chain(aliases)
+                .filter(|cmd_name| match proxy.command_dispatcher.owner(cmd_name) {
+                    Some(owner) if owner.as_deref() != Some(plugin.metadata.name.as_str()) => {
+                        warn!(
+                            "Plugin '{}' cannot register '/{}', which is already taken",
+                            plugin.metadata.name, cmd_name
+                        );
+                        false
+                    }
+                    _ => true,
+                })
                 .collect::<Vec<_>>();
             if let Ok(mut routes) = self.command_routes.write() {
                 for cmd_name in &names {
@@ -116,21 +128,25 @@ impl PluginManager {
                         CommandRoute {
                             plugin: plugin.clone(),
                             command_id,
+                            permission: permission.clone(),
                         },
                     );
                 }
             }
             for cmd_name in names {
                 let route = cmd_name.to_ascii_lowercase();
-                let perm_check = permission.clone();
+                let routes = self.command_routes.clone();
+                let required = route.clone();
+                // Read the permission from the current route, since a reload keeps the first node
                 let cmd_builder = pumpkin_command::argument_builder::command(cmd_name, description.clone())
                     .with_source(plugin.metadata.name.clone())
                     .requires(move |src: &ProxyCommandSource| {
-                        if let Some(ref p) = perm_check {
-                            src.has_permission(p)
-                        } else {
-                            true
-                        }
+                        resolve_route(&routes, &required).is_some_and(|route| {
+                            route
+                                .permission
+                                .as_deref()
+                                .is_none_or(|p| src.has_permission(p))
+                        })
                     })
                     .executes(PluginCommandExecutor {
                         name: route.clone(),
@@ -722,7 +738,9 @@ impl pumpkin_command::node::CommandExecutor<ProxyCommandSource> for PluginComman
             }
         };
 
-        let Some(CommandRoute { plugin, command_id }) = resolve_route(&self.routes, &self.name)
+        let Some(CommandRoute {
+            plugin, command_id, ..
+        }) = resolve_route(&self.routes, &self.name)
         else {
             context.source.reply("vine.plugin.command_unavailable", &[]);
             return Ok(0);
@@ -783,7 +801,9 @@ impl pumpkin_command::suggestion::provider::SuggestionProvider<ProxyCommandSourc
             }
         };
 
-        let Some(CommandRoute { plugin, command_id }) = resolve_route(&self.routes, &self.name)
+        let Some(CommandRoute {
+            plugin, command_id, ..
+        }) = resolve_route(&self.routes, &self.name)
         else {
             return builder.build();
         };

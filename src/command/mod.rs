@@ -335,6 +335,14 @@ impl CommandDispatcher {
         }
     }
 
+    /// Returns who registered `name`: `Some(None)` for a built-in, the plugin name otherwise
+    pub fn owner(&self, name: &str) -> Option<Option<String>> {
+        let clean = name.trim_start_matches('/').to_ascii_lowercase();
+        let lock = self.read()?;
+        let node = lock.tree.get(&clean)?;
+        Some(lock.tree[node].meta.source.as_deref().map(str::to_string))
+    }
+
     /// Returns true if the proxy should run this command for `source`: it exists, is active and
     /// the source may use it. Anything else goes on to the backend.
     pub fn handles(&self, name: &str, source: &ProxyCommandSource) -> bool {
