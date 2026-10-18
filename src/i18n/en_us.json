@@ -24,6 +24,7 @@
   "vine.server.switch_cancelled": "§c%s",
   "vine.server.connect_failed": "§cFailed to connect to server '%s': %s",
   "vine.server.switch_failed": "Failed to connect to server '%s'",
+  "vine.server.already_connecting": "§cYou are already connecting to a server.",
   "vine.server.lost_connection": "Lost connection to server",
   "vine.server.fallback": "§eConnecting to fallback server '%s'... (§c%s§e)",
   "vine.server.fallback_failed": "Lost connection to '%s' and fallback unavailable: %s",

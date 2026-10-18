@@ -67,7 +67,7 @@ pub enum BridgeError {
 }
 
 #[derive(Debug)]
-pub enum TunnelExit {
+enum TunnelExit {
     /// Client disconnected or connection closed
     ClientDisconnected,
     /// Player requested switch to another backend server
@@ -76,6 +76,8 @@ pub enum TunnelExit {
     BackendDisconnected { reason: Option<String> },
     /// The proxy kicked the player
     Kicked { reason: String },
+    /// The backend being switched to finished logging in, or failed to
+    Prepared(Box<Result<PreparedBackend, BridgeError>>),
 }
 
 type BackendReader = PacketReader<OwnedReadHalf>;
@@ -501,6 +503,8 @@ impl BackendBridge {
 
         // Outlives each tunnel so packets still queued when one ends are not lost
         let (client_tx, mut client_rx) = ClientQueue::new();
+        let bridge = &self;
+        let mut connecting: Option<(String, Connecting<'_>)> = None;
 
         loop {
             let tunnel_res = Self::bridge_tunnel(
@@ -524,6 +528,7 @@ impl BackendBridge {
                 &phase,
                 &keep_alive_challenge,
                 &leftovers,
+                connecting.as_mut().map(|(_, future)| future),
             )
             .await;
 
@@ -564,6 +569,19 @@ impl BackendBridge {
                     break;
                 }
                 TunnelExit::Connect { server_name } => {
+                    if connecting.is_some() {
+                        self.notify(
+                            &mut client_writer,
+                            &phase,
+                            translate(
+                                self.locale().as_deref(),
+                                "vine.server.already_connecting",
+                                &[],
+                            ),
+                        )
+                        .await;
+                        continue;
+                    }
                     info!(
                         "Switching player '{}' to backend server '{}'...",
                         self.player.username, server_name
@@ -617,17 +635,33 @@ impl BackendBridge {
                         continue;
                     };
 
-                    match self
-                        .switch_backend(
-                            &mut client_reader,
-                            &mut client_writer,
-                            &phase,
-                            &leftovers,
-                            &server_name,
-                            &target_config,
-                        )
-                        .await
-                    {
+                    let target = server_name.clone();
+                    connecting = Some((
+                        server_name,
+                        Box::pin(
+                            async move { bridge.prepare_backend(&target, &target_config).await },
+                        ),
+                    ));
+                }
+                TunnelExit::Prepared(prepared) => {
+                    let Some((server_name, _)) = connecting.take() else {
+                        continue;
+                    };
+                    let switched = match *prepared {
+                        Ok(prepared) => {
+                            self.finish_switch(
+                                &mut client_reader,
+                                &mut client_writer,
+                                &phase,
+                                &leftovers,
+                                &server_name,
+                                prepared,
+                            )
+                            .await
+                        }
+                        Err(e) => Err(SwitchError::Unreachable(e)),
+                    };
+                    match switched {
                         Ok((new_reader, new_writer)) => {
                             backend_reader = new_reader;
                             backend_writer = new_writer;
@@ -688,6 +722,8 @@ impl BackendBridge {
                     }
                 }
                 TunnelExit::BackendDisconnected { reason } => {
+                    // The current backend is gone, so a switch in progress is abandoned
+                    connecting = None;
                     warn!(
                         "Backend server '{}' disconnected player '{}': {:?}",
                         current_server_name, self.player.username, reason
@@ -810,33 +846,79 @@ impl BackendBridge {
         R: AsyncRead + Unpin,
         W: AsyncWrite + Unpin,
     {
-        let (mut backend_reader, mut backend_writer, _) = self
-            .login_backend(server_name, config)
+        let prepared = self
+            .prepare_backend(server_name, config)
             .await
             .map_err(SwitchError::Unreachable)?;
+        self.finish_switch(
+            client_reader,
+            client_writer,
+            phase,
+            leftovers,
+            server_name,
+            prepared,
+        )
+        .await
+    }
+
+    /// Logs in to the next backend without touching the client, so the current one keeps running
+    async fn prepare_backend(
+        &self,
+        server_name: &str,
+        config: &BackendConfig,
+    ) -> Result<PreparedBackend, BridgeError> {
+        let (mut reader, writer, _) = self.login_backend(server_name, config).await?;
         let version = self.client_version;
-        if version < ProtocolVersion::V1_20_2 {
+        let join_game = if version < ProtocolVersion::V1_20_2 {
             // The backend may still be in the login state right after LoginSuccess; client
             // packets are only safe to forward once it has placed the player and sent JoinGame
             let mut pending = Vec::new();
             let joined = async {
                 loop {
-                    let packet = backend_reader.read_packet().await?;
+                    let packet = reader.read_packet().await?;
                     if PacketKind::JoinGame.matches(packet.id, version) {
                         return Ok::<_, ProtocolError>(packet);
                     }
                     pending.push(packet.to_bytes());
                 }
             };
-            let join_game = match timeout(SWITCH_ACK_TIMEOUT, joined).await {
+            let packet = match timeout(SWITCH_ACK_TIMEOUT, joined).await {
                 Ok(Ok(packet)) => packet,
-                Ok(Err(e)) => return Err(SwitchError::Unreachable(e.into())),
-                Err(_) => {
-                    return Err(SwitchError::Unreachable(BridgeError::LoginTimeout(
-                        server_name.to_string(),
-                    )));
-                }
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => return Err(BridgeError::LoginTimeout(server_name.to_string())),
             };
+            Some((pending, packet))
+        } else {
+            None
+        };
+        Ok(PreparedBackend {
+            reader,
+            writer,
+            join_game,
+        })
+    }
+
+    /// Moves the client over to a backend that `prepare_backend` already logged in to
+    async fn finish_switch<R, W>(
+        &self,
+        client_reader: &mut PacketReader<R>,
+        client_writer: &mut PacketWriter<W>,
+        phase: &PhaseCell,
+        leftovers: &std::sync::Mutex<Leftovers>,
+        server_name: &str,
+        prepared: PreparedBackend,
+    ) -> Result<(BackendReader, BackendWriter), SwitchError>
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        let PreparedBackend {
+            reader: backend_reader,
+            writer: mut backend_writer,
+            join_game,
+        } = prepared;
+        let version = self.client_version;
+        if let Some((mut pending, join_game)) = join_game {
             let joining = join_game_sequence(&join_game, version).unwrap_or_else(|e| {
                 debug!(
                     "Forwarding JoinGame from '{}' unchanged: {}",
@@ -1125,6 +1207,22 @@ async fn send_best_effort<P: Packet, W: AsyncWrite + Unpin>(
 
 const SWITCH_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
+struct PreparedBackend {
+    reader: BackendReader,
+    writer: BackendWriter,
+    // Before 1.20.2: the packets the backend sent up to its JoinGame, and the JoinGame itself
+    join_game: Option<(Vec<Bytes>, crate::protocol::RawPacket)>,
+}
+
+impl std::fmt::Debug for PreparedBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PreparedBackend")
+    }
+}
+
+type Connecting<'a> =
+    std::pin::Pin<Box<dyn Future<Output = Result<PreparedBackend, BridgeError>> + Send + 'a>>;
+
 enum SwitchError {
     // Nothing was sent to the client yet, so it can stay on its current backend
     Unreachable(BridgeError),
@@ -1237,6 +1335,7 @@ impl BackendBridge {
         phase: &PhaseCell,
         keep_alive_challenge: &std::sync::Mutex<Option<i64>>,
         leftovers: &std::sync::Mutex<Leftovers>,
+        connecting: Option<&mut Connecting<'_>>,
     ) -> Result<TunnelExit, BridgeError>
     where
         R1: AsyncRead + Unpin,
@@ -1801,11 +1900,20 @@ impl BackendBridge {
             TunnelExit::ClientDisconnected
         };
 
+        // A switch logs in to the next backend while this tunnel keeps the current one running
+        let prepared = async {
+            match connecting {
+                Some(future) => TunnelExit::Prepared(Box::new(future.as_mut().await)),
+                None => std::future::pending().await,
+            }
+        };
+
         let exit = tokio::select! {
             exit = client_to_backend => exit,
             exit = backend_to_client => exit,
             exit = action_loop => exit,
             exit = client_writer => exit,
+            exit = prepared => exit,
         };
 
         Ok(exit)
