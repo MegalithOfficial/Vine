@@ -45,6 +45,24 @@ leading_string_packet!(ChatCommand, ChatCommand, command);
 leading_string_packet!(SignedChatCommand, SignedChatCommand, command);
 leading_string_packet!(ChatMessage, ChatMessage, message);
 
+pub fn chat_length_limit(version: ProtocolVersion) -> usize {
+    if version < ProtocolVersion::V1_11 {
+        100
+    } else {
+        MAX_CHAT_LEN
+    }
+}
+
+/// Replaces the text a chat message or command packet starts with, keeping the rest as is.
+pub fn replace_leading_string(payload: &[u8], text: &str) -> Result<Vec<u8>, ProtocolError> {
+    let mut rest = payload;
+    rest.read_string_bounded(MAX_CHAT_LEN)?;
+    let mut out = Vec::with_capacity(text.len() + rest.len() + 3);
+    out.write_string(text);
+    out.extend_from_slice(rest);
+    Ok(out)
+}
+
 const SIGNATURE_LEN: usize = 256;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

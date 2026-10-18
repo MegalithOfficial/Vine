@@ -36,7 +36,7 @@ use crate::protocol::packets::play::{
     ChatAcknowledgement, ChatCommand, ChatMessage, ClientboundPluginMessage,
     CommandSuggestionRequest, CommandSuggestions, InjectedCommand, PlayDisconnect, PlayKeepAlive,
     PlayKeepAliveResponse, ServerboundPluginMessage, StartConfiguration, Suggestion, SystemChat,
-    Transfer, chat_signing, inject_commands,
+    Transfer, chat_length_limit, chat_signing, inject_commands, replace_leading_string,
 };
 use crate::protocol::packets::switch::{Leftovers, join_game_sequence};
 use crate::protocol::text::{component_json, plain_text};
@@ -876,6 +876,47 @@ impl BackendBridge {
         None
     }
 
+    fn rewrite_chat(
+        packet: &mut crate::protocol::RawPacket,
+        version: ProtocolVersion,
+        text: &str,
+        username: &str,
+    ) -> Option<TunnelExit> {
+        let kind = if PacketKind::ChatCommand.matches(packet.id, version) {
+            PacketKind::ChatCommand
+        } else {
+            PacketKind::ChatMessage
+        };
+        if chat_signing(kind, &packet.payload, version)
+            .unwrap_or_default()
+            .signed
+        {
+            error!(
+                "Disconnecting '{}': a plugin changed a signed chat message, which the backend would reject",
+                username
+            );
+            return Some(TunnelExit::Kicked {
+                reason: "A proxy plugin changed a signed chat message. Contact your network administrator."
+                    .to_string(),
+            });
+        }
+        if text.encode_utf16().count() > chat_length_limit(version) {
+            warn!(
+                "A plugin made a chat message from '{}' longer than the client limit; sending the original",
+                username
+            );
+            return None;
+        }
+        match replace_leading_string(&packet.payload, text) {
+            Ok(payload) => packet.payload = payload.into(),
+            Err(e) => warn!(
+                "Could not rewrite a chat message from '{}': {}",
+                username, e
+            ),
+        }
+        None
+    }
+
     async fn notify<W: AsyncWrite + Unpin>(
         &self,
         writer: &mut PacketWriter<W>,
@@ -1079,7 +1120,7 @@ impl BackendBridge {
         let client_to_backend = async {
             loop {
                 match client_reader.read_packet().await {
-                    Ok(raw_packet) => {
+                    Ok(mut raw_packet) => {
                         if !client_rate_limiter.record_packet() {
                             warn!(
                                 "Player '{}' exceeded packet rate limit (flood protection kicked in)",
@@ -1139,7 +1180,7 @@ impl BackendBridge {
                                 let mut cmd_event = PlayerCommandEvent {
                                     uuid: player_uuid.to_string(),
                                     username: username.to_string(),
-                                    command,
+                                    command: command.clone(),
                                     cancelled: false,
                                 };
                                 plugin_manager.fire_player_command(&mut cmd_event).await;
@@ -1184,11 +1225,27 @@ impl BackendBridge {
                                         None => continue,
                                     }
                                 }
+
+                                if cmd_event.command != command {
+                                    let text = if client_version < ProtocolVersion::V1_19 {
+                                        format!("/{}", cmd_event.command)
+                                    } else {
+                                        cmd_event.command
+                                    };
+                                    if let Some(exit) = Self::rewrite_chat(
+                                        &mut raw_packet,
+                                        client_version,
+                                        &text,
+                                        username,
+                                    ) {
+                                        return exit;
+                                    }
+                                }
                             } else if let Some(message) = chat_message {
                                 let mut chat_event = PlayerChatEvent {
                                     uuid: player_uuid.to_string(),
                                     username: username.to_string(),
-                                    message,
+                                    message: message.clone(),
                                     cancelled: false,
                                 };
                                 plugin_manager.fire_player_chat(&mut chat_event).await;
@@ -1204,6 +1261,16 @@ impl BackendBridge {
                                         Some(exit) => return exit,
                                         None => continue,
                                     }
+                                }
+                                if chat_event.message != message
+                                    && let Some(exit) = Self::rewrite_chat(
+                                        &mut raw_packet,
+                                        client_version,
+                                        &chat_event.message,
+                                        username,
+                                    )
+                                {
+                                    return exit;
                                 }
                             }
 

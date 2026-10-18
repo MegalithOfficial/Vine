@@ -9,6 +9,7 @@ impl ProtocolVersion {
     pub const V1_7_6: Self = Self(5);
     pub const V1_8: Self = Self(47);
     pub const V1_9: Self = Self(107);
+    pub const V1_11: Self = Self(315);
     pub const V1_12_2: Self = Self(340);
     pub const V1_13: Self = Self(393);
     pub const V1_16: Self = Self(735);
