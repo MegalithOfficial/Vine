@@ -264,7 +264,10 @@ impl BackendBridge {
                     request.channel
                 );
 
-                let data = if request.channel == VINE_PLAYER_INFO_CHANNEL {
+                // Only the scheme this backend is configured for is answered; anything else is refused
+                let data = if request.channel == VINE_PLAYER_INFO_CHANNEL
+                    && active_config.forwarding == ForwardingMode::Vine
+                {
                     let secret = active_config
                         .secret
                         .as_deref()
@@ -287,7 +290,9 @@ impl BackendBridge {
                         )
                         .map_err(|e| BridgeError::VineError(e.to_string()))?,
                     )
-                } else if request.channel == VELOCITY_PLAYER_INFO_CHANNEL {
+                } else if request.channel == VELOCITY_PLAYER_INFO_CHANNEL
+                    && active_config.forwarding == ForwardingMode::Velocity
+                {
                     let secret = active_config
                         .secret
                         .as_deref()
