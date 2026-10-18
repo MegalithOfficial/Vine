@@ -191,7 +191,10 @@ impl ProxyServer {
         );
 
         if self.config.bedrock.enabled {
-            let bedrock_cfg = self.config.bedrock.clone();
+            let mut bedrock_cfg = self.config.bedrock.clone();
+            if bedrock_cfg.max_players == 0 {
+                bedrock_cfg.max_players = self.config.motd.max_players;
+            }
             let online_players = self.online_players.clone();
             let bedrock_shutdown = shutdown_rx.resubscribe();
 
