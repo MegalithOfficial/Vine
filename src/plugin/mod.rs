@@ -255,6 +255,7 @@ impl PluginManager {
             .await
             .map_err(|e| format!("Failed to load plugin '{}': {}", path.display(), e))?;
         if self.name_taken(&metadata.name, None).await {
+            plugin.shutdown().await;
             return Err(format!(
                 "Plugin '{}' from '{}' is already loaded",
                 metadata.name,
@@ -267,6 +268,7 @@ impl PluginManager {
 
     async fn enable_plugin(&self, plugin: Arc<WasmPlugin>, path: PathBuf) -> Result<(), String> {
         let metadata = plugin.metadata.clone();
+        plugin.register_early_translations();
         if let Err(e) = plugin.on_load(Arc::default()).await {
             // Whatever it registered before failing would otherwise outlive it
             self.forget(&plugin, &metadata.name).await;

@@ -79,7 +79,7 @@ impl wasmtime::ResourceLimiter for PluginLimiter {
     }
 }
 
-type Translations = Vec<(String, String)>;
+pub type Translations = Vec<(String, String)>;
 
 pub struct ContextResource {
     pub context: Arc<PluginContext>,
@@ -138,24 +138,10 @@ impl PluginHostState {
         }
     }
 
-    /// Registers the translations held back until the plugin reported its name
-    pub fn register_early_translations(&mut self) {
-        for (locale, entries) in self.early_translations.take().unwrap_or_default() {
-            self.register_translations_now(locale, entries);
-        }
-    }
-
-    fn register_translations_now(&self, locale: String, entries: Vec<(String, String)>) {
-        if let Err(e) =
-            crate::i18n::register(&crate::i18n::namespace(&self.plugin_name), &locale, entries)
-        {
-            tracing::warn!(
-                "[Plugin: {}] Could not register '{}' translations: {}",
-                self.plugin_name,
-                locale,
-                e
-            );
-        }
+    /// Hands over the translations held back until the plugin is accepted under its name;
+    /// later ones are registered right away
+    pub fn take_early_translations(&mut self) -> Vec<(String, Translations)> {
+        self.early_translations.take().unwrap_or_default()
     }
 
     pub fn add_context(
@@ -225,7 +211,7 @@ impl wit::vine::plugin::translation::Host for PluginHostState {
     ) -> wasmtime::Result<()> {
         match &mut self.early_translations {
             Some(early) => early.push((locale, entries)),
-            None => self.register_translations_now(locale, entries),
+            None => register_translations(&self.plugin_name, locale, entries),
         }
         Ok(())
     }
@@ -585,5 +571,16 @@ impl wit::vine::plugin::context::HostContext for PluginHostState {
             .resource_table
             .delete::<ContextResource>(Resource::new_own(rep.rep()));
         Ok(())
+    }
+}
+
+pub fn register_translations(plugin_name: &str, locale: String, entries: Translations) {
+    if let Err(e) = crate::i18n::register(&crate::i18n::namespace(plugin_name), &locale, entries) {
+        tracing::warn!(
+            "[Plugin: {}] Could not register '{}' translations: {}",
+            plugin_name,
+            locale,
+            e
+        );
     }
 }

@@ -79,6 +79,7 @@ pub struct WasmPlugin {
     pub metadata: PluginMetadata,
     killed: Arc<AtomicBool>,
     kill_signal: Arc<Notify>,
+    early_translations: std::sync::Mutex<Vec<(String, state::Translations)>>,
     // Set once the plugin is being stopped, so calls that fail because of it are not crashes
     stopping: AtomicBool,
     call_timeout: Duration,
@@ -101,6 +102,18 @@ impl CallStart {
 impl WasmPlugin {
     pub fn is_disabled(&self) -> bool {
         self.killed.load(Ordering::Relaxed)
+    }
+
+    /// Registers the translations from init-plugin, once the plugin is accepted under its name
+    pub fn register_early_translations(&self) {
+        let early = self
+            .early_translations
+            .lock()
+            .map(|mut early| std::mem::take(&mut *early))
+            .unwrap_or_default();
+        for (locale, entries) in early {
+            state::register_translations(&self.metadata.name, locale, entries);
+        }
     }
 
     pub async fn shutdown(&self) {
@@ -394,7 +407,7 @@ impl PluginRuntime {
         };
 
         store.data_mut().plugin_name = raw_meta.name;
-        store.data_mut().register_early_translations();
+        let early_translations = store.data_mut().take_early_translations();
 
         let legacy_store = concurrent_store::start_legacy_store(
             store,
@@ -410,6 +423,7 @@ impl PluginRuntime {
             metadata: metadata.clone(),
             killed,
             kill_signal: Arc::new(Notify::new()),
+            early_translations: std::sync::Mutex::new(early_translations),
             stopping: AtomicBool::new(false),
             call_timeout: timeout,
         });
