@@ -14,7 +14,7 @@ use crate::command::{CommandDispatcher, CommandSender, ProxyCommandSource};
 use crate::config::{Config, ForwardingMode};
 use crate::network;
 use crate::security::ConnectionRateLimiter;
-use crate::session::SessionManager;
+use crate::session::{PlayerAction, SessionManager};
 use crate::status::{StatusHandler, StatusIconManager};
 use crate::telemetry;
 
@@ -250,7 +250,7 @@ impl ProxyServer {
                         match cmd_opt {
                             Some(trimmed) => {
                                 if trimmed.eq_ignore_ascii_case("stop") || trimmed.eq_ignore_ascii_case("end") {
-                                    info!("Received stop command from console. Initiating graceful shutdown...");
+                                    info!("Shutting down (console)");
                                     let _ = shutdown_tx.send(());
                                 } else if !trimmed.is_empty() {
                                     let source = ProxyCommandSource {
@@ -359,17 +359,13 @@ impl ProxyServer {
                         }
                     }
                 }
-                _ = shutdown_rx.recv() => {
-                    info!("Shutting down Vine proxy listener...");
-                    break;
-                }
+                _ = shutdown_rx.recv() => break,
             }
         }
 
-        info!("Vine proxy has stopped accepting connections.");
+        self.disconnect_players().await;
 
         if self.config.plugins.enabled {
-            info!("Unloading plugins...");
             self.plugin_manager.unload_plugins().await;
         }
 
@@ -379,5 +375,18 @@ impl ProxyServer {
         }
 
         Ok(())
+    }
+
+    async fn disconnect_players(&self) {
+        for session in self.session_manager.list_sessions() {
+            let _ = session.action_tx.send(PlayerAction::Disconnect(
+                "Proxy is shutting down.".to_string(),
+            ));
+        }
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_secs(self.config.server.shutdown_timeout_secs.max(1));
+        while self.session_manager.count() > 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 }

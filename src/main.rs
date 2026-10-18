@@ -41,7 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(async move {
         match shutdown_signal().await {
             Ok(signal) => {
-                info!("Received shutdown signal ({signal}). Initiating graceful shutdown...");
+                info!("Shutting down ({signal})");
                 let _ = signal_tx.send(());
             }
             Err(err) => error!("Failed to listen for shutdown signal: {}", err),
@@ -53,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    info!("Vine proxy shut down successfully.");
+    info!("Stopped");
     std::process::exit(0);
 }
 
