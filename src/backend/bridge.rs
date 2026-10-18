@@ -1415,6 +1415,14 @@ fn serverbound_transition(phase: Phase, id: i32, version: ProtocolVersion) -> Op
 const CLIENT_QUEUE_BYTES: usize = 8 * 1024 * 1024;
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
+struct TunnelAlive(Arc<AtomicBool>);
+
+impl Drop for TunnelAlive {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 type ClientQueueRx = mpsc::UnboundedReceiver<(Bytes, OwnedSemaphorePermit)>;
 
 #[derive(Clone)]
@@ -1480,6 +1488,11 @@ impl BackendBridge {
         W2: AsyncWrite + Unpin,
     {
         let mut client_rate_limiter = PacketRateLimiter::new(max_packets_per_sec);
+
+        // Answers worked out on other tasks are dropped once this tunnel ends, since the client
+        // may have moved to another backend or phase by then
+        let alive = Arc::new(AtomicBool::new(true));
+        let _alive = TunnelAlive(alive.clone());
 
         let pending_suggestions: Arc<
             tokio::sync::Mutex<std::collections::HashMap<i32, PendingSuggestion>>,
@@ -1737,6 +1750,7 @@ impl BackendBridge {
                                     let input = clean_cmd.to_string();
                                     let dispatcher = command_dispatcher.clone();
                                     let client_tx = client_tx.clone();
+                                    let alive = alive.clone();
                                     tokio::spawn(async move {
                                         let Ok(suggestions) =
                                             tokio::task::spawn_blocking(move || {
@@ -1761,7 +1775,9 @@ impl BackendBridge {
                                                 })
                                                 .collect(),
                                         };
-                                        if let Ok(bytes) = encode_packet(&response, client_version)
+                                        if alive.load(Ordering::Acquire)
+                                            && let Ok(bytes) =
+                                                encode_packet(&response, client_version)
                                         {
                                             client_tx.send(bytes).await;
                                         }
@@ -1797,6 +1813,7 @@ impl BackendBridge {
 
                                         let pending_ref = pending_suggestions.clone();
                                         let client_tx_clone = client_tx.clone();
+                                        let alive = alive.clone();
                                         tokio::spawn(async move {
                                             tokio::time::sleep(Duration::from_millis(200)).await;
                                             if let Some(pending) =
@@ -1820,8 +1837,9 @@ impl BackendBridge {
                                                         })
                                                         .collect(),
                                                 };
-                                                if let Ok(bytes) =
-                                                    encode_packet(&response, client_version)
+                                                if alive.load(Ordering::Acquire)
+                                                    && let Ok(bytes) =
+                                                        encode_packet(&response, client_version)
                                                 {
                                                     client_tx_clone.send(bytes).await;
                                                 }
