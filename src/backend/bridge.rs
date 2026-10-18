@@ -1355,15 +1355,15 @@ impl BackendBridge {
                                     .split_whitespace()
                                     .next()
                                     .unwrap_or(&cmd_event.command);
-                                if command_dispatcher.has_command(first_word) {
-                                    let source = ProxyCommandSource {
-                                        sender: CommandSender::Player {
-                                            username: username.to_string(),
-                                            action_tx: action_tx.clone(),
-                                        },
-                                        config: proxy_config.clone(),
-                                        session_manager: session_manager.clone(),
-                                    };
+                                let source = ProxyCommandSource {
+                                    sender: CommandSender::Player {
+                                        username: username.to_string(),
+                                        action_tx: action_tx.clone(),
+                                    },
+                                    config: proxy_config.clone(),
+                                    session_manager: session_manager.clone(),
+                                };
+                                if command_dispatcher.handles(first_word, &source) {
                                     command_dispatcher.handle_command(&source, &cmd_event.command);
                                     match Self::swallow_chat(
                                         &raw_packet,
@@ -1467,7 +1467,7 @@ impl BackendBridge {
 
                                 // 1. Arguments to a proxy command (contains a space, e.g. "/server ", "/send ")
                                 if clean_cmd.contains(' ')
-                                    && command_dispatcher.has_command(first_word)
+                                    && command_dispatcher.handles(first_word, &source)
                                 {
                                     // Plugins answer these, so they run off the tunnel to keep its traffic flowing
                                     let offset = if raw_cmd.starts_with('/') { 1 } else { 0 };

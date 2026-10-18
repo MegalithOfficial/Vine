@@ -1,4 +1,5 @@
 use pumpkin_command::CommandSource;
+use pumpkin_command::Requirement;
 use pumpkin_command::argument_builder::{ArgumentBuilder, argument, command};
 use pumpkin_command::argument_types::core::string::StringArgumentType;
 use pumpkin_command::context::command_context::CommandContext;
@@ -145,6 +146,7 @@ pub fn register(dispatcher: &mut RawCommandDispatcher<ProxyCommandSource>) {
             "send",
             "Sends a player or all players to another backend server",
         )
+        .requires(Requirement::from("vine.command.send"))
         .then(
             argument("target", StringArgumentType::SingleWord)
                 .suggests(TargetSuggestionProvider)
@@ -227,13 +229,6 @@ mod tests {
         };
         let res_denied = dispatcher.execute_input("send Steve survival", &non_admin_source);
         assert!(res_denied.is_err());
-        assert!(
-            res_denied
-                .unwrap_err()
-                .message
-                .to_pretty_console()
-                .contains("permission")
-        );
     }
 
     #[test]

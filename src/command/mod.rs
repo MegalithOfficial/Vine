@@ -335,6 +335,18 @@ impl CommandDispatcher {
         }
     }
 
+    /// Returns true if the proxy should run this command for `source`: it exists, is active and
+    /// the source may use it. Anything else goes on to the backend.
+    pub fn handles(&self, name: &str, source: &ProxyCommandSource) -> bool {
+        let clean = name.trim_start_matches('/').to_ascii_lowercase();
+        let Some(lock) = self.read() else {
+            return false;
+        };
+        lock.tree
+            .get(&clean)
+            .is_some_and(|node| !lock.is_disabled(&clean) && lock.tree.can_use(node.into(), source))
+    }
+
     /// Returns suggestions with range information for any command input.
     /// If input contains arguments (i.e. has a space), it evaluates argument suggestions.
     /// If input is typing the root command name, it suggests permitted root commands starting with the prefix.
@@ -342,7 +354,7 @@ impl CommandDispatcher {
         let clean = input.strip_prefix('/').unwrap_or(input);
         if clean.contains(' ') {
             let first_word = clean.split_whitespace().next().unwrap_or(clean);
-            if self.has_command(first_word)
+            if self.handles(first_word, source)
                 && let Some(lock) = self.read()
             {
                 return lock.suggest_with_range(clean, source);
