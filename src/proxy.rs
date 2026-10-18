@@ -8,9 +8,10 @@ use tracing::{debug, error, info, warn};
 
 use crate::auth::{Authenticator, KeyStore};
 use crate::backend::Router;
+use crate::backend::forwarding::ForwardingHelper;
 use crate::client::ClientHandler;
 use crate::command::{CommandDispatcher, CommandSender, ProxyCommandSource};
-use crate::config::Config;
+use crate::config::{Config, ForwardingMode};
 use crate::network;
 use crate::security::ConnectionRateLimiter;
 use crate::session::SessionManager;
@@ -144,6 +145,14 @@ impl ProxyServer {
                 "    - [{}] {} (Forwarding: {:?}, Icon: {})",
                 name, server.address, server.forwarding, icon_info
             );
+            if server.forwarding == ForwardingMode::Vine
+                && let Some(key) = server
+                    .secret
+                    .as_deref()
+                    .and_then(|secret| ForwardingHelper::get_vine_public_key_hex(secret).ok())
+            {
+                info!("      Vine public key: {key} (networking.proxy.vine.public_key on Pumpkin)");
+            }
         }
         info!("  Default route: '{}'", self.config.routing.default_server);
         if self.config.telemetry.enabled {
