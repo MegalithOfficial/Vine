@@ -512,35 +512,43 @@ impl BackendBridge {
         let (client_tx, mut client_rx) = ClientQueue::new();
         let bridge = &self;
         let mut connecting: Option<(String, Connecting<'_>)> = None;
-        // A switch asked for while the client is still configuring waits until it is playing
+        // A switch asked for, or a backend that finished logging in, while the client is still
+        // logging in or configuring waits until it is playing
         let mut deferred: Option<String> = None;
+        let mut early: Option<Box<Result<PreparedBackend, BridgeError>>> = None;
+        // An exit to handle next without running the tunnel again
+        let mut pending_exit: Option<TunnelExit> = None;
 
         loop {
-            let tunnel_res = Self::bridge_tunnel(
-                &self.player.username,
-                &mut client_reader,
-                &mut client_writer,
-                &client_tx,
-                &mut client_rx,
-                &mut backend_reader,
-                &mut backend_writer,
-                self.max_packets_per_sec,
-                self.client_version,
-                &mut action_rx,
-                &action_tx,
-                self.command_dispatcher.clone(),
-                self.proxy_config.clone(),
-                self.session_manager.clone(),
-                self.plugin_manager.clone(),
-                self.player.id,
-                current_server_name.clone(),
-                &phase,
-                &keep_alive_challenge,
-                &leftovers,
-                connecting.as_mut().map(|(_, future)| future),
-                deferred.is_some(),
-            )
-            .await;
+            let tunnel_res = if let Some(exit) = pending_exit.take() {
+                Ok(exit)
+            } else {
+                Self::bridge_tunnel(
+                    &self.player.username,
+                    &mut client_reader,
+                    &mut client_writer,
+                    &client_tx,
+                    &mut client_rx,
+                    &mut backend_reader,
+                    &mut backend_writer,
+                    self.max_packets_per_sec,
+                    self.client_version,
+                    &mut action_rx,
+                    &action_tx,
+                    self.command_dispatcher.clone(),
+                    self.proxy_config.clone(),
+                    self.session_manager.clone(),
+                    self.plugin_manager.clone(),
+                    self.player.id,
+                    current_server_name.clone(),
+                    &phase,
+                    &keep_alive_challenge,
+                    &leftovers,
+                    connecting.as_mut().map(|(_, future)| future),
+                    deferred.is_some() || early.is_some(),
+                )
+                .await
+            };
 
             let exit = match tunnel_res {
                 Ok(exit) => exit,
@@ -582,9 +590,12 @@ impl BackendBridge {
                     if let Some(server_name) = deferred.take() {
                         let _ = action_tx.send(PlayerAction::Connect { server_name });
                     }
+                    if let Some(prepared) = early.take() {
+                        pending_exit = Some(TunnelExit::Prepared(prepared));
+                    }
                 }
                 TunnelExit::Connect { server_name } => {
-                    if phase.get() == Phase::Config {
+                    if phase.get() != Phase::Play {
                         deferred = Some(server_name);
                         continue;
                     }
@@ -676,6 +687,15 @@ impl BackendBridge {
                     ));
                 }
                 TunnelExit::Prepared(prepared) => {
+                    if phase.get() != Phase::Play {
+                        // Keep the slot taken so another switch waits; the result is replayed
+                        // once the client is playing
+                        if let Some((_, future)) = connecting.as_mut() {
+                            *future = Box::pin(std::future::pending());
+                        }
+                        early = Some(prepared);
+                        continue;
+                    }
                     let Some((server_name, _)) = connecting.take() else {
                         continue;
                     };
@@ -757,6 +777,7 @@ impl BackendBridge {
                     // The current backend is gone, so a switch in progress is abandoned
                     connecting = None;
                     deferred = None;
+                    early = None;
                     warn!(
                         "Backend server '{}' disconnected player '{}': {:?}",
                         current_server_name, self.player.username, reason
