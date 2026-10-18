@@ -52,6 +52,10 @@ fn default_forwarding_secret_file() -> String {
     "forwarding.secret".to_string()
 }
 
+fn default_vine_key_file() -> String {
+    "vine-forwarding.key".to_string()
+}
+
 fn default_locale() -> String {
     "en_us".to_string()
 }
@@ -132,9 +136,13 @@ pub struct ServerConfig {
     /// Graceful shutdown timeout in seconds to wait for active connections to close
     #[serde(default = "default_shutdown_timeout")]
     pub shutdown_timeout_secs: u64,
-    /// Shared secret for velocity and vine backends without their own `secret`
+    /// Shared secret for velocity backends without their own `secret`
     #[serde(default = "default_forwarding_secret_file")]
     pub forwarding_secret_file: String,
+    /// Signing key for vine backends without their own `secret`, kept apart from the velocity
+    /// secret so velocity backends cannot sign for vine ones
+    #[serde(default = "default_vine_key_file")]
+    pub vine_key_file: String,
     /// Require 1.19-1.19.2 clients to present a Mojang-signed chat key in online mode
     #[serde(default = "default_true")]
     pub force_key_authentication: bool,
@@ -389,6 +397,7 @@ impl Default for Config {
                 compression_level: 6,
                 shutdown_timeout_secs: 10,
                 forwarding_secret_file: default_forwarding_secret_file(),
+                vine_key_file: default_vine_key_file(),
                 force_key_authentication: true,
                 default_locale: default_locale(),
             },
@@ -431,14 +440,14 @@ pub fn normalize_host(host: &str) -> String {
     host.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 
-fn needs_shared_secret(server: &BackendConfig) -> bool {
-    matches!(
-        server.forwarding,
-        ForwardingMode::Velocity | ForwardingMode::Vine
-    ) && server.secret.as_deref().is_none_or(|s| s.trim().is_empty())
+fn needs_secret(server: &BackendConfig, mode: ForwardingMode) -> bool {
+    server.forwarding == mode && server.secret.as_deref().is_none_or(|s| s.trim().is_empty())
 }
 
-fn load_or_create_secret_file(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
+fn load_or_create_secret_file(
+    path: &Path,
+    usage: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
     match std::fs::read_to_string(path) {
         Ok(content) if content.trim().is_empty() => {
             Err(format!("forwarding secret file '{}' is empty", path.display()).into())
@@ -451,10 +460,7 @@ fn load_or_create_secret_file(path: &Path) -> Result<String, Box<dyn std::error:
             #[cfg(unix)]
             std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
             options.open(path)?.write_all(secret.as_bytes())?;
-            tracing::info!(
-                "Generated a new forwarding secret in '{}'; use it as proxies.velocity.secret in each Paper backend",
-                path.display()
-            );
+            tracing::info!("Generated '{}'; {usage}", path.display());
             Ok(secret)
         }
         Err(e) => Err(format!(
@@ -490,15 +496,42 @@ impl Config {
         config_dir: &Path,
         env_secret: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        if !self.servers.values().any(needs_shared_secret) {
-            return Ok(());
+        if self
+            .servers
+            .values()
+            .any(|s| needs_secret(s, ForwardingMode::Velocity))
+        {
+            let secret = match env_secret.as_deref().map(str::trim) {
+                Some(secret) if !secret.is_empty() => secret.to_string(),
+                _ => load_or_create_secret_file(
+                    &config_dir.join(&self.server.forwarding_secret_file),
+                    "use it as proxies.velocity.secret in each Paper backend",
+                )?,
+            };
+            for server in self
+                .servers
+                .values_mut()
+                .filter(|s| needs_secret(s, ForwardingMode::Velocity))
+            {
+                server.secret = Some(secret.clone());
+            }
         }
-        let secret = match env_secret.as_deref().map(str::trim) {
-            Some(secret) if !secret.is_empty() => secret.to_string(),
-            _ => load_or_create_secret_file(&config_dir.join(&self.server.forwarding_secret_file))?,
-        };
-        for server in self.servers.values_mut().filter(|s| needs_shared_secret(s)) {
-            server.secret = Some(secret.clone());
+        if self
+            .servers
+            .values()
+            .any(|s| needs_secret(s, ForwardingMode::Vine))
+        {
+            let key = load_or_create_secret_file(
+                &config_dir.join(&self.server.vine_key_file),
+                "give each Pumpkin backend the Vine public key logged below",
+            )?;
+            for server in self
+                .servers
+                .values_mut()
+                .filter(|s| needs_secret(s, ForwardingMode::Vine))
+            {
+                server.secret = Some(key.clone());
+            }
         }
         Ok(())
     }
