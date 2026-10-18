@@ -727,24 +727,16 @@ impl pumpkin_command::node::CommandExecutor<ProxyCommandSource> for PluginComman
             context.source.reply("vine.plugin.command_unavailable", &[]);
             return Ok(0);
         };
-        let handle = tokio::runtime::Handle::current();
-        let result = tokio::task::block_in_place(|| {
-            handle.block_on(async move { plugin.handle_command(command_id, sender, args).await })
+        // Runs on its own task so a slow plugin doesn't hold up the player's connection
+        let source = context.source.clone();
+        tokio::spawn(async move {
+            match plugin.handle_command(command_id, sender, args).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(err_msg)) => source.reply("vine.plugin.command_error", &[&err_msg]),
+                Err(e) => source.reply("vine.plugin.command_error", &[&e]),
+            }
         });
-
-        match result {
-            Ok(Ok(code)) => Ok(code),
-            Ok(Err(err_msg)) => {
-                context
-                    .source
-                    .reply("vine.plugin.command_error", &[&err_msg]);
-                Ok(0)
-            }
-            Err(e) => {
-                context.source.reply("vine.plugin.command_error", &[&e]);
-                Ok(0)
-            }
-        }
+        Ok(1)
     }
 }
 

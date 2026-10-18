@@ -1458,27 +1458,41 @@ impl BackendBridge {
                                 if clean_cmd.contains(' ')
                                     && command_dispatcher.has_command(first_word)
                                 {
-                                    let suggestions =
-                                        command_dispatcher.suggest_with_range(clean_cmd, &source);
+                                    // Plugins answer these, so they run off the tunnel to keep its traffic flowing
                                     let offset = if raw_cmd.starts_with('/') { 1 } else { 0 };
-                                    let response = CommandSuggestions {
-                                        id: suggestion_req.id,
-                                        start: (suggestions.range.start + offset) as i32,
-                                        length: suggestions.range.len() as i32,
-                                        matches: suggestions
-                                            .suggestions
-                                            .into_iter()
-                                            .map(|s| Suggestion {
-                                                text: s.text.cached_text().clone(),
-                                                tooltip: s
-                                                    .tooltip
-                                                    .map(|t| component_json(&t, client_version)),
+                                    let id = suggestion_req.id;
+                                    let input = clean_cmd.to_string();
+                                    let dispatcher = command_dispatcher.clone();
+                                    let client_tx = client_tx.clone();
+                                    tokio::spawn(async move {
+                                        let Ok(suggestions) =
+                                            tokio::task::spawn_blocking(move || {
+                                                dispatcher.suggest_with_range(&input, &source)
                                             })
-                                            .collect(),
-                                    };
-                                    if let Ok(bytes) = encode_packet(&response, client_version) {
-                                        client_tx.send(bytes).await;
-                                    }
+                                            .await
+                                        else {
+                                            return;
+                                        };
+                                        let response = CommandSuggestions {
+                                            id,
+                                            start: (suggestions.range.start + offset) as i32,
+                                            length: suggestions.range.len() as i32,
+                                            matches: suggestions
+                                                .suggestions
+                                                .into_iter()
+                                                .map(|s| Suggestion {
+                                                    text: s.text.cached_text().clone(),
+                                                    tooltip: s.tooltip.map(|t| {
+                                                        component_json(&t, client_version)
+                                                    }),
+                                                })
+                                                .collect(),
+                                        };
+                                        if let Ok(bytes) = encode_packet(&response, client_version)
+                                        {
+                                            client_tx.send(bytes).await;
+                                        }
+                                    });
                                     continue;
                                 }
 
