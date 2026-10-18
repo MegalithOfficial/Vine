@@ -81,6 +81,32 @@ impl StatusIcon {
     }
 }
 
+/// What changes when a file is edited, replaced or has its permissions fixed
+#[derive(Debug, PartialEq)]
+struct FileState {
+    modified: Option<SystemTime>,
+    len: u64,
+    permissions: fs::Permissions,
+    #[cfg(unix)]
+    changed: (i64, i64),
+}
+
+impl FileState {
+    fn of(path: &Path) -> Option<Self> {
+        let meta = fs::metadata(path).ok()?;
+        Some(Self {
+            modified: meta.modified().ok(),
+            len: meta.len(),
+            permissions: meta.permissions(),
+            #[cfg(unix)]
+            changed: {
+                use std::os::unix::fs::MetadataExt;
+                (meta.ctime(), meta.ctime_nsec())
+            },
+        })
+    }
+}
+
 /// Manages status images for the proxy, supporting global icons, per-server icons,
 /// and automatic hot-reloading when image files on disk change.
 pub struct StatusIconManager {
@@ -89,9 +115,9 @@ pub struct StatusIconManager {
     forced_hosts: HashMap<String, String>,
     default_server: String,
     cache: RwLock<HashMap<PathBuf, StatusIcon>>,
-    // Files that failed to load, by modification time, so a bad icon is read and reported
-    // once instead of on every ping
-    failed: RwLock<HashMap<PathBuf, Option<SystemTime>>>,
+    // Files that failed to load, by their file state, so a bad icon is read and reported once
+    // instead of on every ping
+    failed: RwLock<HashMap<PathBuf, Option<FileState>>>,
 }
 
 impl StatusIconManager {
@@ -179,11 +205,11 @@ impl StatusIconManager {
             }
         }
 
-        let mtime = fs::metadata(path).and_then(|m| m.modified()).ok();
+        let state = FileState::of(path);
         if self
             .failed
             .read()
-            .is_ok_and(|failed| failed.get(path) == Some(&mtime))
+            .is_ok_and(|failed| failed.get(path) == Some(&state))
         {
             return None;
         }
@@ -202,7 +228,7 @@ impl StatusIconManager {
             Err(e) => {
                 warn!("Could not load status icon '{}': {}", path.display(), e);
                 if let Ok(mut failed) = self.failed.write() {
-                    failed.insert(path.to_path_buf(), mtime);
+                    failed.insert(path.to_path_buf(), state);
                 }
                 None
             }
