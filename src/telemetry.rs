@@ -41,9 +41,6 @@ pub struct PluginInfo {
     pub version: String,
 }
 
-/// Type alias for plugin telemetry information.
-pub type PluginTelemetryInfo = PluginInfo;
-
 /// The telemetry heartbeat payload transmitted to the backend.
 /// Matches the Pumpkin Market API schema: https://market.pumpkinmc.org/api/docs/#/
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -207,12 +204,6 @@ impl TelemetryClient {
         }
     }
 
-    /// Returns the 64-character lowercase hexadecimal representation of the client's Ed25519 public key.
-    #[must_use]
-    pub fn public_key_hex(&self) -> String {
-        hex::encode(self.signing_key.verifying_key().to_bytes())
-    }
-
     /// Loads an existing Ed25519 private key/seed from the given path or generates and persists a new one.
     pub fn load_or_generate_key(key_path: &Path) -> Result<SigningKey, std::io::Error> {
         if key_path.exists() {
@@ -325,19 +316,6 @@ pub fn resolve_identity_key() -> SigningKey {
     TelemetryClient::load_or_generate_key(path).unwrap_or_else(|err| {
         tracing::warn!(
             "Failed to persist telemetry identity key at {}: {err}, using ephemeral key",
-            path.display()
-        );
-        let seed: [u8; 32] = rand::random();
-        SigningKey::from_bytes(&seed)
-    })
-}
-
-/// Helper function to load or create an identity key at a specified path.
-#[must_use]
-pub fn get_or_create_identity_key(path: &Path) -> SigningKey {
-    TelemetryClient::load_or_generate_key(path).unwrap_or_else(|err| {
-        tracing::warn!(
-            "Failed to save identity key to {}: {err}, using ephemeral key",
             path.display()
         );
         let seed: [u8; 32] = rand::random();

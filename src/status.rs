@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::config::{BackendConfig, MotdConfig};
 use crate::protocol::ProtocolVersion;
 use crate::protocol::packets::status::StatusResponse;
-pub use icon::{StatusIcon, StatusIconManager};
+pub use icon::StatusIconManager;
 
 #[derive(Serialize)]
 struct StatusJson<'a> {

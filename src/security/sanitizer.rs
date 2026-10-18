@@ -31,11 +31,6 @@ impl Sanitizer {
         }
         clean
     }
-
-    /// Validates packet size against maximum limit
-    pub fn is_valid_packet_size(size: usize, max_allowed: usize) -> bool {
-        size <= max_allowed
-    }
 }
 
 #[cfg(test)]

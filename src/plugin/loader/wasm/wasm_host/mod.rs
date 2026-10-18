@@ -12,7 +12,7 @@ use thiserror::Error;
 use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::{Engine, Store, UpdateDeadline};
 
-use crate::plugin::api::{Plugin, PluginContext, PluginFuture, PluginMetadata};
+use crate::plugin::api::{PluginContext, PluginMetadata};
 use concurrent_store::{LegacyStore, LegacySyncReentry, TokioSpawner};
 use state::{PluginHostState, ProxyPluginContext};
 
@@ -178,16 +178,6 @@ impl WasmPlugin {
             })
         }))
         .await
-    }
-}
-
-impl Plugin for WasmPlugin {
-    fn on_load(&self, context: Arc<PluginContext>) -> PluginFuture<'_, Result<(), String>> {
-        Box::pin(async move { Self::on_load(self, context).await })
-    }
-
-    fn on_unload(&self, context: Arc<PluginContext>) -> PluginFuture<'_, Result<(), String>> {
-        Box::pin(async move { Self::on_unload(self, context).await })
     }
 }
 

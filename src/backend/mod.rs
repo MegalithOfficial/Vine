@@ -2,7 +2,6 @@ pub mod bridge;
 pub mod forwarding;
 
 pub use bridge::{BackendBridge, BridgeError};
-pub use forwarding::{ForwardingError, ForwardingHelper};
 
 use crate::config::{BackendConfig, RoutingConfig, normalize_host};
 use std::collections::HashMap;

@@ -355,32 +355,6 @@ impl Packet for CommandSuggestions {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct Transfer {
-    pub host: String,
-    pub port: u16,
-}
-
-impl Packet for Transfer {
-    const KIND: PacketKind = PacketKind::Transfer;
-
-    fn read(buf: &mut &[u8], _version: ProtocolVersion) -> Result<Self, ProtocolError> {
-        let host = buf.read_string()?;
-        let port = buf.read_varint()?;
-        Ok(Self {
-            host,
-            port: u16::try_from(port)
-                .map_err(|_| ProtocolError::Malformed(format!("invalid port {port}")))?,
-        })
-    }
-
-    fn write(&self, buf: &mut Vec<u8>, _version: ProtocolVersion) -> Result<(), ProtocolError> {
-        buf.write_string(&self.host);
-        buf.write_varint(i32::from(self.port));
-        Ok(())
-    }
-}
-
 fn read_keep_alive(buf: &mut &[u8], version: ProtocolVersion) -> Result<i64, ProtocolError> {
     if version < ProtocolVersion::V1_8 {
         Ok(i64::from(buf.read_i32()?))

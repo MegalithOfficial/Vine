@@ -10,8 +10,6 @@ use pumpkin_util::text::TextComponent;
 pub enum PlayerAction {
     /// Request connecting the player to a target backend server in-proxy
     Connect { server_name: String },
-    /// Request transfer of the player to a target host and port
-    Transfer { host: String, port: u16 },
     /// Send a system chat message to the player
     Message(TextComponent),
     /// Disconnect/kick the player with a reason

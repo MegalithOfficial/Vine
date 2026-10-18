@@ -8,7 +8,6 @@ pub struct ProtocolVersion(pub u32);
 impl ProtocolVersion {
     pub const V1_7_6: Self = Self(5);
     pub const V1_8: Self = Self(47);
-    pub const V1_9: Self = Self(107);
     pub const V1_11: Self = Self(315);
     pub const V1_12_2: Self = Self(340);
     pub const V1_13: Self = Self(393);
@@ -19,7 +18,6 @@ impl ProtocolVersion {
     pub const V1_20_2: Self = Self(764);
     pub const V1_20_3: Self = Self(765);
     pub const V1_20_5: Self = Self(766);
-    pub const V1_21_6: Self = Self(771);
 
     pub fn from_handshake(raw: i32) -> Self {
         Self(raw.max(0) as u32)

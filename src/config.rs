@@ -429,7 +429,7 @@ impl Default for Config {
     }
 }
 
-pub use crate::permissions::{GroupConfig, PermissionsConfig, UserPermissionConfig};
+pub use crate::permissions::PermissionsConfig;
 
 pub fn normalize_host(host: &str) -> String {
     host.trim().trim_end_matches('.').to_ascii_lowercase()

@@ -22,8 +22,6 @@ const YGGDRASIL_SESSION_KEY: &[u8] = include_bytes!("yggdrasil_session_pubkey.de
 pub enum AuthError {
     #[error("Failed to decrypt RSA payload: {0}")]
     DecryptError(String),
-    #[error("Verify token mismatch")]
-    VerifyTokenMismatch,
     #[error("player has not joined this server through Mojang's session service")]
     NotJoined,
     #[error("Mojang authentication failed (status: {0})")]

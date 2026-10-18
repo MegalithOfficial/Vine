@@ -4,4 +4,3 @@ pub mod status;
 
 pub use config::BedrockConfig;
 pub use listener::run_bedrock_listener;
-pub use status::BedrockStatusHandler;

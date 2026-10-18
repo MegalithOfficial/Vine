@@ -211,7 +211,7 @@ impl PluginManager {
     async fn enable_plugin(&self, plugin: Arc<WasmPlugin>, path: PathBuf) -> Result<(), String> {
         let metadata = plugin.metadata.clone();
         plugin
-            .on_load(Self::plugin_context(&metadata))
+            .on_load(Arc::default())
             .await
             .map_err(|e| format!("Plugin '{}' failed to on_load: {}", metadata.name, e))?;
         info!(
@@ -225,11 +225,6 @@ impl PluginManager {
             .await
             .push(LoadedPlugin { plugin, path });
         Ok(())
-    }
-
-    fn plugin_context(metadata: &PluginMetadata) -> Arc<PluginContext> {
-        let data_folder = PathBuf::from("plugins").join("data").join(&metadata.name);
-        Arc::new(PluginContext::new(metadata.clone(), data_folder))
     }
 
     async fn is_loaded(&self, name: &str) -> bool {
@@ -280,9 +275,7 @@ impl PluginManager {
         };
         let plugin = &loaded.plugin;
         if !plugin.is_disabled()
-            && let Err(e) = plugin
-                .on_unload(Self::plugin_context(&plugin.metadata))
-                .await
+            && let Err(e) = plugin.on_unload(Arc::default()).await
         {
             error!("Error unloading plugin '{}': {}", name, e);
         }

@@ -11,10 +11,7 @@ pub const PNG_SIGNATURE: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x
 
 #[derive(Clone, Debug)]
 pub struct StatusIcon {
-    pub path: PathBuf,
     pub data_uri: Arc<str>,
-    pub width: u32,
-    pub height: u32,
     pub last_modified: Option<SystemTime>,
 }
 
@@ -78,10 +75,7 @@ impl StatusIcon {
         );
 
         Ok(Self {
-            path,
             data_uri,
-            width,
-            height,
             last_modified,
         })
     }
@@ -217,8 +211,6 @@ mod tests {
     fn test_valid_png_parsing() {
         let png = create_test_png(64, 64);
         let icon = StatusIcon::from_bytes(png, PathBuf::from("test.png")).unwrap();
-        assert_eq!(icon.width, 64);
-        assert_eq!(icon.height, 64);
         assert!(icon.data_uri.starts_with("data:image/png;base64,"));
     }
 

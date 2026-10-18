@@ -35,7 +35,7 @@ use crate::protocol::packets::login::{
 use crate::protocol::packets::play::{
     ChatAcknowledgement, ChatCommand, ChatMessage, ClientboundPluginMessage,
     CommandSuggestionRequest, CommandSuggestions, InjectedCommand, PlayDisconnect, PlayKeepAlive,
-    PlayKeepAliveResponse, SignedChatCommand, StartConfiguration, Suggestion, SystemChat, Transfer,
+    PlayKeepAliveResponse, SignedChatCommand, StartConfiguration, Suggestion, SystemChat,
     chat_length_limit, chat_signing, inject_commands, read_plugin_message, replace_leading_string,
     write_plugin_message,
 };
@@ -72,8 +72,6 @@ pub enum TunnelExit {
     ClientDisconnected,
     /// Player requested switch to another backend server
     Connect { server_name: String },
-    /// Direct client transfer requested
-    Transfer { host: String, port: u16 },
     /// Backend server closed connection or sent disconnect/kick
     BackendDisconnected { reason: Option<String> },
     /// The proxy kicked the player
@@ -514,18 +512,6 @@ impl BackendBridge {
                     debug!(
                         "Player '{}' disconnected from client side",
                         self.player.username
-                    );
-                    break;
-                }
-                TunnelExit::Transfer { host, port } => {
-                    let transfer = Transfer {
-                        host: host.clone(),
-                        port,
-                    };
-                    send_best_effort(&mut client_writer, &transfer, self.client_version).await;
-                    info!(
-                        "Transferring player '{}' to {}:{}",
-                        self.player.username, host, port
                     );
                     break;
                 }
@@ -1637,9 +1623,6 @@ impl BackendBridge {
                 match action {
                     PlayerAction::Connect { server_name } => {
                         return TunnelExit::Connect { server_name };
-                    }
-                    PlayerAction::Transfer { host, port } => {
-                        return TunnelExit::Transfer { host, port };
                     }
                     PlayerAction::Message(_) | PlayerAction::PluginMessage { .. }
                         if phase.get() != Phase::Play =>

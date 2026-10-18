@@ -1,10 +1,4 @@
-use std::future::Future;
-use std::path::PathBuf;
-use std::pin::Pin;
-use std::sync::Arc;
 use tokio::sync::Mutex;
-
-pub type PluginFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PluginMetadata {
@@ -133,26 +127,8 @@ pub enum PluginMessageSource {
     Server,
 }
 
+#[derive(Default)]
 pub struct PluginContext {
-    pub metadata: PluginMetadata,
-    pub data_folder: PathBuf,
     pub registered_commands: Mutex<Vec<u32>>,
     pub registered_events: Mutex<Vec<(u32, EventType, EventPriority)>>,
-}
-
-impl PluginContext {
-    #[must_use]
-    pub fn new(metadata: PluginMetadata, data_folder: PathBuf) -> Self {
-        Self {
-            metadata,
-            data_folder,
-            registered_commands: Mutex::new(Vec::new()),
-            registered_events: Mutex::new(Vec::new()),
-        }
-    }
-}
-
-pub trait Plugin: Send + Sync {
-    fn on_load(&self, context: Arc<PluginContext>) -> PluginFuture<'_, Result<(), String>>;
-    fn on_unload(&self, context: Arc<PluginContext>) -> PluginFuture<'_, Result<(), String>>;
 }

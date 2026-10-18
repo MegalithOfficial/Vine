@@ -59,19 +59,6 @@ impl CommandSender {
             }
         }
     }
-
-    /// Sends a plain text message to the command sender
-    pub fn send_text(&self, text: impl Into<String>) {
-        self.send_message(TextComponent::text(text.into()));
-    }
-
-    /// Returns the name of the sender
-    pub fn name(&self) -> &str {
-        match self {
-            Self::Console => "CONSOLE",
-            Self::Player { username, .. } => username,
-        }
-    }
 }
 
 /// Execution context passed to commands
