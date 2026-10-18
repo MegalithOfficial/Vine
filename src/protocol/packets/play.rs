@@ -515,13 +515,13 @@ pub fn inject_commands(
                 &mut extra_nodes_buf,
                 command.name,
                 command.executable_without_args,
-                Some(next_node_idx + 1),
+                Some(next_node_idx.checked_add(1)?),
             );
             write_greedy_argument(&mut extra_nodes_buf, version)?;
-            next_node_idx += 2;
+            next_node_idx = next_node_idx.checked_add(2)?;
         } else {
             write_literal(&mut extra_nodes_buf, command.name, true, None);
-            next_node_idx += 1;
+            next_node_idx = next_node_idx.checked_add(1)?;
         }
     }
 
