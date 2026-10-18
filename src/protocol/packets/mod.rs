@@ -73,10 +73,14 @@ pub enum PacketKind {
 
 impl PacketKind {
     pub fn id(self, version: ProtocolVersion) -> Option<i32> {
-        if !version.is_known() {
-            return None;
-        }
         let (_, runs) = PACKET_IDS.iter().find(|(kind, _)| *kind == self)?;
+        if !version.is_known() {
+            // Packets whose ID never changed, like the status ping, still work with unknown versions
+            return match runs {
+                [(_, id)] if *id >= 0 => Some(*id),
+                _ => None,
+            };
+        }
         let idx = runs.partition_point(|(first, _)| *first <= version.0);
         let (_, id) = runs.get(idx.checked_sub(1)?)?;
         (*id >= 0).then_some(*id)
@@ -160,7 +164,7 @@ mod tests {
         (
             PacketKind::JoinGame,
             &[
-                47, 109, 477, 573, 735, 751, 755, 757, 759, 763, 764, 766, 768, 773,
+                47, 108, 477, 573, 735, 751, 755, 757, 759, 763, 764, 766, 768, 773,
             ],
         ),
         (
@@ -222,6 +226,7 @@ mod tests {
         assert_eq!(PacketKind::PlayDisconnect.id(v1_21_4), Some(0x1D));
         assert_eq!(PacketKind::SetCompression.id(ProtocolVersion(5)), None);
         assert_eq!(PacketKind::Transfer.id(ProtocolVersion(765)), None);
-        assert_eq!(PacketKind::Handshake.id(ProtocolVersion(9999)), None);
+        assert_eq!(PacketKind::Handshake.id(ProtocolVersion(9999)), Some(0));
+        assert_eq!(PacketKind::SystemChat.id(ProtocolVersion(9999)), None);
     }
 }
