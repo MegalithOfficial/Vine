@@ -67,6 +67,8 @@ pub struct WasmPlugin {
     pub store: LegacyStore,
     pub metadata: PluginMetadata,
     killed: Arc<AtomicBool>,
+    // Set once the plugin is being stopped, so calls that fail because of it are not crashes
+    stopping: AtomicBool,
     call_timeout: Duration,
 }
 
@@ -76,6 +78,7 @@ impl WasmPlugin {
     }
 
     pub async fn shutdown(&self) {
+        self.stopping.store(true, Ordering::Relaxed);
         let _ = tokio::time::timeout(
             self.call_timeout,
             self.store.shutdown(|_| Box::pin(async { Ok(()) })),
@@ -108,7 +111,9 @@ impl WasmPlugin {
         tokio::select! {
             result = call => {
                 // A trap leaves the store unusable, so the plugin is marked as such
-                if let Err(e) = &result {
+                if let Err(e) = &result
+                    && !self.stopping.load(Ordering::Relaxed)
+                {
                     self.killed.store(true, Ordering::Relaxed);
                     tracing::error!(
                         "Plugin '{}' crashed and has been disabled: {}",
@@ -371,6 +376,7 @@ impl PluginRuntime {
             store: legacy_store,
             metadata: metadata.clone(),
             killed,
+            stopping: AtomicBool::new(false),
             call_timeout: timeout,
         });
 
