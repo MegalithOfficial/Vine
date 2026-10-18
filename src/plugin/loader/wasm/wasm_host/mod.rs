@@ -394,6 +394,7 @@ impl PluginRuntime {
         };
 
         store.data_mut().plugin_name = raw_meta.name;
+        store.data_mut().register_early_translations();
 
         let legacy_store = concurrent_store::start_legacy_store(
             store,

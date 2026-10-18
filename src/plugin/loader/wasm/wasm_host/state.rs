@@ -76,6 +76,8 @@ impl wasmtime::ResourceLimiter for PluginLimiter {
     }
 }
 
+type Translations = Vec<(String, String)>;
+
 pub struct ContextResource {
     pub context: Arc<PluginContext>,
 }
@@ -89,6 +91,8 @@ pub struct PluginHostState {
     pub data_folder: PathBuf,
     pub plugin: Option<Weak<WasmPlugin>>,
     pub killed: Arc<AtomicBool>,
+    // Translations registered before the plugin's name is known, which is their namespace
+    early_translations: Option<Vec<(String, Translations)>>,
 }
 
 impl Default for PluginHostState {
@@ -125,6 +129,27 @@ impl PluginHostState {
             data_folder,
             plugin: None,
             killed: Arc::new(AtomicBool::new(false)),
+            early_translations: Some(Vec::new()),
+        }
+    }
+
+    /// Registers the translations held back until the plugin reported its name
+    pub fn register_early_translations(&mut self) {
+        for (locale, entries) in self.early_translations.take().unwrap_or_default() {
+            self.register_translations_now(locale, entries);
+        }
+    }
+
+    fn register_translations_now(&self, locale: String, entries: Vec<(String, String)>) {
+        if let Err(e) =
+            crate::i18n::register(&crate::i18n::namespace(&self.plugin_name), &locale, entries)
+        {
+            tracing::warn!(
+                "[Plugin: {}] Could not register '{}' translations: {}",
+                self.plugin_name,
+                locale,
+                e
+            );
         }
     }
 
@@ -193,15 +218,9 @@ impl wit::vine::plugin::translation::Host for PluginHostState {
         locale: String,
         entries: Vec<(String, String)>,
     ) -> wasmtime::Result<()> {
-        if let Err(e) =
-            crate::i18n::register(&crate::i18n::namespace(&self.plugin_name), &locale, entries)
-        {
-            tracing::warn!(
-                "[Plugin: {}] Could not register '{}' translations: {}",
-                self.plugin_name,
-                locale,
-                e
-            );
+        match &mut self.early_translations {
+            Some(early) => early.push((locale, entries)),
+            None => self.register_translations_now(locale, entries),
         }
         Ok(())
     }
