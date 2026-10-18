@@ -170,6 +170,12 @@ async fn parse_proxy_v1<R: AsyncRead + Unpin>(
                     format!("Invalid PROXY v1 IP '{}': {}", src_ip_str, e),
                 )
             })?;
+            if ip.is_ipv4() != (proto == "TCP4") || parts.len() != 6 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Malformed PROXY v1 header: '{}'", line),
+                ));
+            }
             let port: u16 = src_port_str.parse().map_err(|e| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
