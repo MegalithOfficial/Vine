@@ -40,8 +40,9 @@ struct CommandRoute {
 type CommandRoutes = Arc<std::sync::RwLock<HashMap<String, CommandRoute>>>;
 
 // Senders with a plugin command still running; each may run one at a time, so spamming
-// commands cannot pile up work or run them out of order
-type RunningCommands = Arc<std::sync::Mutex<std::collections::HashSet<String>>>;
+// commands cannot pile up work or run them out of order. Players are keyed by name, the
+// console by None.
+type RunningCommands = Arc<std::sync::Mutex<std::collections::HashSet<Option<String>>>>;
 
 pub struct PluginManager {
     plugins_dir: PathBuf,
@@ -740,7 +741,7 @@ struct PluginCommandExecutor {
 
 struct RunningGuard {
     running: RunningCommands,
-    sender: String,
+    sender: Option<String>,
 }
 
 impl Drop for RunningGuard {
@@ -798,7 +799,10 @@ impl pumpkin_command::node::CommandExecutor<ProxyCommandSource> for PluginComman
             return Ok(0);
         };
         // Runs on its own task so a slow plugin doesn't hold up the player's connection
-        let sender_name = sender.name.clone();
+        let sender_name = match &context.source.sender {
+            CommandSender::Console => None,
+            CommandSender::Player { username, .. } => Some(username.clone()),
+        };
         if !self
             .running
             .lock()
