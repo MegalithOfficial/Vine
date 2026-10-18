@@ -226,10 +226,14 @@ impl PluginManager {
 
     async fn enable_plugin(&self, plugin: Arc<WasmPlugin>, path: PathBuf) -> Result<(), String> {
         let metadata = plugin.metadata.clone();
-        plugin
-            .on_load(Arc::default())
-            .await
-            .map_err(|e| format!("Plugin '{}' failed to on_load: {}", metadata.name, e))?;
+        if let Err(e) = plugin.on_load(Arc::default()).await {
+            // Whatever it registered before failing would otherwise outlive it
+            self.forget(&plugin, &metadata.name).await;
+            return Err(format!(
+                "Plugin '{}' failed to on_load: {}",
+                metadata.name, e
+            ));
+        }
         info!(
             "Loaded plugin '{}' v{} by {}",
             metadata.name,
@@ -295,6 +299,13 @@ impl PluginManager {
         {
             error!("Error unloading plugin '{}': {}", name, e);
         }
+        self.forget(plugin, name).await;
+        info!("Unloaded plugin '{}'", name);
+        Some(loaded.path)
+    }
+
+    /// Stops a plugin and drops its event handlers and commands
+    async fn forget(&self, plugin: &Arc<WasmPlugin>, name: &str) {
         plugin.shutdown().await;
         for handlers in self.event_handlers.write().await.values_mut() {
             handlers.retain(|handler| !Arc::ptr_eq(&handler.plugin, plugin));
@@ -305,8 +316,6 @@ impl PluginManager {
         if let Some(proxy) = self.proxy_ctx.get() {
             proxy.command_dispatcher.deactivate_source(name);
         }
-        info!("Unloaded plugin '{}'", name);
-        Some(loaded.path)
     }
 
     /// Swaps a plugin for a fresh instance of its file; a file that fails to load leaves the
