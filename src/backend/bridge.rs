@@ -35,8 +35,9 @@ use crate::protocol::packets::login::{
 use crate::protocol::packets::play::{
     ChatAcknowledgement, ChatCommand, ChatMessage, ClientboundPluginMessage,
     CommandSuggestionRequest, CommandSuggestions, InjectedCommand, PlayDisconnect, PlayKeepAlive,
-    PlayKeepAliveResponse, ServerboundPluginMessage, StartConfiguration, Suggestion, SystemChat,
-    Transfer, chat_length_limit, chat_signing, inject_commands, replace_leading_string,
+    PlayKeepAliveResponse, StartConfiguration, Suggestion, SystemChat, Transfer, chat_length_limit,
+    chat_signing, inject_commands, read_plugin_message, replace_leading_string,
+    write_plugin_message,
 };
 use crate::protocol::packets::switch::{Leftovers, join_game_sequence};
 use crate::protocol::text::{component_json, plain_text};
@@ -917,6 +918,38 @@ impl BackendBridge {
         None
     }
 
+    /// Returns false when a plugin cancelled the message.
+    async fn plugin_message_event(
+        plugin_manager: &PluginManager,
+        packet: &mut crate::protocol::RawPacket,
+        version: ProtocolVersion,
+        player_uuid: uuid::Uuid,
+        server_name: &str,
+        source: PluginMessageSource,
+    ) -> bool {
+        let Ok((channel, data)) = read_plugin_message(&mut &packet.payload[..], version) else {
+            return true;
+        };
+        let mut event = PluginMessageEvent {
+            channel: channel.clone(),
+            data: data.clone(),
+            player_uuid: Some(player_uuid.to_string()),
+            server_name: Some(server_name.to_string()),
+            source,
+            cancelled: false,
+        };
+        plugin_manager.fire_plugin_message(&mut event).await;
+        if event.cancelled {
+            return false;
+        }
+        if event.data != data {
+            let mut payload = Vec::new();
+            write_plugin_message(&mut payload, &channel, &event.data, version);
+            packet.payload = payload.into();
+        }
+        true
+    }
+
     async fn notify<W: AsyncWrite + Unpin>(
         &self,
         writer: &mut PacketWriter<W>,
@@ -1134,6 +1167,20 @@ impl BackendBridge {
                             serverbound_transition(current, raw_packet.id, client_version)
                         {
                             phase.set(next);
+                        } else if current == Phase::Config
+                            && PacketKind::ConfigServerboundPluginMessage
+                                .matches(raw_packet.id, client_version)
+                            && !Self::plugin_message_event(
+                                &plugin_manager,
+                                &mut raw_packet,
+                                client_version,
+                                player_uuid,
+                                &current_server_name,
+                                PluginMessageSource::Player,
+                            )
+                            .await
+                        {
+                            continue;
                         } else if current == Phase::Play {
                             if PacketKind::PlayKeepAliveResponse
                                 .matches(raw_packet.id, client_version)
@@ -1276,33 +1323,17 @@ impl BackendBridge {
 
                             if PacketKind::ServerboundPluginMessage
                                 .matches(raw_packet.id, client_version)
-                                && let Ok(custom_payload) = decode_packet::<ServerboundPluginMessage>(
-                                    &raw_packet.payload,
+                                && !Self::plugin_message_event(
+                                    &plugin_manager,
+                                    &mut raw_packet,
                                     client_version,
+                                    player_uuid,
+                                    &current_server_name,
+                                    PluginMessageSource::Player,
                                 )
+                                .await
                             {
-                                let mut msg_event = PluginMessageEvent {
-                                    channel: custom_payload.channel.clone(),
-                                    data: custom_payload.data.clone(),
-                                    player_uuid: Some(player_uuid.to_string()),
-                                    server_name: Some(current_server_name.clone()),
-                                    source: PluginMessageSource::Player,
-                                    cancelled: false,
-                                };
-                                plugin_manager.fire_plugin_message(&mut msg_event).await;
-                                if msg_event.cancelled {
-                                    continue;
-                                }
-                                if msg_event.data != custom_payload.data {
-                                    let rewritten = ServerboundPluginMessage {
-                                        channel: custom_payload.channel,
-                                        data: msg_event.data,
-                                    };
-                                    let mut payload = Vec::new();
-                                    if rewritten.write(&mut payload, client_version).is_ok() {
-                                        raw_packet.payload = payload.into();
-                                    }
-                                }
+                                continue;
                             }
 
                             if PacketKind::CommandSuggestionRequest
@@ -1446,6 +1477,22 @@ impl BackendBridge {
                             return TunnelExit::BackendDisconnected { reason };
                         }
 
+                        if current == Phase::Config
+                            && PacketKind::ConfigClientboundPluginMessage
+                                .matches(raw_packet.id, client_version)
+                            && !Self::plugin_message_event(
+                                &plugin_manager,
+                                &mut raw_packet,
+                                client_version,
+                                player_uuid,
+                                &current_server_name,
+                                PluginMessageSource::Server,
+                            )
+                            .await
+                        {
+                            continue;
+                        }
+
                         if current == Phase::Play {
                             if client_version < ProtocolVersion::V1_20_2
                                 && let Ok(mut leftovers) = leftovers.lock()
@@ -1507,33 +1554,17 @@ impl BackendBridge {
 
                             if PacketKind::ClientboundPluginMessage
                                 .matches(raw_packet.id, client_version)
-                                && let Ok(custom_payload) = decode_packet::<ClientboundPluginMessage>(
-                                    &raw_packet.payload,
+                                && !Self::plugin_message_event(
+                                    &plugin_manager,
+                                    &mut raw_packet,
                                     client_version,
+                                    player_uuid,
+                                    &current_server_name,
+                                    PluginMessageSource::Server,
                                 )
+                                .await
                             {
-                                let mut msg_event = PluginMessageEvent {
-                                    channel: custom_payload.channel.clone(),
-                                    data: custom_payload.data.clone(),
-                                    player_uuid: Some(player_uuid.to_string()),
-                                    server_name: Some(current_server_name.clone()),
-                                    source: PluginMessageSource::Server,
-                                    cancelled: false,
-                                };
-                                plugin_manager.fire_plugin_message(&mut msg_event).await;
-                                if msg_event.cancelled {
-                                    continue;
-                                }
-                                if msg_event.data != custom_payload.data {
-                                    let rewritten = ClientboundPluginMessage {
-                                        channel: custom_payload.channel,
-                                        data: msg_event.data,
-                                    };
-                                    let mut payload = Vec::new();
-                                    if rewritten.write(&mut payload, client_version).is_ok() {
-                                        raw_packet.payload = payload.into();
-                                    }
-                                }
+                                continue;
                             }
 
                             if PacketKind::Commands.matches(raw_packet.id, client_version) {

@@ -88,6 +88,14 @@ pub(super) const PACKET_IDS: &[(PacketKind, &[(u32, i32)])] = &[
     (PacketKind::ConfigKnownPacksResponse, &[(5, -1), (766, 7)]),
     (PacketKind::ConfigAcceptCodeOfConduct, &[(5, -1), (773, 9)]),
     (
+        PacketKind::ConfigServerboundPluginMessage,
+        &[(5, -1), (764, 1), (766, 2)],
+    ),
+    (
+        PacketKind::ConfigClientboundPluginMessage,
+        &[(5, -1), (764, 0), (766, 1)],
+    ),
+    (
         PacketKind::ChatCommand,
         &[(5, -1), (759, 3), (760, 4), (768, 5), (771, 6), (775, 7)],
     ),
@@ -498,6 +506,8 @@ pub(super) const LAYOUT_CHANGES: &[(PacketKind, &[u32])] = &[
     (PacketKind::ConfigPong, &[764]),
     (PacketKind::ConfigKnownPacksResponse, &[]),
     (PacketKind::ConfigAcceptCodeOfConduct, &[773]),
+    (PacketKind::ConfigServerboundPluginMessage, &[764]),
+    (PacketKind::ConfigClientboundPluginMessage, &[764]),
     (PacketKind::ChatCommand, &[759, 760, 761, 766]),
     (PacketKind::SignedChatCommand, &[766, 770, 774, 775]),
     (PacketKind::ChatMessage, &[759, 760, 761, 770]),

@@ -41,6 +41,8 @@ pub enum PacketKind {
     ConfigPong,
     ConfigKnownPacksResponse,
     ConfigAcceptCodeOfConduct,
+    ConfigServerboundPluginMessage,
+    ConfigClientboundPluginMessage,
 
     ChatCommand,
     SignedChatCommand,
@@ -144,6 +146,8 @@ mod tests {
         (PacketKind::ConfigKeepAliveResponse, &[764]),
         (PacketKind::ConfigPong, &[764]),
         (PacketKind::ConfigAcceptCodeOfConduct, &[773]),
+        (PacketKind::ConfigServerboundPluginMessage, &[764]),
+        (PacketKind::ConfigClientboundPluginMessage, &[764]),
         // Read up to the acknowledgement offset, before the parts added later
         (PacketKind::ChatCommand, &[759, 760, 761, 766]),
         (PacketKind::SignedChatCommand, &[766, 770, 774, 775]),

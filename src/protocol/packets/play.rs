@@ -171,7 +171,7 @@ impl Packet for CommandSuggestionRequest {
     }
 }
 
-fn read_plugin_message(
+pub fn read_plugin_message(
     buf: &mut &[u8],
     version: ProtocolVersion,
 ) -> Result<(String, Vec<u8>), ProtocolError> {
@@ -186,32 +186,17 @@ fn read_plugin_message(
     Ok((channel, data))
 }
 
-fn write_plugin_message(buf: &mut Vec<u8>, channel: &str, data: &[u8], version: ProtocolVersion) {
+pub fn write_plugin_message(
+    buf: &mut Vec<u8>,
+    channel: &str,
+    data: &[u8],
+    version: ProtocolVersion,
+) {
     buf.write_string(channel);
     if version < ProtocolVersion::V1_8 {
         buf.write_short_byte_array(data);
     } else {
         buf.extend_from_slice(data);
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct ServerboundPluginMessage {
-    pub channel: String,
-    pub data: Vec<u8>,
-}
-
-impl Packet for ServerboundPluginMessage {
-    const KIND: PacketKind = PacketKind::ServerboundPluginMessage;
-
-    fn read(buf: &mut &[u8], version: ProtocolVersion) -> Result<Self, ProtocolError> {
-        let (channel, data) = read_plugin_message(buf, version)?;
-        Ok(Self { channel, data })
-    }
-
-    fn write(&self, buf: &mut Vec<u8>, version: ProtocolVersion) -> Result<(), ProtocolError> {
-        write_plugin_message(buf, &self.channel, &self.data, version);
-        Ok(())
     }
 }
 
