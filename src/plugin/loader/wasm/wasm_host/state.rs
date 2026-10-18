@@ -22,6 +22,64 @@ pub struct ProxyPluginContext {
     pub plugin_manager: Arc<PluginManager>,
 }
 
+// A pointer per element, so this is about 8 MB of tables
+const MAX_TABLE_ELEMENTS: usize = 1_000_000;
+
+/// Caps what a plugin allocates across all of its memories and tables, not per memory
+pub struct PluginLimiter {
+    memory_limit: usize,
+    memory_used: usize,
+    table_elements: usize,
+    last_growth: usize,
+}
+
+impl PluginLimiter {
+    pub fn new(memory_limit: usize) -> Self {
+        Self {
+            memory_limit,
+            memory_used: 0,
+            table_elements: 0,
+            last_growth: 0,
+        }
+    }
+}
+
+impl wasmtime::ResourceLimiter for PluginLimiter {
+    fn memory_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        let growth = desired.saturating_sub(current);
+        if self.memory_used.saturating_add(growth) > self.memory_limit {
+            return Ok(false);
+        }
+        self.memory_used += growth;
+        self.last_growth = growth;
+        Ok(true)
+    }
+
+    fn memory_grow_failed(&mut self, _error: wasmtime::Error) -> wasmtime::Result<()> {
+        self.memory_used -= std::mem::take(&mut self.last_growth);
+        Ok(())
+    }
+
+    fn table_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        let growth = desired.saturating_sub(current);
+        if self.table_elements.saturating_add(growth) > MAX_TABLE_ELEMENTS {
+            return Ok(false);
+        }
+        self.table_elements += growth;
+        Ok(true)
+    }
+}
+
 pub struct ContextResource {
     pub context: Arc<PluginContext>,
 }
@@ -29,7 +87,7 @@ pub struct ContextResource {
 pub struct PluginHostState {
     pub wasi_ctx: WasiCtx,
     pub resource_table: ResourceTable,
-    pub limits: wasmtime::StoreLimits,
+    pub limits: PluginLimiter,
     pub proxy: Option<ProxyPluginContext>,
     pub plugin_name: String,
     pub data_folder: PathBuf,
@@ -56,7 +114,7 @@ impl PluginHostState {
                 .inherit_stderr()
                 .build(),
             resource_table: ResourceTable::new(),
-            limits: wasmtime::StoreLimitsBuilder::new().build(),
+            limits: PluginLimiter::new(usize::MAX),
             proxy,
             plugin_name,
             data_folder,

@@ -15,7 +15,7 @@ use wasmtime::{Engine, Store, UpdateDeadline};
 
 use crate::plugin::api::{PluginContext, PluginMetadata};
 use concurrent_store::{LegacyStore, LegacySyncReentry, TokioSpawner};
-use state::{PluginHostState, ProxyPluginContext};
+use state::{PluginHostState, PluginLimiter, ProxyPluginContext};
 
 #[derive(Error, Debug)]
 pub enum PluginInitError {
@@ -282,9 +282,7 @@ impl PluginRuntime {
         let _ = fs::create_dir_all(&data_folder);
 
         let mut state = PluginHostState::new(filename, data_folder, proxy);
-        state.limits = wasmtime::StoreLimitsBuilder::new()
-            .memory_size(self.limits.max_memory_bytes)
-            .build();
+        state.limits = PluginLimiter::new(self.limits.max_memory_bytes);
         let killed = state.killed.clone();
         let mut store = Store::new(&self.engine, state);
         store.limiter(|state| &mut state.limits);
