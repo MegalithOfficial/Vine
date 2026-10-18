@@ -1,7 +1,7 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use pumpkin_util::text::TextComponent;
@@ -520,7 +520,7 @@ impl BackendBridge {
         // A switch asked for, or a backend that finished logging in, while the client is still
         // logging in or configuring waits until it is playing
         let mut deferred: Option<String> = None;
-        let mut early: Option<Box<Result<PreparedBackend, BridgeError>>> = None;
+        let mut early: Option<(Instant, Box<Result<PreparedBackend, BridgeError>>)> = None;
         // An exit to handle next without running the tunnel again
         let mut pending_exit: Option<TunnelExit> = None;
         // Set when the current backend is gone, so a waiting switch must finish right away
@@ -598,8 +598,18 @@ impl BackendBridge {
                     if let Some(server_name) = deferred.take() {
                         let _ = action_tx.send(PlayerAction::Connect { server_name });
                     }
-                    if let Some(prepared) = early.take() {
-                        pending_exit = Some(TunnelExit::Prepared(prepared));
+                    if let Some((held_since, prepared)) = early.take() {
+                        // A backend kept waiting this long may have given up on the login, so it
+                        // is logged into again
+                        if prepared.is_ok()
+                            && held_since.elapsed() > HELD_BACKEND_LIMIT
+                            && let Some((server_name, future)) = connecting.as_mut()
+                            && let Some(again) = bridge.prepare_again(server_name)
+                        {
+                            *future = again;
+                        } else {
+                            pending_exit = Some(TunnelExit::Prepared(prepared));
+                        }
                     }
                 }
                 TunnelExit::Connect { server_name } => {
@@ -702,7 +712,7 @@ impl BackendBridge {
                         if let Some((_, future)) = connecting.as_mut() {
                             *future = Box::pin(std::future::pending());
                         }
-                        early = Some(prepared);
+                        early = Some((Instant::now(), prepared));
                         continue;
                     }
                     let Some((server_name, _)) = connecting.take() else {
@@ -785,13 +795,23 @@ impl BackendBridge {
                 TunnelExit::BackendDisconnected { reason } => {
                     // A switch already on its way finishes instead, so a server that stops right
                     // after sending its players elsewhere still delivers them there
-                    if let Some(prepared) = early.take() {
-                        if prepared.is_ok() {
+                    if let Some((held_since, prepared)) = early.take() {
+                        if prepared.is_ok() && held_since.elapsed() <= HELD_BACKEND_LIMIT {
                             backend_gone = true;
                             pending_exit = Some(TunnelExit::Prepared(prepared));
                             continue;
                         }
-                        connecting = None;
+                        // One held too long is logged into again below
+                        let again = connecting.as_ref().and_then(|(server_name, _)| {
+                            prepared
+                                .is_ok()
+                                .then(|| bridge.prepare_again(server_name))
+                                .flatten()
+                        });
+                        match (again, connecting.as_mut()) {
+                            (Some(again), Some((_, future))) => *future = again,
+                            _ => connecting = None,
+                        }
                     }
                     if let Some((_, future)) = connecting.as_mut() {
                         let prepared = future.as_mut().await;
@@ -942,6 +962,15 @@ impl BackendBridge {
         );
 
         Ok(())
+    }
+
+    /// Starts logging into a configured backend again
+    fn prepare_again(&self, server_name: &str) -> Option<Connecting<'_>> {
+        let config = self.proxy_config.servers.get(server_name)?.clone();
+        let server_name = server_name.to_string();
+        Some(Box::pin(async move {
+            self.prepare_backend(&server_name, &config).await
+        }))
     }
 
     /// Logs into another backend and moves the client over to it. On 1.20.2+ the client is sent
@@ -1348,6 +1377,9 @@ impl std::fmt::Debug for PreparedBackend {
         f.write_str("PreparedBackend")
     }
 }
+
+// Backends drop a login that is not acknowledged within about 30 seconds
+const HELD_BACKEND_LIMIT: Duration = Duration::from_secs(20);
 
 type Connecting<'a> =
     std::pin::Pin<Box<dyn Future<Output = Result<PreparedBackend, BridgeError>> + Send + 'a>>;
