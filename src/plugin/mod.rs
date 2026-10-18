@@ -254,7 +254,7 @@ impl PluginManager {
             .load(path, self.proxy_ctx.get().cloned())
             .await
             .map_err(|e| format!("Failed to load plugin '{}': {}", path.display(), e))?;
-        if self.is_loaded(&metadata.name).await {
+        if self.name_taken(&metadata.name, None).await {
             return Err(format!(
                 "Plugin '{}' from '{}' is already loaded",
                 metadata.name,
@@ -288,12 +288,14 @@ impl PluginManager {
         Ok(())
     }
 
-    async fn is_loaded(&self, name: &str) -> bool {
-        self.loaded_plugins
-            .read()
-            .await
-            .iter()
-            .any(|loaded| loaded.plugin.metadata.name == name)
+    /// Returns true if a loaded plugin other than `except` uses this name. Names differing only
+    /// in case or symbols count as the same, since they would share translations.
+    async fn name_taken(&self, name: &str, except: Option<&str>) -> bool {
+        let namespace = crate::i18n::namespace(name);
+        self.loaded_plugins.read().await.iter().any(|loaded| {
+            Some(loaded.plugin.metadata.name.as_str()) != except
+                && crate::i18n::namespace(&loaded.plugin.metadata.name) == namespace
+        })
     }
 
     pub async fn plugin_names(&self) -> Vec<String> {
@@ -377,7 +379,7 @@ impl PluginManager {
             .load(&path, self.proxy_ctx.get().cloned())
             .await
             .map_err(|e| format!("Failed to reload plugin '{}': {}", name, e))?;
-        if metadata.name != name && self.is_loaded(&metadata.name).await {
+        if self.name_taken(&metadata.name, Some(name)).await {
             plugin.shutdown().await;
             return Err(format!(
                 "Plugin '{}' now reports the name '{}', which is already loaded",
