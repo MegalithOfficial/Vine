@@ -30,5 +30,7 @@ EXPOSE 25565
 
 ENTRYPOINT [ "vine" ]
 
+# Checks the port vine.toml binds to, not just the default one
 HEALTHCHECK --interval=30s --timeout=3s --retries=3 \
-    CMD nc -z 127.0.0.1 25565 || exit 1
+    CMD port=$(sed -n 's/^bind_address *= *".*:\([0-9]*\)"/\1/p' /vine/vine.toml | head -n 1); \
+        nc -z 127.0.0.1 "${port:-25565}" || exit 1
