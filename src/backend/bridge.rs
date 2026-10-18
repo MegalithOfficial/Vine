@@ -624,6 +624,19 @@ impl BackendBridge {
                         continue;
                     }
                     let server_name = connect_event.target_server;
+                    if server_name == current_server_name {
+                        self.notify(
+                            &mut client_writer,
+                            &phase,
+                            translate(
+                                self.locale().as_deref(),
+                                "vine.command.server.already_connected",
+                                &[&server_name],
+                            ),
+                        )
+                        .await;
+                        continue;
+                    }
 
                     let Some(target_config) = self.proxy_config.servers.get(&server_name).cloned()
                     else {
