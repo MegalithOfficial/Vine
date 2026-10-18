@@ -231,7 +231,6 @@ impl WasmPlugin {
 pub struct PluginRuntime {
     engine: Engine,
     linker: Linker<PluginHostState>,
-    reentry: LegacySyncReentry,
     spawner: Arc<TokioSpawner>,
     limits: PluginLimits,
 }
@@ -258,13 +257,11 @@ impl PluginRuntime {
             })
             .map_err(|e| PluginInitError::EngineCreationFailed(wasmtime::Error::msg(e)))?;
         let linker = setup_linker(&engine).map_err(PluginInitError::LinkerSetupFailed)?;
-        let reentry = LegacySyncReentry::new();
         let spawner = Arc::new(TokioSpawner::new(tokio::runtime::Handle::current()));
 
         Ok(Self {
             engine,
             linker,
-            reentry,
             spawner,
             limits,
         })
@@ -277,6 +274,9 @@ impl PluginRuntime {
     ) -> Result<(Arc<WasmPlugin>, PluginMetadata), PluginInitError> {
         let wasm_bytes =
             fs::read(path).map_err(|e| PluginInitError::FileReadFailed(path.to_path_buf(), e))?;
+        // Each plugin gets its own gate: no host call runs another plugin, so they never need to
+        // take turns, and a slow or stuck plugin cannot hold up the others
+        let reentry = LegacySyncReentry::new();
 
         let component = Component::new(&self.engine, &wasm_bytes)
             .map_err(PluginInitError::ComponentCompilationFailed)?;
@@ -320,8 +320,7 @@ impl PluginRuntime {
 
         let plugin = tokio::time::timeout(
             timeout,
-            self.reentry
-                .scope_bootstrap(plugin_pre.instantiate_async(&mut store)),
+            reentry.scope_bootstrap(plugin_pre.instantiate_async(&mut store)),
         )
         .await
         .map_err(|_| PluginInitError::InitTimedOut(timeout))?
@@ -330,7 +329,7 @@ impl PluginRuntime {
         tokio::time::timeout(
             timeout,
             store.run_concurrent(async |accessor| {
-                self.reentry
+                reentry
                     .scope_bootstrap(plugin.call_init_plugin(accessor))
                     .await
             }),
@@ -343,7 +342,7 @@ impl PluginRuntime {
         let raw_meta = tokio::time::timeout(
             timeout,
             store.run_concurrent(async |accessor| {
-                self.reentry
+                reentry
                     .scope_bootstrap(plugin.call_get_metadata(accessor))
                     .await
             }),
@@ -365,7 +364,7 @@ impl PluginRuntime {
 
         let legacy_store = concurrent_store::start_legacy_store(
             store,
-            self.reentry.clone(),
+            reentry,
             Arc::clone(&self.spawner) as Arc<dyn pumpkin_plugin_runtime::RuntimeSpawner>,
         )
         .await
