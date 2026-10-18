@@ -289,12 +289,13 @@ impl PluginRuntime {
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
-        // Kept next to the plugin files, so it follows plugins.plugin_dir
+        // Kept next to the plugin files, so it follows plugins.plugin_dir. The folder name is
+        // cleaned up so a file like "...wasm" cannot point it at ".." or "."
         let data_folder = path
             .parent()
             .unwrap_or(Path::new("."))
             .join("data")
-            .join(&filename);
+            .join(crate::i18n::namespace(&filename));
         let _ = fs::create_dir_all(&data_folder);
 
         let mut state = PluginHostState::new(filename, data_folder, proxy);
