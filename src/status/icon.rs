@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
 use base64::prelude::*;
-use tracing::{debug, info};
+use tracing::{info, warn};
 
 pub const PNG_SIGNATURE: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
 
@@ -89,6 +89,9 @@ pub struct StatusIconManager {
     forced_hosts: HashMap<String, String>,
     default_server: String,
     cache: RwLock<HashMap<PathBuf, StatusIcon>>,
+    // Files that failed to load, by modification time, so a bad icon is read and reported
+    // once instead of on every ping
+    failed: RwLock<HashMap<PathBuf, Option<SystemTime>>>,
 }
 
 impl StatusIconManager {
@@ -114,6 +117,7 @@ impl StatusIconManager {
             forced_hosts,
             default_server,
             cache: RwLock::new(HashMap::new()),
+            failed: RwLock::new(HashMap::new()),
         };
 
         manager.preload_all();
@@ -175,16 +179,31 @@ impl StatusIconManager {
             }
         }
 
+        let mtime = fs::metadata(path).and_then(|m| m.modified()).ok();
+        if self
+            .failed
+            .read()
+            .is_ok_and(|failed| failed.get(path) == Some(&mtime))
+        {
+            return None;
+        }
+
         match StatusIcon::load_from_file(path) {
             Ok(icon) => {
                 let uri = icon.data_uri.clone();
                 if let Ok(mut cache) = self.cache.write() {
                     cache.insert(path.to_path_buf(), icon);
                 }
+                if let Ok(mut failed) = self.failed.write() {
+                    failed.remove(path);
+                }
                 Some(uri)
             }
             Err(e) => {
-                debug!("Could not load status icon '{}': {}", path.display(), e);
+                warn!("Could not load status icon '{}': {}", path.display(), e);
+                if let Ok(mut failed) = self.failed.write() {
+                    failed.insert(path.to_path_buf(), mtime);
+                }
                 None
             }
         }

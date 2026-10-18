@@ -145,7 +145,11 @@ impl StatusHandler {
         let mut json = serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string());
         // Clients reject a status response longer than this, so the icon is the first to go
         if json.encode_utf16().count() > MAX_STATUS_LEN && status.favicon.is_some() {
-            warn!("The status response is too long for clients; sending it without the icon");
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                warn!("The status response is too long for clients; sending it without the icon");
+            }
             json = serde_json::to_string(&StatusJson {
                 favicon: None,
                 ..status
