@@ -51,6 +51,9 @@ pub enum ClientError {
     Timeout,
 }
 
+// Covers the handshake, status and every login packet a client sends, profile keys included
+pub const LOGIN_PACKET_LIMIT: usize = 8 * 1024;
+
 type ClientReader = PacketReader<PrefixedRead<OwnedReadHalf>>;
 type ClientWriter = PacketWriter<OwnedWriteHalf>;
 
@@ -102,6 +105,7 @@ impl ClientHandler {
     ) -> Result<(), ClientError> {
         let (read_half, write_half) = stream.into_split();
         let mut reader = PacketReader::new(PrefixedRead::new(read_half, leftover_bytes));
+        reader.set_limits(LOGIN_PACKET_LIMIT, LOGIN_PACKET_LIMIT);
         let mut writer = PacketWriter::new(write_half);
 
         let handshake_timeout =
@@ -518,6 +522,8 @@ impl ClientHandler {
                 self.config.server.compression_level as u32,
             );
         }
+        let max_packet = self.config.security.max_packet_size;
+        reader.set_limits(max_packet, max_packet);
 
         let (server_name, backend_cfg) = match self.router.resolve_server(&virtual_host) {
             Some(res) => res,

@@ -263,7 +263,8 @@ pub struct SecurityConfig {
     pub connection_burst: u32,
     /// Maximum packets per second from a single client before being kicked for flooding
     pub max_packets_per_sec: u32,
-    /// Maximum raw packet size allowed in bytes (default 2MB)
+    /// Maximum packet size a logged-in client may send, in bytes, both on the wire and once
+    /// inflated (default 2MB; the wire size is capped at the protocol maximum of 2097151)
     pub max_packet_size: usize,
     /// Enforce strict Minecraft username validation (^[a-zA-Z0-9_]{2,16}$)
     pub validate_usernames: bool,
@@ -568,6 +569,12 @@ impl Config {
         let security = &self.security;
         if security.max_packets_per_sec == 0 {
             return Err("security.max_packets_per_sec must be at least 1".to_string());
+        }
+        if security.max_packet_size < crate::client::LOGIN_PACKET_LIMIT {
+            return Err(format!(
+                "security.max_packet_size must be at least {}",
+                crate::client::LOGIN_PACKET_LIMIT
+            ));
         }
         if security.rate_limit_enabled
             && (security.max_connections_per_sec == 0 || security.connection_burst == 0)
