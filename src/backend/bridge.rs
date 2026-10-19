@@ -554,6 +554,7 @@ impl BackendBridge {
             message: None,
             stalled: None,
             served,
+            stale_before: 0,
             plugin_events: None,
             _client_reader: client_reader,
         };
@@ -894,6 +895,8 @@ struct Tunnel {
     stalled: Option<Bytes>,
     // The backend the client's packets go to; changing it drops answers worked out for the last one
     served: watch::Sender<Served>,
+    // Configuration packets the client sent while an earlier backend was current are not passed on
+    stale_before: u64,
     // Plugins hear about connections in order, without holding up the tunnel
     plugin_events: Option<tokio::task::JoinHandle<()>>,
     _client_reader: Task,
@@ -1028,6 +1031,7 @@ impl Tunnel {
                 if let Some(completion) = completion {
                     self.suggesting.expect(completion, served);
                 }
+                let sent_in = self.link;
                 if let Some(next) = entered {
                     self.link = match next {
                         Phase::Login => Link::Login,
@@ -1040,7 +1044,14 @@ impl Tunnel {
                 {
                     return self.acknowledged();
                 }
-                self.forward(packet)?;
+                if sent_in == Link::Config && served < self.stale_before {
+                    debug!(
+                        "Dropping a configuration packet from '{}' meant for a previous backend",
+                        self.session.username
+                    );
+                } else {
+                    self.forward(packet)?;
+                }
                 if entered == Some(Phase::Play) {
                     return self.reached_play();
                 }
@@ -1424,8 +1435,12 @@ impl Tunnel {
             Link::Reconfiguring | Link::Login => {
                 AckClock::Until(tokio::time::Instant::now() + SWITCH_ACK_TIMEOUT)
             }
-            // Only reached with the current backend gone
-            Link::Config => return self.configure(target, prepared),
+            // Only reached with the current backend gone: what the client sent in this
+            // configuration phase until now was meant for it
+            Link::Config => {
+                self.stale_before = self.generation() + 1;
+                return self.configure(target, prepared);
+            }
         };
         if let (Some(packet), Conn::Open(open)) = (self.stalled.take(), &self.backend.conn) {
             let _ = open.writes.try_send(packet);
