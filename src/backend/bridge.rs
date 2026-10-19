@@ -1,6 +1,7 @@
+use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -9,7 +10,7 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
@@ -46,7 +47,7 @@ use crate::protocol::{
     encode_packet,
 };
 use crate::security::PacketRateLimiter;
-use crate::session::{PlayerAction, SessionManager, send_reliably};
+use crate::session::{PlayerAction, SessionManager};
 
 #[derive(Error, Debug)]
 pub enum BridgeError {
@@ -68,22 +69,6 @@ pub enum BridgeError {
     VelocityError(String),
     #[error("Vine forwarding error: {0}")]
     VineError(String),
-}
-
-#[derive(Debug)]
-enum TunnelExit {
-    /// Client disconnected or connection closed
-    ClientDisconnected,
-    /// Player requested switch to another backend server
-    Connect { server_name: String },
-    /// Backend server closed connection or sent disconnect/kick
-    BackendDisconnected { reason: Option<String> },
-    /// The proxy kicked the player
-    Kicked { reason: String },
-    /// The backend being switched to finished logging in, or failed to
-    Prepared(Box<Result<PreparedBackend, BridgeError>>),
-    /// The client finished configuring while a switch was waiting for it
-    ReachedPlay,
 }
 
 type BackendReader = PacketReader<OwnedReadHalf>;
@@ -368,7 +353,7 @@ impl BackendBridge {
         client_reader: PacketReader<R>,
         mut client_writer: PacketWriter<W>,
         action_tx: mpsc::Sender<PlayerAction>,
-        mut action_rx: mpsc::Receiver<PlayerAction>,
+        action_rx: mpsc::Receiver<PlayerAction>,
     ) -> Result<(), BridgeError>
     where
         R: AsyncRead + Unpin + Send + 'static,
@@ -505,470 +490,161 @@ impl BackendBridge {
         self.session_manager
             .update_server(&self.player.username, &current_server_name);
 
-        let (client_tx, client_rx) = ClientQueue::new();
+        let bridge = Arc::new(self);
+        let (client_out, client_rx) = ClientQueue::new();
         let writer = Task::spawn(write_client(
             client_writer,
             client_rx,
-            client_tx.budget.clone(),
-            self.player.username.clone(),
+            client_out.budget.clone(),
+            bridge.player.username.clone(),
         ));
-        let shared = Arc::new(Shared {
-            username: self.player.username.clone(),
-            uuid: self.player.id,
-            version: self.client_version,
-            plugin_manager: self.plugin_manager.clone(),
-            session_manager: self.session_manager.clone(),
-            command_dispatcher: self.command_dispatcher.clone(),
-            proxy_config: self.proxy_config.clone(),
-            action_tx: action_tx.clone(),
-            client_tx,
-            phase: PhaseCell::new(if self.client_version >= ProtocolVersion::V1_20_2 {
-                Phase::Login
-            } else {
-                Phase::Play
-            }),
-            served: watch::Sender::new(current_server_name.clone()),
-            keep_alive_challenge: std::sync::Mutex::new(None),
-            leftovers: std::sync::Mutex::new(Leftovers::default()),
-            client_settings: std::sync::Mutex::new(ClientSettings::default()),
-            suggesting: std::sync::Mutex::new(Suggesting::default()),
-            pending_suggestions: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        let session = Arc::new(Session {
+            username: bridge.player.username.clone(),
+            uuid: bridge.player.id,
+            version: bridge.client_version,
+            plugin_manager: bridge.plugin_manager.clone(),
+            session_manager: bridge.session_manager.clone(),
+            command_dispatcher: bridge.command_dispatcher.clone(),
+            proxy_config: bridge.proxy_config.clone(),
+            action_tx,
+            client_out: client_out.clone(),
         });
-        let (client_events_tx, mut client_events) = mpsc::channel(CLIENT_EVENTS);
-        let _client_reader = Task::spawn(read_client(
-            shared.clone(),
+        let (served, served_rx) = watch::channel(Served {
+            generation: 0,
+            name: current_server_name.clone(),
+        });
+        let (client_events_tx, client_events) = mpsc::channel(CLIENT_EVENTS);
+        let client_reader = Task::spawn(read_client(
+            session.clone(),
             client_reader,
-            PacketRateLimiter::new(self.max_packets_per_sec),
+            PacketRateLimiter::new(bridge.max_packets_per_sec),
+            served_rx,
             client_events_tx,
         ));
-        let mut backend = Backend::start(
-            &shared,
+        let link = if bridge.client_version >= ProtocolVersion::V1_20_2 {
+            Link::Login
+        } else {
+            Link::Play
+        };
+        let backend = Backend::start(
+            &session,
             backend_reader,
             backend_writer,
-            &current_server_name,
+            current_server_name,
+            // A backend sends configuration right after its LoginSuccess
+            match link {
+                Link::Login => Phase::Config,
+                _ => Phase::Play,
+            },
+            Vec::new(),
         );
-        let client_tx = &shared.client_tx;
-        let phase = &shared.phase;
-        let bridge = &self;
-        let mut connecting: Option<(String, Connecting<'_>)> = None;
-        // A switch asked for, or a backend that finished logging in, while the client is still
-        // logging in or configuring waits until it is playing
-        let mut deferred: Option<String> = None;
-        let mut early: Option<(Instant, Box<Result<PreparedBackend, BridgeError>>)> = None;
-        // An exit to handle next without running the tunnel again
-        let mut pending_exit: Option<TunnelExit> = None;
-        // Set when the current backend is gone, so a waiting switch must finish right away
-        let mut backend_gone = false;
-        let mut carried = Carried::default();
+        let mut tunnel = Tunnel {
+            bridge: bridge.clone(),
+            session,
+            link,
+            switch: Switch::Idle,
+            backend,
+            keep_alive: None,
+            leftovers: Leftovers::default(),
+            client_settings: ClientSettings::default(),
+            suggesting: Suggesting::default(),
+            client_out,
+            client_events,
+            actions: action_rx,
+            message: None,
+            stalled: None,
+            served,
+            plugin_events: None,
+            _client_reader: client_reader,
+        };
 
-        loop {
-            let tunnel_res = if let Some(exit) = pending_exit.take() {
-                Ok(exit)
-            } else {
-                Self::bridge_tunnel(
-                    &shared,
-                    &mut client_events,
-                    &mut backend,
-                    &mut action_rx,
-                    connecting.as_mut().map(|(_, future)| future),
-                    deferred.is_some() || early.is_some(),
-                    &mut carried,
-                )
-                .await
-            };
-
-            let exit = match tunnel_res {
-                Ok(exit) => exit,
-                Err(e) => {
-                    warn!(
-                        "Bridge tunnel error for player '{}': {}",
-                        self.player.username, e
-                    );
-                    TunnelExit::BackendDisconnected {
-                        reason: Some(e.to_string()),
-                    }
-                }
-            };
-
-            match exit {
-                TunnelExit::Kicked { reason } => {
-                    info!("Kicking player '{}': {}", self.player.username, reason);
-                    self.disconnect_client(writer, client_tx, phase.backend(), &reason)
-                        .await;
-                    break;
-                }
-                TunnelExit::ClientDisconnected => {
-                    debug!(
-                        "Player '{}' disconnected from client side",
-                        self.player.username
-                    );
-                    break;
-                }
-                TunnelExit::ReachedPlay => {
-                    if let Some(server_name) = deferred.take() {
-                        send_reliably(&action_tx, PlayerAction::Connect { server_name });
-                    }
-                    if let Some((held_since, prepared)) = early.take() {
-                        // A backend kept waiting this long may have given up on the login, so it
-                        // is logged into again
-                        if prepared.is_ok()
-                            && held_since.elapsed() > HELD_BACKEND_LIMIT
-                            && let Some((server_name, future)) = connecting.as_mut()
-                            && let Some(again) = bridge.prepare_again(server_name)
-                        {
-                            *future = again;
-                        } else {
-                            pending_exit = Some(TunnelExit::Prepared(prepared));
-                        }
-                    }
-                }
-                TunnelExit::Connect { server_name } => {
-                    if phase.backend() != Phase::Play {
-                        deferred = Some(server_name);
-                        continue;
-                    }
-                    if connecting.is_some() {
-                        self.notify(
-                            client_tx,
-                            phase,
-                            translate(
-                                self.locale().as_deref(),
-                                "vine.server.already_connecting",
-                                &[],
-                            ),
-                        );
-                        continue;
-                    }
-                    info!(
-                        "Switching player '{}' to backend server '{}'...",
-                        self.player.username, server_name
-                    );
-
-                    let mut connect_event = ServerConnectEvent {
-                        uuid: self.player.id.to_string(),
-                        username: self.player.username.clone(),
-                        current_server: Some(current_server_name.clone()),
-                        target_server: server_name.clone(),
-                        cancelled: false,
-                        cancel_reason: None,
-                    };
-                    self.plugin_manager
-                        .fire_server_connect(&mut connect_event)
-                        .await;
-                    if connect_event.cancelled {
-                        let reason = connect_event.cancel_reason.unwrap_or_else(|| {
-                            translate(
-                                self.locale().as_deref(),
-                                "vine.plugin.cancelled_switch",
-                                &[],
-                            )
-                        });
-                        self.notify(
-                            client_tx,
-                            phase,
-                            translate(
-                                self.locale().as_deref(),
-                                "vine.server.switch_cancelled",
-                                &[&reason],
-                            ),
-                        );
-                        continue;
-                    }
-                    let server_name = connect_event.target_server;
-                    if server_name == current_server_name {
-                        self.notify(
-                            client_tx,
-                            phase,
-                            translate(
-                                self.locale().as_deref(),
-                                "vine.command.server.already_connected",
-                                &[&server_name],
-                            ),
-                        );
-                        continue;
-                    }
-
-                    let Some(target_config) = self.proxy_config.servers.get(&server_name).cloned()
-                    else {
-                        self.notify(
-                            client_tx,
-                            phase,
-                            translate(
-                                self.locale().as_deref(),
-                                "vine.server.unknown",
-                                &[&server_name],
-                            ),
-                        );
-                        continue;
-                    };
-
-                    let target = server_name.clone();
-                    connecting = Some((
-                        server_name,
-                        Box::pin(
-                            async move { bridge.prepare_backend(&target, &target_config).await },
-                        ),
-                    ));
-                }
-                TunnelExit::Prepared(prepared) => {
-                    let gone = std::mem::take(&mut backend_gone);
-                    if phase.backend() != Phase::Play && !gone {
-                        // Keep the slot taken so another switch waits; the result is replayed
-                        // once the client is playing
-                        if let Some((_, future)) = connecting.as_mut() {
-                            *future = Box::pin(std::future::pending());
-                        }
-                        early = Some((Instant::now(), prepared));
-                        continue;
-                    }
-                    let Some((server_name, _)) = connecting.take() else {
-                        continue;
-                    };
-                    let switched = match *prepared {
-                        Ok(prepared) => {
-                            self.finish_switch(
-                                &shared,
-                                &mut client_events,
-                                &mut backend,
-                                &server_name,
-                                prepared,
-                            )
-                            .await
-                        }
-                        Err(e) => Err(SwitchError::Unreachable(e)),
-                    };
-                    match switched {
-                        Ok(next) => {
-                            backend = next;
-                            current_server_name = server_name;
-                            self.session_manager
-                                .update_server(&self.player.username, &current_server_name);
-                            info!(
-                                "Player '{}' successfully switched to '{}'",
-                                self.player.username, current_server_name
-                            );
-                            let connected_event = ServerConnectedEvent {
-                                uuid: self.player.id.to_string(),
-                                username: self.player.username.clone(),
-                                server_name: current_server_name.clone(),
-                            };
-                            self.plugin_manager
-                                .fire_server_connected(&connected_event)
-                                .await;
-                        }
-                        Err(SwitchError::Unreachable(e)) => {
-                            warn!(
-                                "Failed to switch player '{}' to '{}': {}",
-                                self.player.username, server_name, e
-                            );
-                            self.notify(
-                                client_tx,
-                                phase,
-                                translate(
-                                    self.locale().as_deref(),
-                                    "vine.server.connect_failed",
-                                    &[&server_name, &e],
-                                ),
-                            );
-                        }
-                        Err(SwitchError::Fatal(e)) => {
-                            warn!(
-                                "Lost player '{}' while switching to '{}': {}",
-                                self.player.username, server_name, e
-                            );
-                            self.disconnect_client(
-                                writer,
-                                client_tx,
-                                phase.backend(),
-                                &translate(
-                                    self.locale().as_deref(),
-                                    "vine.server.switch_failed",
-                                    &[&server_name],
-                                ),
-                            )
-                            .await;
-                            break;
-                        }
-                    }
-                }
-                TunnelExit::BackendDisconnected { reason } => {
-                    // A switch already on its way finishes instead, so a server that stops right
-                    // after sending its players elsewhere still delivers them there
-                    if let Some((held_since, prepared)) = early.take() {
-                        if prepared.is_ok() && held_since.elapsed() <= HELD_BACKEND_LIMIT {
-                            backend_gone = true;
-                            pending_exit = Some(TunnelExit::Prepared(prepared));
-                            continue;
-                        }
-                        // One held too long is logged into again below
-                        let again = connecting.as_ref().and_then(|(server_name, _)| {
-                            prepared
-                                .is_ok()
-                                .then(|| bridge.prepare_again(server_name))
-                                .flatten()
-                        });
-                        match (again, connecting.as_mut()) {
-                            (Some(again), Some((_, future))) => *future = again,
-                            _ => connecting = None,
-                        }
-                    }
-                    if let Some((_, future)) = connecting.as_mut() {
-                        let prepared = future.as_mut().await;
-                        if prepared.is_ok() {
-                            backend_gone = true;
-                            pending_exit = Some(TunnelExit::Prepared(Box::new(prepared)));
-                            continue;
-                        }
-                        connecting = None;
-                    }
-                    deferred = None;
-                    warn!(
-                        "Backend server '{}' disconnected player '{}': {:?}",
-                        current_server_name, self.player.username, reason
-                    );
-                    let reason = reason.unwrap_or_else(|| {
-                        translate(self.locale().as_deref(), "vine.server.lost_connection", &[])
-                    });
-
-                    let fallback = self
-                        .fallback_server
-                        .clone()
-                        .filter(|(fb_name, _)| fb_name != &current_server_name);
-                    let Some((fb_name, fb_cfg)) = fallback else {
-                        self.disconnect_client(writer, client_tx, phase.backend(), &reason)
-                            .await;
-                        break;
-                    };
-
-                    // Plugins see this move like any other; with the old backend gone a cancelled
-                    // one ends the session, and a different target must be a configured server
-                    let mut connect_event = ServerConnectEvent {
-                        uuid: self.player.id.to_string(),
-                        username: self.player.username.clone(),
-                        current_server: Some(current_server_name.clone()),
-                        target_server: fb_name.clone(),
-                        cancelled: false,
-                        cancel_reason: None,
-                    };
-                    self.plugin_manager
-                        .fire_server_connect(&mut connect_event)
-                        .await;
-                    if connect_event.cancelled {
-                        let reason = connect_event.cancel_reason.unwrap_or(reason);
-                        self.disconnect_client(writer, client_tx, phase.backend(), &reason)
-                            .await;
-                        break;
-                    }
-                    let (fb_name, fb_cfg) =
-                        match self.proxy_config.servers.get(&connect_event.target_server) {
-                            Some(cfg) if connect_event.target_server != fb_name => {
-                                (connect_event.target_server, cfg.clone())
-                            }
-                            _ => (fb_name, fb_cfg),
-                        };
-
-                    info!(
-                        "Rerouting player '{}' to fallback server '{}' (kicked from '{}': {})",
-                        self.player.username, fb_name, current_server_name, reason
-                    );
-                    self.notify(
-                        client_tx,
-                        phase,
-                        translate(
-                            self.locale().as_deref(),
-                            "vine.server.fallback",
-                            &[&fb_name, &reason],
-                        ),
-                    );
-
-                    match self
-                        .switch_backend(
-                            &shared,
-                            &mut client_events,
-                            &mut backend,
-                            &fb_name,
-                            &fb_cfg,
-                        )
-                        .await
-                    {
-                        Ok(next) => {
-                            backend = next;
-                            current_server_name = fb_name;
-                            self.session_manager
-                                .update_server(&self.player.username, &current_server_name);
-                            info!(
-                                "Player '{}' successfully recovered to fallback '{}'",
-                                self.player.username, current_server_name
-                            );
-                            let connected_event = ServerConnectedEvent {
-                                uuid: self.player.id.to_string(),
-                                username: self.player.username.clone(),
-                                server_name: current_server_name.clone(),
-                            };
-                            self.plugin_manager
-                                .fire_server_connected(&connected_event)
-                                .await;
-                        }
-                        Err(SwitchError::Unreachable(e) | SwitchError::Fatal(e)) => {
-                            warn!(
-                                "Failed to connect player '{}' to fallback server '{}': {}",
-                                self.player.username, fb_name, e
-                            );
-                            self.disconnect_client(
-                                writer,
-                                client_tx,
-                                phase.backend(),
-                                &translate(
-                                    self.locale().as_deref(),
-                                    "vine.server.fallback_failed",
-                                    &[&current_server_name, &e],
-                                ),
-                            )
-                            .await;
-                            break;
-                        }
-                    }
-                }
+        match tunnel.run().await {
+            End::Kicked(reason) => {
+                info!(
+                    "Disconnecting player '{}': {}",
+                    bridge.player.username, reason
+                );
+                tunnel.disconnect_client(writer, &reason).await;
             }
+            End::Closed => debug!(
+                "Player '{}' disconnected from client side",
+                bridge.player.username
+            ),
         }
+        let last_server = tunnel.backend.name.clone();
+        let plugin_events = tunnel.plugin_events.take();
+        drop(tunnel);
+        if let Some(events) = plugin_events {
+            let _ = events.await;
+        }
+        bridge.fire_disconnect(Some(last_server)).await;
 
-        self.fire_disconnect(Some(current_server_name)).await;
-
-        self.online_players.fetch_sub(1, Ordering::Relaxed);
+        bridge.online_players.fetch_sub(1, Ordering::Relaxed);
         info!(
             "Player '{}' disconnected from proxy. Online players: {}",
-            self.player.username,
-            self.online_players.load(Ordering::Relaxed)
+            bridge.player.username,
+            bridge.online_players.load(Ordering::Relaxed)
         );
 
         Ok(())
     }
 
-    /// Starts logging into a configured backend again
-    fn prepare_again(&self, server_name: &str) -> Option<Connecting<'_>> {
-        let config = self.proxy_config.servers.get(server_name)?.clone();
-        let server_name = server_name.to_string();
-        Some(Box::pin(async move {
-            self.prepare_backend(&server_name, &config).await
-        }))
+    /// Tells plugins about a switch the player asked for, then logs into its target
+    async fn switch_job(self: Arc<Self>, current: String, target: String) -> Connected {
+        let mut event = ServerConnectEvent {
+            uuid: self.player.id.to_string(),
+            username: self.player.username.clone(),
+            current_server: Some(current.clone()),
+            target_server: target,
+            cancelled: false,
+            cancel_reason: None,
+        };
+        self.plugin_manager.fire_server_connect(&mut event).await;
+        if event.cancelled {
+            return Connected::Cancelled(event.cancel_reason);
+        }
+        let target = event.target_server;
+        if target == current {
+            return Connected::AlreadyThere(target);
+        }
+        let Some(config) = self.proxy_config.servers.get(&target).cloned() else {
+            return Connected::Unknown(target);
+        };
+        let prepared = self.prepare_backend(&target, &config).await;
+        Connected::Prepared(target, prepared)
     }
 
-    /// Logs into another backend and moves the client over to it. On 1.20.2+ the client is sent
-    /// back into the configuration phase so the new backend can configure it from scratch.
-    async fn switch_backend(
-        &self,
-        shared: &Arc<Shared>,
-        client_events: &mut mpsc::Receiver<ClientEvent>,
-        old_backend: &mut Backend,
-        server_name: &str,
-        config: &BackendConfig,
-    ) -> Result<Backend, SwitchError> {
-        let prepared = self
-            .prepare_backend(server_name, config)
-            .await
-            .map_err(SwitchError::Unreachable)?;
-        self.finish_switch(shared, client_events, old_backend, server_name, prepared)
-            .await
+    /// Plugins see a move to the fallback server like any other; with the old backend gone a
+    /// cancelled one ends the session, and a different target must be a configured server
+    async fn fallback_job(
+        self: Arc<Self>,
+        current: String,
+        target: String,
+        config: BackendConfig,
+    ) -> Connected {
+        let mut event = ServerConnectEvent {
+            uuid: self.player.id.to_string(),
+            username: self.player.username.clone(),
+            current_server: Some(current),
+            target_server: target.clone(),
+            cancelled: false,
+            cancel_reason: None,
+        };
+        self.plugin_manager.fire_server_connect(&mut event).await;
+        if event.cancelled {
+            return Connected::Cancelled(event.cancel_reason);
+        }
+        let (target, config) = match self.proxy_config.servers.get(&event.target_server) {
+            Some(cfg) if event.target_server != target => (event.target_server, cfg.clone()),
+            _ => (target, config),
+        };
+        let prepared = self.prepare_backend(&target, &config).await;
+        Connected::Prepared(target, prepared)
+    }
+
+    async fn prepare_job(self: Arc<Self>, target: String, config: BackendConfig) -> Connected {
+        let prepared = self.prepare_backend(&target, &config).await;
+        Connected::Prepared(target, prepared)
     }
 
     /// Logs in to the next backend without touching the client, so the current one keeps running
@@ -976,7 +652,7 @@ impl BackendBridge {
         &self,
         server_name: &str,
         config: &BackendConfig,
-    ) -> Result<PreparedBackend, BridgeError> {
+    ) -> Result<Box<PreparedBackend>, BridgeError> {
         let (mut reader, writer, _) = self.login_backend(server_name, config).await?;
         let version = self.client_version;
         let join_game = if version < ProtocolVersion::V1_20_2 {
@@ -1001,135 +677,11 @@ impl BackendBridge {
         } else {
             None
         };
-        Ok(PreparedBackend {
+        Ok(Box::new(PreparedBackend {
             reader,
             writer,
             join_game,
-        })
-    }
-
-    /// Moves the client over to a backend that `prepare_backend` already logged in to
-    async fn finish_switch(
-        &self,
-        shared: &Arc<Shared>,
-        client_events: &mut mpsc::Receiver<ClientEvent>,
-        old_backend: &mut Backend,
-        server_name: &str,
-        prepared: PreparedBackend,
-    ) -> Result<Backend, SwitchError> {
-        let PreparedBackend {
-            reader: backend_reader,
-            writer: mut backend_writer,
-            join_game,
-        } = prepared;
-        let version = self.client_version;
-        let client_tx = &shared.client_tx;
-        let phase = &shared.phase;
-        old_backend.stop_reading().await;
-        shared.served.send_replace(server_name.to_string());
-        if let Some((mut pending, join_game)) = join_game {
-            let joining = join_game_sequence(&join_game, version).unwrap_or_else(|e| {
-                debug!(
-                    "Forwarding JoinGame from '{}' unchanged: {}",
-                    server_name, e
-                );
-                vec![join_game.to_bytes()]
-            });
-            {
-                let mut leftovers = shared
-                    .leftovers
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                pending.extend(leftovers.clear_players(version));
-                pending.extend(joining);
-                pending.extend(leftovers.clear_overlays(version));
-            }
-            if !client_tx.push(pending) {
-                return Err(SwitchError::Fatal(client_timeout()));
-            }
-            return Ok(Backend::start(
-                shared,
-                backend_reader,
-                backend_writer,
-                server_name,
-            ));
-        }
-
-        let awaited = match phase.get() {
-            // The old backend already asked for reconfiguration, so the client is about to
-            // acknowledge that one
-            Phase::Play if phase.backend() == Phase::Config => true,
-            Phase::Play => {
-                let start = encode_packet(&StartConfiguration, version)
-                    .map_err(|e| SwitchError::Fatal(e.into()))?;
-                // The client's wait for its acknowledgement starts once it has the request
-                if !client_tx.push([start]) || !client_tx.written().await {
-                    return Err(SwitchError::Fatal(client_timeout()));
-                }
-                phase.backend_started_configuration();
-                true
-            }
-            Phase::Login => true,
-            Phase::Config => false,
-        };
-
-        if awaited {
-            // Packets the client sends before acknowledging, plugin events and all, still go to the
-            // old backend; a kick over one of them is moot as that backend is left right after
-            let acknowledged = async {
-                loop {
-                    let packet = match client_events.recv().await {
-                        Some(ClientEvent::Packet {
-                            entered: Some(Phase::Config),
-                            ..
-                        }) => return true,
-                        Some(ClientEvent::Packet { packet, .. }) => packet,
-                        Some(ClientEvent::KeepAliveResponse { id, packet })
-                            if shared.answers_challenge(id) =>
-                        {
-                            packet
-                        }
-                        Some(ClientEvent::KeepAliveResponse { .. } | ClientEvent::Kick(_)) => {
-                            continue;
-                        }
-                        Some(ClientEvent::Closed) | None => return false,
-                    };
-                    let _ = old_backend.writes.send(packet).await;
-                }
-            };
-            match timeout(SWITCH_ACK_TIMEOUT, acknowledged).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    return Err(SwitchError::Fatal(ProtocolError::ConnectionClosed.into()));
-                }
-                Err(_) => return Err(SwitchError::Fatal(client_timeout())),
-            }
-        }
-        // The client is configuring from here on, so a failure below must disconnect it as such
-        phase.set(Phase::Config);
-
-        let ack =
-            encode_packet(&LoginAcknowledged, version).map_err(|e| SwitchError::Fatal(e.into()))?;
-        let repeated = shared
-            .client_settings
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .repeat(version);
-        for packet in std::iter::once(ack).chain(repeated) {
-            backend_writer
-                .queue(&packet)
-                .map_err(|e| SwitchError::Fatal(e.into()))?;
-        }
-        backend_writer
-            .flush()
-            .await
-            .map_err(|e| SwitchError::Fatal(e.into()))?;
-        Ok(Backend::start(
-            shared,
-            backend_reader,
-            backend_writer,
-            server_name,
-        ))
+        }))
     }
 
     /// Every player that got past PlayerLogin gets a PlayerDisconnect, even if no backend took them
@@ -1145,42 +697,868 @@ impl BackendBridge {
     fn locale(&self) -> Option<String> {
         self.session_manager.locale(&self.player.username)
     }
+}
 
-    fn notify(&self, client_tx: &ClientQueue, phase: &PhaseCell, text: String) {
-        let content = component_json(&parse_message(&text), self.client_version);
+/// Where the client is in the connection's phases
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Link {
+    Login,
+    Config,
+    Play,
+    // The backend asked the client to reconfigure and the client has not acknowledged yet, so what
+    // reaches the client is read as configuration while what it sends is still play
+    Reconfiguring,
+}
+
+impl Link {
+    /// The phase the client reads what is queued for it next in
+    fn clientbound(self) -> Phase {
+        match self {
+            Link::Login => Phase::Login,
+            Link::Config | Link::Reconfiguring => Phase::Config,
+            Link::Play => Phase::Play,
+        }
+    }
+}
+
+/// A move to another backend, from being asked for to the client being handed over
+enum Switch {
+    Idle,
+    /// Asked for while the client is not playing; started once it is
+    Deferred {
+        target: String,
+    },
+    /// Plugins are told and the next backend is logged into while the current one keeps running
+    Connecting {
+        target: String,
+        job: Job,
+    },
+    /// The next backend finished logging in while the client was not playing
+    Held {
+        target: String,
+        prepared: Box<PreparedBackend>,
+        since: Instant,
+    },
+    /// The current backend's reader is let finish the packet in hand
+    Stopping {
+        target: String,
+        prepared: Box<PreparedBackend>,
+    },
+    /// On 1.20.2+ the client is sent back into configuration so the next backend can configure
+    /// it from scratch; packets it sends before acknowledging still go to the current backend
+    AwaitingAck {
+        target: String,
+        prepared: Box<PreparedBackend>,
+        clock: AckClock,
+    },
+    /// The current backend is gone and the player is moved to the fallback server
+    Fallback {
+        reason: String,
+        job: Job,
+    },
+}
+
+enum AckClock {
+    // The client's wait for its acknowledgement starts once it has the request
+    Writing(oneshot::Receiver<()>),
+    Until(tokio::time::Instant),
+}
+
+/// What a connect job ends with
+enum Connected {
+    Cancelled(Option<String>),
+    AlreadyThere(String),
+    Unknown(String),
+    Prepared(String, Result<Box<PreparedBackend>, BridgeError>),
+}
+
+/// Work on a task of its own, so the tunnel keeps running meanwhile; dropped, it is stopped
+struct Job {
+    result: oneshot::Receiver<Connected>,
+    _task: Task,
+}
+
+impl Job {
+    fn spawn(work: impl Future<Output = Connected> + Send + 'static) -> Self {
+        let (done, result) = oneshot::channel();
+        let task = Task::spawn(async move {
+            let _ = done.send(work.await);
+        });
+        Self {
+            result,
+            _task: task,
+        }
+    }
+}
+
+enum SwitchEvent {
+    Connected(Option<Connected>),
+    Written,
+    AckTimedOut,
+}
+
+async fn switch_progress(switch: &mut Switch) -> SwitchEvent {
+    match switch {
+        Switch::Connecting { job, .. } | Switch::Fallback { job, .. } => {
+            SwitchEvent::Connected((&mut job.result).await.ok())
+        }
+        Switch::AwaitingAck {
+            clock: AckClock::Writing(written),
+            ..
+        } => {
+            let _ = written.await;
+            SwitchEvent::Written
+        }
+        Switch::AwaitingAck {
+            clock: AckClock::Until(deadline),
+            ..
+        } => {
+            tokio::time::sleep_until(*deadline).await;
+            SwitchEvent::AckTimedOut
+        }
+        _ => std::future::pending().await,
+    }
+}
+
+/// The backend the client's packets go to, and which generation of the session's backends it is
+#[derive(Clone)]
+struct Served {
+    generation: u64,
+    name: String,
+}
+
+enum End {
+    Closed,
+    Kicked(String),
+}
+
+enum Event {
+    ClientGone,
+    Client(Option<ClientEvent>),
+    BackendRoom(Option<mpsc::OwnedPermit<Bytes>>),
+    Backend(Option<BackendEvent>),
+    Action(Option<PlayerAction>),
+    MessageRoom(Option<OwnedSemaphorePermit>),
+    Switch(SwitchEvent),
+    Suggestion(SuggestionEvent),
+}
+
+/// A proxy message waiting for room in the client queue
+struct HeldMessage {
+    bytes: Bytes,
+    room: Room,
+}
+
+type Room = std::pin::Pin<
+    Box<
+        dyn Future<Output = Result<OwnedSemaphorePermit, tokio::sync::AcquireError>>
+            + Send
+            + Sync
+            + 'static,
+    >,
+>;
+
+async fn message_room(message: &mut Option<HeldMessage>) -> Option<OwnedSemaphorePermit> {
+    match message {
+        Some(held) => held.room.as_mut().await.ok(),
+        None => std::future::pending().await,
+    }
+}
+
+async fn backend_room(writes: Option<mpsc::Sender<Bytes>>) -> Option<mpsc::OwnedPermit<Bytes>> {
+    match writes {
+        Some(writes) => writes.reserve_owned().await.ok(),
+        None => std::future::pending().await,
+    }
+}
+
+/// One player's session after the first backend took them. Everything about it is decided here,
+/// one event at a time; the readers, writers and connect jobs around it only report to it.
+struct Tunnel {
+    bridge: Arc<BackendBridge>,
+    session: Arc<Session>,
+    link: Link,
+    switch: Switch,
+    backend: Backend,
+    // Keep-alive replies meant for a previous backend would make the current one kick the
+    // player, so only replies to the current backend's latest challenge are forwarded
+    keep_alive: Option<i64>,
+    leftovers: Leftovers,
+    client_settings: ClientSettings,
+    suggesting: Suggesting,
+    client_out: ClientQueue,
+    client_events: mpsc::Receiver<ClientEvent>,
+    actions: mpsc::Receiver<PlayerAction>,
+    message: Option<HeldMessage>,
+    // A client packet waiting for room in the backend's queue; the client is not read meanwhile
+    stalled: Option<Bytes>,
+    // The backend the client's packets go to; changing it drops answers worked out for the last one
+    served: watch::Sender<Served>,
+    // Plugins hear about connections in order, without holding up the tunnel
+    plugin_events: Option<tokio::task::JoinHandle<()>>,
+    _client_reader: Task,
+}
+
+impl Tunnel {
+    async fn run(&mut self) -> End {
+        loop {
+            let event = self.next().await;
+            if let Err(end) = self.handle(event) {
+                return end;
+            }
+        }
+    }
+
+    async fn next(&mut self) -> Event {
+        let takes_client = self.takes_client();
+        let held = self.message.is_some();
+        let stalled = match (&self.backend.conn, &self.stalled) {
+            (Conn::Open(open), Some(_)) => Some(open.writes.clone()),
+            _ => None,
+        };
+        tokio::select! {
+            () = self.client_out.closed() => Event::ClientGone,
+            event = self.client_events.recv(), if takes_client => Event::Client(event),
+            permit = backend_room(stalled) => Event::BackendRoom(permit),
+            event = self.backend.next_event() => Event::Backend(event),
+            action = self.actions.recv(), if !held => Event::Action(action),
+            permit = message_room(&mut self.message) => Event::MessageRoom(permit),
+            event = switch_progress(&mut self.switch) => Event::Switch(event),
+            event = self.suggesting.progress() => Event::Suggestion(event),
+        }
+    }
+
+    fn takes_client(&self) -> bool {
+        self.stalled.is_none()
+            && match self.switch {
+                Switch::Stopping { .. } => false,
+                Switch::AwaitingAck { .. } => true,
+                // With the backend gone, what the client sends waits for the next one
+                _ => matches!(self.backend.conn, Conn::Open(_)),
+            }
+    }
+
+    fn handle(&mut self, event: Event) -> Result<(), End> {
+        match event {
+            Event::ClientGone | Event::Client(None) | Event::Action(None) => Err(End::Closed),
+            Event::Client(Some(event)) => self.client_event(event),
+            Event::BackendRoom(permit) => match (permit, self.stalled.take()) {
+                (Some(permit), Some(packet)) => {
+                    permit.send(packet);
+                    Ok(())
+                }
+                (None, _) => self.backend_lost(None),
+                (Some(_), None) => Ok(()),
+            },
+            Event::Backend(Some(BackendEvent::Packet {
+                packet,
+                permit,
+                done,
+            })) => {
+                self.backend_packet(packet, permit);
+                let _ = done.send(());
+                Ok(())
+            }
+            Event::Backend(Some(BackendEvent::Lost { reason })) => self.backend_lost(reason),
+            Event::Backend(Some(BackendEvent::ClientGone)) => Err(End::Closed),
+            Event::Backend(None) => self.backend_stopped(),
+            Event::Action(Some(action)) => self.action(action),
+            Event::MessageRoom(permit) => {
+                if let (Some(held), Some(permit)) = (self.message.take(), permit) {
+                    self.send_play(held.bytes, Some(permit));
+                }
+                Ok(())
+            }
+            Event::Switch(event) => self.switch_event(event),
+            Event::Suggestion(event) => {
+                self.suggestion_event(event);
+                Ok(())
+            }
+        }
+    }
+
+    fn generation(&self) -> u64 {
+        self.served.borrow().generation
+    }
+
+    fn locale(&self) -> Option<String> {
+        self.bridge.locale()
+    }
+
+    fn translate(&self, key: &str, args: &[&(dyn std::fmt::Display + Sync)]) -> String {
+        translate(self.locale().as_deref(), key, args)
+    }
+
+    /// Every packet of the proxy's own for a playing client goes through here
+    fn send_play(&self, bytes: Bytes, permit: Option<OwnedSemaphorePermit>) {
+        if self.link == Link::Play {
+            self.client_out.push(bytes, permit);
+        } else {
+            debug!(
+                "Dropping a message for '{}' outside play",
+                self.session.username
+            );
+        }
+    }
+
+    fn notify(&self, text: String) {
+        let version = self.session.version;
         let message = SystemChat {
-            content,
+            content: component_json(&parse_message(&text), version),
             overlay: false,
         };
-        match encode_packet(&message, self.client_version) {
-            Ok(bytes) => {
-                client_tx.push_in_play(bytes, phase);
+        match encode_packet(&message, version) {
+            Ok(bytes) => self.send_play(bytes, None),
+            Err(e) => debug!("Skipping a notice for {}: {}", version, e),
+        }
+    }
+
+    fn client_event(&mut self, event: ClientEvent) -> Result<(), End> {
+        match event {
+            ClientEvent::Packet {
+                packet,
+                entered,
+                setting,
+                completion,
+                served,
+            } => {
+                if let Some(setting) = setting {
+                    self.client_settings.apply(setting);
+                }
+                if let Some(completion) = completion {
+                    self.suggesting.expect(completion, served);
+                }
+                if let Some(next) = entered {
+                    self.link = match next {
+                        Phase::Login => Link::Login,
+                        Phase::Config => Link::Config,
+                        Phase::Play => Link::Play,
+                    };
+                }
+                if entered == Some(Phase::Config)
+                    && matches!(self.switch, Switch::AwaitingAck { .. })
+                {
+                    return self.acknowledged();
+                }
+                self.forward(packet)?;
+                if entered == Some(Phase::Play) {
+                    return self.reached_play();
+                }
+                Ok(())
             }
-            Err(e) => debug!("Skipping a notice for {}: {}", self.client_version, e),
+            ClientEvent::KeepAliveResponse { id, packet } => {
+                if self.keep_alive == Some(id) {
+                    self.forward(packet)
+                } else {
+                    debug!(
+                        "Dropping stale keep-alive {} from '{}'",
+                        id, self.session.username
+                    );
+                    Ok(())
+                }
+            }
+            ClientEvent::Suggest { request, served } => {
+                self.suggesting.ask(&self.session, request, served);
+                Ok(())
+            }
+            // The backend being left would have seen the packet; a kick over it is moot
+            ClientEvent::Kick(_) if matches!(self.switch, Switch::AwaitingAck { .. }) => Ok(()),
+            ClientEvent::Kick(reason) => Err(End::Kicked(reason)),
+            ClientEvent::Closed => Err(End::Closed),
+        }
+    }
+
+    /// Passes a client packet on to the current backend
+    fn forward(&mut self, packet: Bytes) -> Result<(), End> {
+        let Conn::Open(open) = &self.backend.conn else {
+            return Ok(());
+        };
+        let leaving = matches!(self.switch, Switch::AwaitingAck { .. });
+        match open.writes.try_send(packet) {
+            Ok(()) => Ok(()),
+            Err(_) if leaving => Ok(()),
+            Err(mpsc::error::TrySendError::Full(packet)) => {
+                self.stalled = Some(packet);
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => self.backend_lost(None),
+        }
+    }
+
+    /// A packet from the backend whose effect on the session is decided here before it is queued
+    fn backend_packet(&mut self, packet: crate::protocol::RawPacket, permit: OwnedSemaphorePermit) {
+        let version = self.session.version;
+        let mut replaced = None;
+        if PacketKind::StartConfiguration.matches(packet.id, version) {
+            if self.link == Link::Play {
+                self.link = Link::Reconfiguring;
+            }
+        } else if PacketKind::PlayKeepAlive.matches(packet.id, version) {
+            if let Ok(challenge) = decode_packet::<PlayKeepAlive>(&packet.payload, version) {
+                self.keep_alive = Some(challenge.id);
+            }
+        } else if PacketKind::CommandSuggestionsResponse.matches(packet.id, version) {
+            if let Ok(mut answer) = decode_packet::<CommandSuggestions>(&packet.payload, version)
+                && let Some(pending) = self.suggesting.answered(answer.id)
+            {
+                merge_suggestions(&mut answer.matches, pending.proxy_matches, version);
+                replaced = encode_packet(&answer, version).ok();
+            }
+        } else {
+            self.leftovers.observe(&packet, version);
+        }
+        self.client_out
+            .push(replaced.unwrap_or_else(|| packet.to_bytes()), Some(permit));
+    }
+
+    fn action(&mut self, action: PlayerAction) -> Result<(), End> {
+        let version = self.session.version;
+        let encoded = match action {
+            PlayerAction::Connect { server_name } => return self.request_switch(server_name),
+            PlayerAction::Disconnect(reason) => return Err(End::Kicked(reason)),
+            PlayerAction::Message(content) => encode_packet(
+                &SystemChat {
+                    content: component_json(&content, version),
+                    overlay: false,
+                },
+                version,
+            ),
+            PlayerAction::PluginMessage { channel, data } => {
+                encode_packet(&ClientboundPluginMessage { channel, data }, version)
+            }
+        };
+        if let Ok(bytes) = encoded {
+            let room = self.client_out.room(bytes.len());
+            self.message = Some(HeldMessage { bytes, room });
+        }
+        Ok(())
+    }
+
+    fn request_switch(&mut self, target: String) -> Result<(), End> {
+        let idle = matches!(self.switch, Switch::Idle | Switch::Deferred { .. });
+        if self.link != Link::Play && idle {
+            self.switch = Switch::Deferred { target };
+            return Ok(());
+        }
+        if !idle {
+            self.notify(self.translate("vine.server.already_connecting", &[]));
+            return Ok(());
+        }
+        info!(
+            "Switching player '{}' to backend server '{}'...",
+            self.session.username, target
+        );
+        let job = Job::spawn(
+            self.bridge
+                .clone()
+                .switch_job(self.backend.name.clone(), target.clone()),
+        );
+        self.switch = Switch::Connecting { target, job };
+        Ok(())
+    }
+
+    fn switch_event(&mut self, event: SwitchEvent) -> Result<(), End> {
+        match event {
+            SwitchEvent::Connected(connected) => {
+                match std::mem::replace(&mut self.switch, Switch::Idle) {
+                    Switch::Connecting { target, .. } => {
+                        let connected = connected
+                            .unwrap_or_else(|| Connected::Prepared(target, Err(job_ended())));
+                        self.connected(connected)
+                    }
+                    Switch::Fallback { reason, .. } => match connected {
+                        Some(connected) => self.fallen_back(reason, connected),
+                        None => Err(End::Kicked(reason)),
+                    },
+                    other => {
+                        self.switch = other;
+                        Ok(())
+                    }
+                }
+            }
+            SwitchEvent::Written => {
+                if let Switch::AwaitingAck { clock, .. } = &mut self.switch {
+                    *clock = AckClock::Until(tokio::time::Instant::now() + SWITCH_ACK_TIMEOUT);
+                }
+                Ok(())
+            }
+            SwitchEvent::AckTimedOut => {
+                let Switch::AwaitingAck { target, .. } = &self.switch else {
+                    return Ok(());
+                };
+                warn!(
+                    "Lost player '{}' while switching to '{}': {}",
+                    self.session.username,
+                    target,
+                    client_timeout()
+                );
+                Err(End::Kicked(
+                    self.translate("vine.server.switch_failed", &[target]),
+                ))
+            }
+        }
+    }
+
+    /// A switch the player asked for has its next backend logged in, or failed to
+    fn connected(&mut self, connected: Connected) -> Result<(), End> {
+        if let Conn::Gone { reason } = &self.backend.conn {
+            // A server that stops right after sending its players elsewhere still delivers them
+            return match connected {
+                Connected::Prepared(target, Ok(prepared)) => self.leave(target, prepared),
+                other => {
+                    if let Connected::Prepared(target, Err(e)) = other {
+                        warn!(
+                            "Failed to switch player '{}' to '{}': {}",
+                            self.session.username, target, e
+                        );
+                    }
+                    let reason = reason.clone();
+                    self.reroute(reason)
+                }
+            };
+        }
+        match connected {
+            Connected::Cancelled(reason) => {
+                let reason =
+                    reason.unwrap_or_else(|| self.translate("vine.plugin.cancelled_switch", &[]));
+                self.notify(self.translate("vine.server.switch_cancelled", &[&reason]));
+            }
+            Connected::AlreadyThere(target) => {
+                self.notify(self.translate("vine.command.server.already_connected", &[&target]));
+            }
+            Connected::Unknown(target) => {
+                self.notify(self.translate("vine.server.unknown", &[&target]));
+            }
+            Connected::Prepared(target, Err(e)) => {
+                warn!(
+                    "Failed to switch player '{}' to '{}': {}",
+                    self.session.username, target, e
+                );
+                let e = e.to_string();
+                self.notify(self.translate("vine.server.connect_failed", &[&target, &e]));
+            }
+            Connected::Prepared(target, Ok(prepared)) if self.link == Link::Play => {
+                return self.leave(target, prepared);
+            }
+            // Kept so another switch waits; it goes ahead once the client is playing
+            Connected::Prepared(target, Ok(prepared)) => {
+                self.switch = Switch::Held {
+                    target,
+                    prepared,
+                    since: Instant::now(),
+                };
+            }
+        }
+        Ok(())
+    }
+
+    fn fallen_back(&mut self, reason: String, connected: Connected) -> Result<(), End> {
+        match connected {
+            Connected::Prepared(target, Ok(prepared)) => {
+                info!(
+                    "Rerouting player '{}' to fallback server '{}' (kicked from '{}': {})",
+                    self.session.username, target, self.backend.name, reason
+                );
+                self.notify(self.translate("vine.server.fallback", &[&target, &reason]));
+                self.leave(target, prepared)
+            }
+            Connected::Prepared(target, Err(e)) => {
+                warn!(
+                    "Failed to connect player '{}' to fallback server '{}': {}",
+                    self.session.username, target, e
+                );
+                let e = e.to_string();
+                Err(End::Kicked(self.translate(
+                    "vine.server.fallback_failed",
+                    &[&self.backend.name, &e],
+                )))
+            }
+            Connected::Cancelled(cancel_reason) => {
+                Err(End::Kicked(cancel_reason.unwrap_or(reason)))
+            }
+            Connected::AlreadyThere(_) | Connected::Unknown(_) => Err(End::Kicked(reason)),
+        }
+    }
+
+    /// The client finished configuring and is playing
+    fn reached_play(&mut self) -> Result<(), End> {
+        match std::mem::replace(&mut self.switch, Switch::Idle) {
+            Switch::Deferred { target } => self.request_switch(target),
+            Switch::Held {
+                target,
+                prepared,
+                since,
+            } => {
+                // A backend kept waiting this long may have given up on the login, so it is
+                // logged into again
+                if since.elapsed() > HELD_BACKEND_LIMIT
+                    && let Some(config) = self.bridge.proxy_config.servers.get(&target).cloned()
+                {
+                    let job = Job::spawn(self.bridge.clone().prepare_job(target.clone(), config));
+                    self.switch = Switch::Connecting { target, job };
+                    return Ok(());
+                }
+                self.leave(target, prepared)
+            }
+            other => {
+                self.switch = other;
+                Ok(())
+            }
+        }
+    }
+
+    fn backend_lost(&mut self, reason: Option<String>) -> Result<(), End> {
+        if matches!(self.backend.conn, Conn::Gone { .. }) {
+            return Ok(());
+        }
+        self.backend.conn = Conn::Gone {
+            reason: reason.clone(),
+        };
+        self.stalled = None;
+        match std::mem::replace(&mut self.switch, Switch::Idle) {
+            // A switch already on its way finishes instead, so a server that stops right after
+            // sending its players elsewhere still delivers them there
+            Switch::Held {
+                target,
+                prepared,
+                since,
+            } if since.elapsed() <= HELD_BACKEND_LIMIT => self.leave(target, prepared),
+            Switch::Held { target, .. } => {
+                match self.bridge.proxy_config.servers.get(&target).cloned() {
+                    Some(config) => {
+                        let job =
+                            Job::spawn(self.bridge.clone().prepare_job(target.clone(), config));
+                        self.switch = Switch::Connecting { target, job };
+                        Ok(())
+                    }
+                    None => self.reroute(reason),
+                }
+            }
+            Switch::Stopping { target, prepared } => self.stopped(target, prepared),
+            Switch::Idle | Switch::Deferred { .. } => self.reroute(reason),
+            other => {
+                self.switch = other;
+                Ok(())
+            }
+        }
+    }
+
+    /// The current backend's reader finished
+    fn backend_stopped(&mut self) -> Result<(), End> {
+        if let Conn::Open(open) = &mut self.backend.conn {
+            open.events = None;
+        }
+        match std::mem::replace(&mut self.switch, Switch::Idle) {
+            Switch::Stopping { target, prepared } => self.stopped(target, prepared),
+            other => {
+                self.switch = other;
+                self.backend_lost(None)
+            }
+        }
+    }
+
+    /// With the current backend gone, moves the player to the fallback server or disconnects them
+    fn reroute(&mut self, reason: Option<String>) -> Result<(), End> {
+        warn!(
+            "Backend server '{}' disconnected player '{}': {:?}",
+            self.backend.name, self.session.username, reason
+        );
+        let reason = reason.unwrap_or_else(|| self.translate("vine.server.lost_connection", &[]));
+        let fallback = self
+            .bridge
+            .fallback_server
+            .clone()
+            .filter(|(name, _)| name != &self.backend.name);
+        let Some((target, config)) = fallback else {
+            return Err(End::Kicked(reason));
+        };
+        let job = Job::spawn(self.bridge.clone().fallback_job(
+            self.backend.name.clone(),
+            target,
+            config,
+        ));
+        self.switch = Switch::Fallback { reason, job };
+        Ok(())
+    }
+
+    /// Starts moving the client over to a backend that is logged in
+    fn leave(&mut self, target: String, prepared: Box<PreparedBackend>) -> Result<(), End> {
+        if self.backend.stop_reading() {
+            self.switch = Switch::Stopping { target, prepared };
+            return Ok(());
+        }
+        self.stopped(target, prepared)
+    }
+
+    /// Nothing more of the current backend reaches the client; hands the client over
+    fn stopped(&mut self, target: String, mut prepared: Box<PreparedBackend>) -> Result<(), End> {
+        let version = self.session.version;
+        if let Some((mut pending, join_game)) = prepared.join_game.take() {
+            let joining = join_game_sequence(&join_game, version).unwrap_or_else(|e| {
+                debug!("Forwarding JoinGame from '{}' unchanged: {}", target, e);
+                vec![join_game.to_bytes()]
+            });
+            pending.extend(self.leftovers.clear_players(version));
+            pending.extend(joining);
+            pending.extend(self.leftovers.clear_overlays(version));
+            if !self.client_out.push_all(pending) {
+                return Err(End::Closed);
+            }
+            let PreparedBackend { reader, writer, .. } = *prepared;
+            return self.install(target, reader, writer, Phase::Play, Vec::new());
+        }
+
+        let clock = match self.link {
+            Link::Play => {
+                let Ok(start) = encode_packet(&StartConfiguration, version) else {
+                    return Err(End::Kicked(
+                        self.translate("vine.server.switch_failed", &[&target]),
+                    ));
+                };
+                self.client_out.push(start, None);
+                self.link = Link::Reconfiguring;
+                AckClock::Writing(self.client_out.written())
+            }
+            // The current backend already asked for reconfiguration, or the client is still
+            // logging in, so it is about to acknowledge
+            Link::Reconfiguring | Link::Login => {
+                AckClock::Until(tokio::time::Instant::now() + SWITCH_ACK_TIMEOUT)
+            }
+            // Only reached with the current backend gone
+            Link::Config => return self.configure(target, prepared),
+        };
+        if let (Some(packet), Conn::Open(open)) = (self.stalled.take(), &self.backend.conn) {
+            let _ = open.writes.try_send(packet);
+        }
+        self.switch = Switch::AwaitingAck {
+            target,
+            prepared,
+            clock,
+        };
+        Ok(())
+    }
+
+    fn acknowledged(&mut self) -> Result<(), End> {
+        match std::mem::replace(&mut self.switch, Switch::Idle) {
+            Switch::AwaitingAck {
+                target, prepared, ..
+            } => self.configure(target, prepared),
+            other => {
+                self.switch = other;
+                Ok(())
+            }
+        }
+    }
+
+    /// Hands a configuring client to a 1.20.2+ backend that is waiting for its acknowledgement
+    fn configure(&mut self, target: String, prepared: Box<PreparedBackend>) -> Result<(), End> {
+        let version = self.session.version;
+        let Ok(ack) = encode_packet(&LoginAcknowledged, version) else {
+            return Err(End::Kicked(
+                self.translate("vine.server.switch_failed", &[&target]),
+            ));
+        };
+        let initial = std::iter::once(ack)
+            .chain(self.client_settings.repeat(version))
+            .collect();
+        let PreparedBackend { reader, writer, .. } = *prepared;
+        self.install(target, reader, writer, Phase::Config, initial)
+    }
+
+    fn install(
+        &mut self,
+        target: String,
+        reader: BackendReader,
+        writer: BackendWriter,
+        phase: Phase,
+        initial: Vec<Bytes>,
+    ) -> Result<(), End> {
+        self.backend = Backend::start(
+            &self.session,
+            reader,
+            writer,
+            target.clone(),
+            phase,
+            initial,
+        );
+        self.keep_alive = None;
+        self.suggesting.forget();
+        let generation = self.generation() + 1;
+        self.served.send_replace(Served {
+            generation,
+            name: target.clone(),
+        });
+        self.session
+            .session_manager
+            .update_server(&self.session.username, &target);
+        info!(
+            "Player '{}' successfully switched to '{}'",
+            self.session.username, target
+        );
+        self.fire_connected(target);
+        match self.stalled.take() {
+            Some(packet) => self.forward(packet),
+            None => Ok(()),
+        }
+    }
+
+    fn fire_connected(&mut self, server_name: String) {
+        let previous = self.plugin_events.take();
+        let bridge = self.bridge.clone();
+        self.plugin_events = Some(tokio::spawn(async move {
+            if let Some(previous) = previous {
+                let _ = previous.await;
+            }
+            let event = ServerConnectedEvent {
+                uuid: bridge.player.id.to_string(),
+                username: bridge.player.username.clone(),
+                server_name,
+            };
+            bridge.plugin_manager.fire_server_connected(&event).await;
+        }));
+    }
+
+    fn suggestion_event(&mut self, event: SuggestionEvent) {
+        let generation = self.generation();
+        let answer = match event {
+            SuggestionEvent::Answered(answer) => {
+                let served = self.suggesting.running.take().map(|running| running.served);
+                if let Some((request, served)) = self.suggesting.next.take() {
+                    self.suggesting.ask(&self.session, request, served);
+                    return;
+                }
+                answer.filter(|_| served == Some(generation))
+            }
+            SuggestionEvent::Due => self.suggesting.due(generation, self.session.version),
+        };
+        if let Some(bytes) = answer {
+            self.send_play(bytes, None);
         }
     }
 
     /// Sends the kick after everything already queued and closes the connection behind it
-    async fn disconnect_client(
-        &self,
-        mut writer: Task,
-        client_tx: &ClientQueue,
-        phase: Phase,
-        reason: &str,
-    ) {
+    async fn disconnect_client(&self, mut writer: Task, reason: &str) {
         let locale = self.locale();
-        if let Some(kick) = disconnect_packet(self.client_version, phase, locale.as_deref(), reason)
-        {
-            client_tx.push([kick]);
+        if let Some(kick) = disconnect_packet(
+            self.session.version,
+            self.link.clientbound(),
+            locale.as_deref(),
+            reason,
+        ) {
+            self.client_out.push(kick, None);
         }
-        let _ = client_tx.tx.send(ClientWrite::Close);
+        self.client_out.close();
         if timeout(CLIENT_WRITE_TIMEOUT, writer.join()).await.is_err() {
             debug!(
                 "Gave up writing to '{}' before disconnecting",
-                self.player.username
+                self.session.username
             );
         }
     }
+}
+
+fn job_ended() -> BridgeError {
+    BridgeError::IoError(std::io::Error::other("the connection attempt ended"))
 }
 
 fn disconnect_packet(
@@ -1242,31 +1620,45 @@ struct ClientSettings {
     brand: Option<Vec<u8>>,
 }
 
+/// A setting the client told its backend about
+enum Setting {
+    Information(Bytes),
+    Brand(Vec<u8>),
+}
+
+fn client_setting(
+    packet: &crate::protocol::RawPacket,
+    phase: Phase,
+    version: ProtocolVersion,
+) -> Option<Setting> {
+    let (information, plugin_message) = match phase {
+        Phase::Config => (
+            PacketKind::ConfigClientInformation,
+            PacketKind::ConfigServerboundPluginMessage,
+        ),
+        Phase::Play => (
+            PacketKind::ClientInformation,
+            PacketKind::ServerboundPluginMessage,
+        ),
+        Phase::Login => return None,
+    };
+    if information.matches(packet.id, version) {
+        Some(Setting::Information(packet.payload.clone()))
+    } else if plugin_message.matches(packet.id, version)
+        && let Ok((channel, data)) = read_plugin_message(&mut &packet.payload[..], version)
+        && channel == BRAND_CHANNEL
+    {
+        Some(Setting::Brand(data))
+    } else {
+        None
+    }
+}
+
 impl ClientSettings {
-    fn observe(
-        &mut self,
-        packet: &crate::protocol::RawPacket,
-        phase: Phase,
-        version: ProtocolVersion,
-    ) {
-        let (information, plugin_message) = match phase {
-            Phase::Config => (
-                PacketKind::ConfigClientInformation,
-                PacketKind::ConfigServerboundPluginMessage,
-            ),
-            Phase::Play => (
-                PacketKind::ClientInformation,
-                PacketKind::ServerboundPluginMessage,
-            ),
-            Phase::Login => return,
-        };
-        if information.matches(packet.id, version) {
-            self.information = Some(packet.payload.clone());
-        } else if plugin_message.matches(packet.id, version)
-            && let Ok((channel, data)) = read_plugin_message(&mut &packet.payload[..], version)
-            && channel == BRAND_CHANNEL
-        {
-            self.brand = Some(data);
+    fn apply(&mut self, setting: Setting) {
+        match setting {
+            Setting::Information(payload) => self.information = Some(payload),
+            Setting::Brand(data) => self.brand = Some(data),
         }
     }
 
@@ -1325,23 +1717,8 @@ struct PreparedBackend {
     join_game: Option<(Vec<Bytes>, crate::protocol::RawPacket)>,
 }
 
-impl std::fmt::Debug for PreparedBackend {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("PreparedBackend")
-    }
-}
-
 // Backends drop a login that is not acknowledged within about 30 seconds
 const HELD_BACKEND_LIMIT: Duration = Duration::from_secs(20);
-
-type Connecting<'a> =
-    std::pin::Pin<Box<dyn Future<Output = Result<PreparedBackend, BridgeError>> + Send + 'a>>;
-
-enum SwitchError {
-    // Nothing was sent to the client yet, so it can stay on its current backend
-    Unreachable(BridgeError),
-    Fatal(BridgeError),
-}
 
 fn client_timeout() -> BridgeError {
     BridgeError::IoError(std::io::Error::new(
@@ -1355,47 +1732,6 @@ enum Phase {
     Login,
     Config,
     Play,
-}
-
-struct PhaseCell {
-    phase: AtomicU8,
-    // A backend that asks for reconfiguration switches what it sends at once, before the client
-    // acknowledges, so its packets are read as configuration from then on
-    backend_configuring: AtomicBool,
-}
-
-impl PhaseCell {
-    fn new(phase: Phase) -> Self {
-        Self {
-            phase: AtomicU8::new(phase as u8),
-            backend_configuring: AtomicBool::new(false),
-        }
-    }
-
-    fn get(&self) -> Phase {
-        match self.phase.load(Ordering::Acquire) {
-            0 => Phase::Login,
-            1 => Phase::Config,
-            _ => Phase::Play,
-        }
-    }
-
-    /// The phase of what the backend is sending
-    fn backend(&self) -> Phase {
-        match self.get() {
-            Phase::Play if self.backend_configuring.load(Ordering::Acquire) => Phase::Config,
-            phase => phase,
-        }
-    }
-
-    fn set(&self, phase: Phase) {
-        self.phase.store(phase as u8, Ordering::Release);
-        self.backend_configuring.store(false, Ordering::Release);
-    }
-
-    fn backend_started_configuration(&self) {
-        self.backend_configuring.store(true, Ordering::Release);
-    }
 }
 
 // The client's acknowledgements mark every phase change; the backend switches only after
@@ -1420,22 +1756,146 @@ struct SuggestionRequest {
     input: String,
     offset: usize,
     source: ProxyCommandSource,
-    served: watch::Receiver<String>,
 }
 
-/// One argument suggestion per player is worked out at a time. The client only uses the answer
-/// to its newest request, so only the newest one that arrives meanwhile is kept for next.
+/// Root command names of the proxy's own, waiting to be merged into the backend's answer
+struct PendingSuggestion {
+    id: i32,
+    clean_cmd: String,
+    offset: usize,
+    proxy_matches: Vec<(String, Option<String>)>,
+}
+
+enum Suggest {
+    /// Arguments to a proxy command, answered by the proxy alone
+    Proxy(SuggestionRequest),
+    /// A command name the proxy has matches for, merged into the backend's answer
+    Completion(PendingSuggestion),
+    Backend,
+}
+
+// The backend gets this long to answer before the proxy's own command names are sent alone
+const COMPLETION_WAIT: Duration = Duration::from_millis(200);
+
+/// The client's suggestion requests the proxy answers
 #[derive(Default)]
 struct Suggesting {
-    busy: bool,
-    next: Option<SuggestionRequest>,
+    // One argument suggestion per player is worked out at a time. The client only uses the answer
+    // to its newest request, so only the newest one that arrives meanwhile is kept for next.
+    running: Option<RunningSuggestion>,
+    next: Option<(SuggestionRequest, u64)>,
+    pending: HashMap<i32, (u64, PendingSuggestion)>,
+    due: VecDeque<(tokio::time::Instant, i32)>,
+}
+
+struct RunningSuggestion {
+    served: u64,
+    answer: tokio::task::JoinHandle<Option<Bytes>>,
+}
+
+enum SuggestionEvent {
+    Answered(Option<Bytes>),
+    Due,
+}
+
+impl Suggesting {
+    fn ask(&mut self, session: &Session, request: SuggestionRequest, served: u64) {
+        if self.running.is_some() {
+            self.next = Some((request, served));
+            return;
+        }
+        let version = session.version;
+        let dispatcher = session.command_dispatcher.clone();
+        // Plugins answer these, so they are worked out off the tunnel
+        let answer = tokio::task::spawn_blocking(move || {
+            let SuggestionRequest {
+                id,
+                input,
+                offset,
+                source,
+            } = request;
+            let suggestions = dispatcher.suggest_with_range(&input, &source);
+            let response = CommandSuggestions {
+                id,
+                start: (suggestions.range.start + offset) as i32,
+                length: suggestions.range.len() as i32,
+                matches: suggestions
+                    .suggestions
+                    .into_iter()
+                    .map(|s| Suggestion {
+                        text: s.text.cached_text().clone(),
+                        tooltip: s.tooltip.map(|t| component_json(&t, version)),
+                    })
+                    .collect(),
+            };
+            encode_packet(&response, version).ok()
+        });
+        self.running = Some(RunningSuggestion { served, answer });
+    }
+
+    fn expect(&mut self, completion: PendingSuggestion, served: u64) {
+        self.due
+            .push_back((tokio::time::Instant::now() + COMPLETION_WAIT, completion.id));
+        self.pending.insert(completion.id, (served, completion));
+    }
+
+    fn answered(&mut self, id: i32) -> Option<PendingSuggestion> {
+        self.pending.remove(&id).map(|(_, pending)| pending)
+    }
+
+    /// The proxy's own answer to the oldest completion the backend has not answered in time
+    fn due(&mut self, generation: u64, version: ProtocolVersion) -> Option<Bytes> {
+        let (_, id) = self.due.pop_front()?;
+        let (served, pending) = self.pending.remove(&id)?;
+        if served != generation {
+            return None;
+        }
+        let response = CommandSuggestions {
+            id,
+            start: pending.offset as i32,
+            length: pending.clean_cmd.len() as i32,
+            matches: pending
+                .proxy_matches
+                .into_iter()
+                .map(|(cmd, tip)| Suggestion {
+                    text: cmd,
+                    tooltip: tip.map(|t| component_json(&TextComponent::text(t), version)),
+                })
+                .collect(),
+        };
+        encode_packet(&response, version).ok()
+    }
+
+    fn forget(&mut self) {
+        self.pending.clear();
+        self.due.clear();
+    }
+
+    async fn progress(&mut self) -> SuggestionEvent {
+        let due = self.due.front().map(|(at, _)| *at);
+        let running = &mut self.running;
+        tokio::select! {
+            answer = async {
+                match running {
+                    Some(running) => (&mut running.answer).await,
+                    None => std::future::pending().await,
+                }
+            } => SuggestionEvent::Answered(answer.ok().flatten()),
+            () = async {
+                match due {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            } => SuggestionEvent::Due,
+        }
+    }
 }
 
 enum ClientWrite {
     // Packets of the proxy's own carry no permit, so they never wait for room
     Packet(Bytes, Option<OwnedSemaphorePermit>),
     // Answered once everything queued before it is written
-    Written(tokio::sync::oneshot::Sender<()>),
+    Written(oneshot::Sender<()>),
     Close,
 }
 
@@ -1446,75 +1906,56 @@ type ClientQueueRx = mpsc::UnboundedReceiver<ClientWrite>;
 struct ClientQueue {
     tx: mpsc::UnboundedSender<ClientWrite>,
     budget: Arc<Semaphore>,
-    // Held while the backend's reconfiguration is noted, so a packet checked as in play cannot
-    // be queued behind the backend's StartConfiguration
-    order: Arc<std::sync::Mutex<()>>,
 }
 
 impl ClientQueue {
     fn new() -> (Self, ClientQueueRx) {
         let (tx, rx) = mpsc::unbounded_channel();
         let budget = Arc::new(Semaphore::new(CLIENT_QUEUE_BYTES));
-        let order = Arc::new(std::sync::Mutex::new(()));
-        (Self { tx, budget, order }, rx)
+        (Self { tx, budget }, rx)
     }
 
-    async fn reserve(&self, bytes: &Bytes) -> Option<OwnedSemaphorePermit> {
-        let cost = bytes.len().clamp(1, CLIENT_QUEUE_BYTES) as u32;
-        Arc::clone(&self.budget).acquire_many_owned(cost).await.ok()
+    fn cost(len: usize) -> u32 {
+        len.clamp(1, CLIENT_QUEUE_BYTES) as u32
     }
 
-    /// Queues a packet only if the client and backend are still playing
-    async fn send_in_play(&self, bytes: Bytes, phase: &PhaseCell) -> bool {
-        let Some(permit) = self.reserve(&bytes).await else {
-            return false;
-        };
-        let _order = self.order.lock().unwrap_or_else(|e| e.into_inner());
-        phase.backend() == Phase::Play
-            && self
-                .tx
-                .send(ClientWrite::Packet(bytes, Some(permit)))
-                .is_ok()
+    async fn reserve(&self, len: usize) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.budget)
+            .acquire_many_owned(Self::cost(len))
+            .await
+            .ok()
     }
 
-    /// Queues the backend's StartConfiguration; its packets are read as configuration from then on
-    async fn send_start_configuration(&self, bytes: Bytes, phase: &PhaseCell) -> bool {
-        let Some(permit) = self.reserve(&bytes).await else {
-            return false;
-        };
-        let _order = self.order.lock().unwrap_or_else(|e| e.into_inner());
-        phase.backend_started_configuration();
-        self.tx
-            .send(ClientWrite::Packet(bytes, Some(permit)))
-            .is_ok()
+    /// Resolves once there is room for a packet of this size
+    fn room(&self, len: usize) -> Room {
+        Box::pin(Arc::clone(&self.budget).acquire_many_owned(Self::cost(len)))
     }
 
+    /// Queues a packet once there is room for it
     async fn send(&self, bytes: Bytes) -> bool {
-        match self.reserve(&bytes).await {
-            Some(permit) => self
-                .tx
-                .send(ClientWrite::Packet(bytes, Some(permit)))
-                .is_ok(),
+        match self.reserve(bytes.len()).await {
+            Some(permit) => self.push(bytes, Some(permit)),
             None => false,
         }
     }
 
-    fn push(&self, packets: impl IntoIterator<Item = Bytes>) -> bool {
-        let _order = self.order.lock().unwrap_or_else(|e| e.into_inner());
-        packets
-            .into_iter()
-            .all(|bytes| self.tx.send(ClientWrite::Packet(bytes, None)).is_ok())
+    fn push(&self, bytes: Bytes, permit: Option<OwnedSemaphorePermit>) -> bool {
+        self.tx.send(ClientWrite::Packet(bytes, permit)).is_ok()
     }
 
-    fn push_in_play(&self, bytes: Bytes, phase: &PhaseCell) -> bool {
-        let _order = self.order.lock().unwrap_or_else(|e| e.into_inner());
-        phase.backend() == Phase::Play && self.tx.send(ClientWrite::Packet(bytes, None)).is_ok()
+    fn push_all(&self, packets: impl IntoIterator<Item = Bytes>) -> bool {
+        packets.into_iter().all(|bytes| self.push(bytes, None))
     }
 
-    /// Waits until everything queued so far is written; false if the client is gone
-    async fn written(&self) -> bool {
-        let (done, wait) = tokio::sync::oneshot::channel();
-        self.tx.send(ClientWrite::Written(done)).is_ok() && wait.await.is_ok()
+    /// Answered once everything queued so far is written; dropped if the client is gone
+    fn written(&self) -> oneshot::Receiver<()> {
+        let (done, wait) = oneshot::channel();
+        let _ = self.tx.send(ClientWrite::Written(done));
+        wait
+    }
+
+    fn close(&self) {
+        let _ = self.tx.send(ClientWrite::Close);
     }
 
     /// Resolves once nothing is written to the client anymore
@@ -1592,15 +2033,8 @@ impl Drop for Lingering {
 
 const LINGER: Duration = Duration::from_secs(10);
 
-#[derive(Clone)]
-struct PendingSuggestion {
-    clean_cmd: String,
-    offset: usize,
-    proxy_matches: Vec<(String, Option<String>)>,
-}
-
-/// What one player's session tasks and tunnel share
-struct Shared {
+/// What one player's readers need to work out what the packets they read become
+struct Session {
     username: String,
     uuid: uuid::Uuid,
     version: ProtocolVersion,
@@ -1609,32 +2043,40 @@ struct Shared {
     command_dispatcher: Arc<CommandDispatcher>,
     proxy_config: Arc<Config>,
     action_tx: mpsc::Sender<PlayerAction>,
-    client_tx: ClientQueue,
-    phase: PhaseCell,
-    // The backend the client's packets go to; changing it drops answers worked out for the last one
-    served: watch::Sender<String>,
-    // Keep-alive replies meant for a previous backend would make the current one kick the
-    // player, so only replies to the current backend's latest challenge are forwarded
-    keep_alive_challenge: std::sync::Mutex<Option<i64>>,
-    leftovers: std::sync::Mutex<Leftovers>,
-    client_settings: std::sync::Mutex<ClientSettings>,
-    suggesting: std::sync::Mutex<Suggesting>,
-    pending_suggestions: tokio::sync::Mutex<std::collections::HashMap<i32, PendingSuggestion>>,
+    client_out: ClientQueue,
 }
 
-/// What the client reader hands the tunnel, in the order the client sent it
+/// What the client reader hands the tunnel, in the order the client sent it. `served` is the
+/// generation of the backend that was current when the packet was read.
 enum ClientEvent {
     /// A packet for the backend, and the phase the client entered by sending it
     Packet {
         packet: Bytes,
         entered: Option<Phase>,
+        setting: Option<Setting>,
+        completion: Option<PendingSuggestion>,
+        served: u64,
     },
     KeepAliveResponse {
         id: i64,
         packet: Bytes,
     },
+    Suggest {
+        request: SuggestionRequest,
+        served: u64,
+    },
     Kick(String),
     Closed,
+}
+
+fn plain_packet(packet: Bytes, served: u64) -> ClientEvent {
+    ClientEvent::Packet {
+        packet,
+        entered: None,
+        setting: None,
+        completion: None,
+        served,
+    }
 }
 
 const CLIENT_EVENTS: usize = 16;
@@ -1642,34 +2084,35 @@ const CLIENT_EVENTS: usize = 16;
 /// Reads the client for the whole session. Its packets are handled one at a time, plugin events
 /// included, so a slow plugin only holds up what the client sends.
 async fn read_client<R: AsyncRead + Unpin>(
-    shared: Arc<Shared>,
+    session: Arc<Session>,
     mut reader: PacketReader<R>,
     mut rate_limiter: PacketRateLimiter,
+    mut served: watch::Receiver<Served>,
     events: mpsc::Sender<ClientEvent>,
 ) {
-    let mut served = shared.served.subscribe();
-    let mut phase = shared.phase.get();
+    let mut phase = if session.version >= ProtocolVersion::V1_20_2 {
+        Phase::Login
+    } else {
+        Phase::Play
+    };
     loop {
         let event = match reader.read_packet().await {
             Ok(_) if !rate_limiter.record_packet() => {
                 warn!(
                     "Player '{}' exceeded packet rate limit (flood protection kicked in)",
-                    shared.username
+                    session.username
                 );
                 ClientEvent::Closed
             }
             Ok(packet) => {
-                let server = served.borrow_and_update().clone();
-                match shared
-                    .client_packet(packet, &mut phase, &server, &served)
-                    .await
-                {
+                let current = served.borrow_and_update().clone();
+                match session.client_packet(packet, &mut phase, &current).await {
                     Some(event) => event,
                     None => continue,
                 }
             }
             Err(e) => {
-                debug!("Client '{}' stream ended: {:?}", shared.username, e);
+                debug!("Client '{}' stream ended: {:?}", session.username, e);
                 ClientEvent::Closed
             }
         };
@@ -1680,7 +2123,7 @@ async fn read_client<R: AsyncRead + Unpin>(
     }
 }
 
-impl Shared {
+impl Session {
     fn command_source(&self) -> ProxyCommandSource {
         ProxyCommandSource {
             sender: CommandSender::Player {
@@ -1696,30 +2139,27 @@ impl Shared {
         self.session_manager.locale(&self.username)
     }
 
-    fn answers_challenge(&self, id: i64) -> bool {
-        self.keep_alive_challenge.lock().ok().and_then(|c| *c) == Some(id)
-    }
-
     /// Works out what a packet from the client becomes; `None` when it is swallowed
     async fn client_packet(
-        self: &Arc<Self>,
+        &self,
         mut raw_packet: crate::protocol::RawPacket,
         phase: &mut Phase,
-        server: &str,
-        served: &watch::Receiver<String>,
+        served: &Served,
     ) -> Option<ClientEvent> {
         let version = self.version;
         let current = *phase;
+        let generation = served.generation;
         if let Some(locale) = client_locale(&raw_packet, current, version) {
             self.session_manager.update_locale(&self.username, &locale);
         }
+        let mut completion = None;
         let entered = serverbound_transition(current, raw_packet.id, version);
         if let Some(next) = entered {
             *phase = next;
         } else if current == Phase::Config
             && PacketKind::ConfigServerboundPluginMessage.matches(raw_packet.id, version)
             && !self
-                .plugin_message_event(&mut raw_packet, server, PluginMessageSource::Player)
+                .plugin_message_event(&mut raw_packet, &served.name, PluginMessageSource::Player)
                 .await
         {
             return None;
@@ -1763,7 +2203,7 @@ impl Shared {
                         "Dropping an unreadable command from '{}': {}",
                         self.username, e
                     );
-                    return self.swallow_chat(&raw_packet);
+                    return self.swallow_chat(&raw_packet, generation);
                 }
             };
 
@@ -1778,7 +2218,7 @@ impl Shared {
                     .fire_player_command(&mut cmd_event)
                     .await;
                 if cmd_event.cancelled {
-                    return self.swallow_chat(&raw_packet);
+                    return self.swallow_chat(&raw_packet, generation);
                 }
 
                 let first_word = cmd_event
@@ -1790,7 +2230,7 @@ impl Shared {
                 if self.command_dispatcher.handles(first_word, &source) {
                     self.command_dispatcher
                         .handle_command(&source, &cmd_event.command);
-                    return self.swallow_chat(&raw_packet);
+                    return self.swallow_chat(&raw_packet, generation);
                 }
 
                 if cmd_event.command != command {
@@ -1812,7 +2252,7 @@ impl Shared {
                 };
                 self.plugin_manager.fire_player_chat(&mut chat_event).await;
                 if chat_event.cancelled {
-                    return self.swallow_chat(&raw_packet);
+                    return self.swallow_chat(&raw_packet, generation);
                 }
                 if chat_event.message != message
                     && let Some(reason) = self.rewrite_chat(&mut raw_packet, &chat_event.message)
@@ -1823,7 +2263,11 @@ impl Shared {
 
             if PacketKind::ServerboundPluginMessage.matches(raw_packet.id, version)
                 && !self
-                    .plugin_message_event(&mut raw_packet, server, PluginMessageSource::Player)
+                    .plugin_message_event(
+                        &mut raw_packet,
+                        &served.name,
+                        PluginMessageSource::Player,
+                    )
                     .await
             {
                 return None;
@@ -1832,165 +2276,81 @@ impl Shared {
             if PacketKind::CommandSuggestionRequest.matches(raw_packet.id, version)
                 && let Ok(suggestion_req) =
                     decode_packet::<CommandSuggestionRequest>(&raw_packet.payload, version)
-                && self.suggest(suggestion_req, served).await
             {
-                return None;
+                match self.suggest(suggestion_req) {
+                    Suggest::Proxy(request) => {
+                        return Some(ClientEvent::Suggest {
+                            request,
+                            served: generation,
+                        });
+                    }
+                    Suggest::Completion(pending) => completion = Some(pending),
+                    Suggest::Backend => {}
+                }
             }
         }
 
-        if version >= ProtocolVersion::V1_20_2 {
-            self.client_settings
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .observe(&raw_packet, current, version);
-        }
+        let setting = if version >= ProtocolVersion::V1_20_2 {
+            client_setting(&raw_packet, current, version)
+        } else {
+            None
+        };
         Some(ClientEvent::Packet {
             packet: raw_packet.to_bytes(),
             entered,
+            setting,
+            completion,
+            served: generation,
         })
     }
 
-    /// Answers a suggestion request for a proxy command; true when the backend must not see it
-    async fn suggest(
-        self: &Arc<Self>,
-        suggestion_req: CommandSuggestionRequest,
-        served: &watch::Receiver<String>,
-    ) -> bool {
-        let version = self.version;
+    /// Works out who answers a suggestion request
+    fn suggest(&self, suggestion_req: CommandSuggestionRequest) -> Suggest {
         let raw_cmd = &suggestion_req.text;
         let clean_cmd = raw_cmd.strip_prefix('/').unwrap_or(raw_cmd);
         let first_word = clean_cmd.split_whitespace().next().unwrap_or(clean_cmd);
         let source = self.command_source();
+        let offset = if raw_cmd.starts_with('/') { 1 } else { 0 };
 
         // 1. Arguments to a proxy command (contains a space, e.g. "/server ", "/send ")
-        if clean_cmd.contains(' ') && self.command_dispatcher.handles(first_word, &source) {
-            // Plugins answer these, so they run off the reader to keep its traffic flowing
-            let request = SuggestionRequest {
-                id: suggestion_req.id,
-                input: clean_cmd.to_string(),
-                offset: if raw_cmd.starts_with('/') { 1 } else { 0 },
-                source,
-                served: served.clone(),
-            };
-            {
-                let mut state = self.suggesting.lock().unwrap_or_else(|e| e.into_inner());
-                if state.busy {
-                    state.next = Some(request);
-                    return true;
-                }
-                state.busy = true;
+        if clean_cmd.contains(' ') {
+            if self.command_dispatcher.handles(first_word, &source) {
+                return Suggest::Proxy(SuggestionRequest {
+                    id: suggestion_req.id,
+                    input: clean_cmd.to_string(),
+                    offset,
+                    source,
+                });
             }
-            let shared = self.clone();
-            tokio::spawn(async move {
-                let mut request = request;
-                loop {
-                    let SuggestionRequest {
-                        id,
-                        input,
-                        offset,
-                        source,
-                        served,
-                    } = request;
-                    let dispatcher = shared.command_dispatcher.clone();
-                    let suggestions = tokio::task::spawn_blocking(move || {
-                        dispatcher.suggest_with_range(&input, &source)
-                    })
-                    .await;
-                    let next = {
-                        let mut state = shared.suggesting.lock().unwrap_or_else(|e| e.into_inner());
-                        let next = state.next.take();
-                        state.busy = next.is_some();
-                        next
-                    };
-                    if next.is_none()
-                        && served.has_changed().is_ok_and(|changed| !changed)
-                        && let Ok(suggestions) = suggestions
-                    {
-                        let response = CommandSuggestions {
-                            id,
-                            start: (suggestions.range.start + offset) as i32,
-                            length: suggestions.range.len() as i32,
-                            matches: suggestions
-                                .suggestions
-                                .into_iter()
-                                .map(|s| Suggestion {
-                                    text: s.text.cached_text().clone(),
-                                    tooltip: s.tooltip.map(|t| component_json(&t, version)),
-                                })
-                                .collect(),
-                        };
-                        if let Ok(bytes) = encode_packet(&response, version) {
-                            shared.client_tx.send_in_play(bytes, &shared.phase).await;
-                        }
-                    }
-                    match next {
-                        Some(next) => request = next,
-                        None => break,
-                    }
-                }
-            });
-            return true;
+            return Suggest::Backend;
         }
 
         // 2. Root command name completion (no space, e.g. "/", "/s", "/ser", "/server")
-        if !clean_cmd.contains(' ') {
-            let clean_lower = clean_cmd.to_ascii_lowercase();
-            let permitted = self.command_dispatcher.get_all_permitted_commands(&source);
-            let proxy_matches: Vec<(String, Option<String>)> = permitted
-                .into_iter()
-                .filter(|(cmd_name, _)| cmd_name.starts_with(&clean_lower))
-                .map(|(cmd_name, description)| {
-                    (cmd_name.to_string(), Some(description.to_string()))
-                })
-                .collect();
-
-            if !proxy_matches.is_empty() {
-                let offset = if raw_cmd.starts_with('/') { 1 } else { 0 };
-                let req_id = suggestion_req.id;
-
-                self.pending_suggestions.lock().await.insert(
-                    req_id,
-                    PendingSuggestion {
-                        clean_cmd: clean_cmd.to_string(),
-                        offset,
-                        proxy_matches,
-                    },
-                );
-
-                let shared = self.clone();
-                let served = served.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                    if let Some(pending) = shared.pending_suggestions.lock().await.remove(&req_id) {
-                        let response = CommandSuggestions {
-                            id: req_id,
-                            start: pending.offset as i32,
-                            length: pending.clean_cmd.len() as i32,
-                            matches: pending
-                                .proxy_matches
-                                .into_iter()
-                                .map(|(cmd, tip)| Suggestion {
-                                    text: cmd,
-                                    tooltip: tip
-                                        .map(|t| component_json(&TextComponent::text(t), version)),
-                                })
-                                .collect(),
-                        };
-                        if served.has_changed().is_ok_and(|changed| !changed)
-                            && let Ok(bytes) = encode_packet(&response, version)
-                        {
-                            shared.client_tx.send_in_play(bytes, &shared.phase).await;
-                        }
-                    }
-                });
-            }
+        let clean_lower = clean_cmd.to_ascii_lowercase();
+        let permitted = self.command_dispatcher.get_all_permitted_commands(&source);
+        let proxy_matches: Vec<(String, Option<String>)> = permitted
+            .into_iter()
+            .filter(|(cmd_name, _)| cmd_name.starts_with(&clean_lower))
+            .map(|(cmd_name, description)| (cmd_name.to_string(), Some(description.to_string())))
+            .collect();
+        if proxy_matches.is_empty() {
+            return Suggest::Backend;
         }
-        false
+        Suggest::Completion(PendingSuggestion {
+            id: suggestion_req.id,
+            clean_cmd: clean_cmd.to_string(),
+            offset,
+            proxy_matches,
+        })
     }
 
     // The backend tracks which chat messages the client has seen through these packets, so one the
     // proxy drops must still hand its acknowledgements on, and a signed one cannot be dropped at all
-    fn swallow_chat(&self, packet: &crate::protocol::RawPacket) -> Option<ClientEvent> {
+    fn swallow_chat(
+        &self,
+        packet: &crate::protocol::RawPacket,
+        served: u64,
+    ) -> Option<ClientEvent> {
         let version = self.version;
         let kind = if PacketKind::ChatCommand.matches(packet.id, version) {
             PacketKind::ChatCommand
@@ -2019,10 +2379,7 @@ impl Shared {
                 version,
             )
         {
-            return Some(ClientEvent::Packet {
-                packet: ack,
-                entered: None,
-            });
+            return Some(plain_packet(ack, served));
         }
         None
     }
@@ -2110,64 +2467,104 @@ impl Shared {
     }
 }
 
-/// What a tunnel was in the middle of, for the next one to finish
-#[derive(Default)]
-struct Carried {
-    // The client's acknowledgement that it is playing is on its way to the backend
-    reached_play: bool,
-    // A message for the client waiting for room in its queue
-    message: Option<Bytes>,
-}
-
-/// Why a backend's reader stopped
+/// What a backend's reader hands the tunnel
 enum BackendEvent {
-    Disconnected { reason: Option<String> },
+    /// A packet whose effect on the session the tunnel decides before queueing it for the client
+    /// with the room already taken for it; the reader goes on once `done` is answered, so
+    /// nothing it reads later overtakes it
+    Packet {
+        packet: crate::protocol::RawPacket,
+        permit: OwnedSemaphorePermit,
+        done: oneshot::Sender<()>,
+    },
+    Lost {
+        reason: Option<String>,
+    },
     ClientGone,
 }
 
-/// The backend the client is on; it is read and written by tasks of its own
+/// The backend the client is on
 struct Backend {
+    name: String,
+    conn: Conn,
+}
+
+enum Conn {
+    Open(OpenBackend),
+    Gone { reason: Option<String> },
+}
+
+/// A backend read and written by tasks of its own
+struct OpenBackend {
     writes: mpsc::Sender<Bytes>,
-    events: mpsc::Receiver<BackendEvent>,
-    reader: Task,
+    // None once the reader has finished
+    events: Option<mpsc::Receiver<BackendEvent>>,
+    // Dropped to stop the reader once the packet in hand has reached the client queue
+    stop: Option<oneshot::Sender<()>>,
+    _reader: Task,
     _writer: Lingering,
 }
 
 impl Backend {
     fn start(
-        shared: &Arc<Shared>,
+        session: &Arc<Session>,
         reader: BackendReader,
         writer: BackendWriter,
-        server_name: &str,
+        name: String,
+        phase: Phase,
+        initial: Vec<Bytes>,
     ) -> Self {
-        if let Ok(mut challenge) = shared.keep_alive_challenge.lock() {
-            *challenge = None;
-        }
         let (events_tx, events) = mpsc::channel(1);
+        let (stop, stopped) = oneshot::channel();
         let reader = Task::spawn(read_backend(
-            shared.clone(),
+            session.clone(),
             reader,
-            server_name.to_string(),
+            name.clone(),
+            phase,
             events_tx,
+            stopped,
         ));
         let (writes, rx) = mpsc::channel(BACKEND_WRITES);
+        for packet in initial {
+            let _ = writes.try_send(packet);
+        }
         let writer = Lingering(tokio::spawn(write_backend(
             writer,
             rx,
-            shared.username.clone(),
+            session.username.clone(),
         )));
         Self {
-            writes,
-            events,
-            reader,
-            _writer: writer,
+            name,
+            conn: Conn::Open(OpenBackend {
+                writes,
+                events: Some(events),
+                stop: Some(stop),
+                _reader: reader,
+                _writer: writer,
+            }),
         }
     }
 
-    /// Stops reading once the packet in hand has reached the client queue; the rest is left unread
-    async fn stop_reading(&mut self) {
-        self.events.close();
-        self.reader.join().await;
+    /// Asks the reader to stop; false if it already has
+    fn stop_reading(&mut self) -> bool {
+        match &mut self.conn {
+            Conn::Open(open) if open.events.is_some() => {
+                open.stop = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The reader's next event; `None` once it has finished
+    async fn next_event(&mut self) -> Option<BackendEvent> {
+        match &mut self.conn {
+            Conn::Open(OpenBackend {
+                events: Some(events),
+                ..
+            }) => events.recv().await,
+            _ => std::future::pending().await,
+        }
     }
 }
 
@@ -2189,83 +2586,86 @@ async fn write_backend(mut writer: BackendWriter, mut rx: mpsc::Receiver<Bytes>,
 }
 
 async fn read_backend(
-    shared: Arc<Shared>,
+    session: Arc<Session>,
     mut reader: BackendReader,
     server_name: String,
+    mut phase: Phase,
     events: mpsc::Sender<BackendEvent>,
+    mut stop: oneshot::Receiver<()>,
 ) {
-    let event = loop {
+    loop {
         let packet = tokio::select! {
             biased;
-            _ = events.closed() => return,
+            _ = &mut stop => return,
             packet = reader.read_packet() => packet,
         };
         let handled = match packet {
-            Ok(packet) => shared.backend_packet(packet, &server_name).await,
+            Ok(packet) => {
+                session
+                    .backend_packet(packet, &server_name, &mut phase, &events)
+                    .await
+            }
             Err(e) => {
-                debug!("Backend stream ended for '{}': {:?}", shared.username, e);
-                Err(BackendEvent::Disconnected {
+                debug!("Backend stream ended for '{}': {:?}", session.username, e);
+                Err(Some(BackendEvent::Lost {
                     reason: Some(e.to_string()),
-                })
+                }))
             }
         };
-        if let Err(event) = handled {
-            break event;
+        match handled {
+            Ok(()) => {}
+            Err(Some(event)) => {
+                let _ = events.send(event).await;
+                return;
+            }
+            Err(None) => return,
         }
-    };
-    let _ = events.send(event).await;
+    }
 }
 
-impl Shared {
-    /// Passes a packet from the backend on to the client queue, waiting for room there
+/// Backend packets the tunnel itself has to see, in the phase the reader reads them in
+fn watched(id: i32, version: ProtocolVersion) -> bool {
+    PacketKind::StartConfiguration.matches(id, version)
+        || PacketKind::PlayKeepAlive.matches(id, version)
+        || PacketKind::CommandSuggestionsResponse.matches(id, version)
+        || (version < ProtocolVersion::V1_20_2
+            && (PacketKind::PlayerInfo.matches(id, version)
+                || PacketKind::PlayerInfoRemove.matches(id, version)
+                || PacketKind::BossBar.matches(id, version)))
+}
+
+impl Session {
+    /// Passes a packet from the backend on to the client queue, waiting for room there. `phase`
+    /// follows what the backend sends: it switches right after its ConfigFinish and its
+    /// StartConfiguration, as the client does on reading them.
     async fn backend_packet(
         &self,
         mut raw_packet: crate::protocol::RawPacket,
         server_name: &str,
-    ) -> Result<(), BackendEvent> {
+        phase: &mut Phase,
+        events: &mpsc::Sender<BackendEvent>,
+    ) -> Result<(), Option<BackendEvent>> {
         let version = self.version;
-        let client_tx = &self.client_tx;
-        let current = self.phase.backend();
-        if current == Phase::Config && PacketKind::ConfigDisconnect.matches(raw_packet.id, version)
-        {
-            let reason = decode_packet::<ConfigDisconnect>(&raw_packet.payload, version)
-                .map(|d| plain_text(&d.reason))
-                .ok();
-            return Err(BackendEvent::Disconnected { reason });
-        }
-
-        if current == Phase::Config
-            && PacketKind::ConfigClientboundPluginMessage.matches(raw_packet.id, version)
-            && !self
-                .plugin_message_event(&mut raw_packet, server_name, PluginMessageSource::Server)
-                .await
-        {
-            return Ok(());
-        }
-
+        let current = *phase;
         let mut packet = None;
-        if current == Phase::Play {
-            if PacketKind::StartConfiguration.matches(raw_packet.id, version) {
-                let bytes = raw_packet.to_bytes();
-                if !client_tx.send_start_configuration(bytes, &self.phase).await {
-                    return Err(BackendEvent::ClientGone);
-                }
+        if current == Phase::Config {
+            if PacketKind::ConfigDisconnect.matches(raw_packet.id, version) {
+                let reason = decode_packet::<ConfigDisconnect>(&raw_packet.payload, version)
+                    .map(|d| plain_text(&d.reason))
+                    .ok();
+                return Err(Some(BackendEvent::Lost { reason }));
+            }
+            if PacketKind::ConfigClientboundPluginMessage.matches(raw_packet.id, version)
+                && !self
+                    .plugin_message_event(&mut raw_packet, server_name, PluginMessageSource::Server)
+                    .await
+            {
                 return Ok(());
             }
-
-            if version < ProtocolVersion::V1_20_2
-                && let Ok(mut leftovers) = self.leftovers.lock()
-            {
-                leftovers.observe(&raw_packet, version);
+            if PacketKind::ConfigFinish.matches(raw_packet.id, version) {
+                *phase = Phase::Play;
             }
-
-            if PacketKind::PlayKeepAlive.matches(raw_packet.id, version)
-                && let Ok(challenge) = decode_packet::<PlayKeepAlive>(&raw_packet.payload, version)
-                && let Ok(mut current) = self.keep_alive_challenge.lock()
-            {
-                *current = Some(challenge.id);
-            }
-
+        } else if current == Phase::Play {
             if PacketKind::PlayDisconnect.matches(raw_packet.id, version) {
                 let reason = decode_packet::<PlayDisconnect>(&raw_packet.payload, version)
                     .map(|d| plain_text(&d.reason))
@@ -2274,25 +2674,17 @@ impl Shared {
                         let s = String::from_utf8_lossy(&raw_packet.payload).to_string();
                         if s.is_empty() { None } else { Some(s) }
                     });
-                return Err(BackendEvent::Disconnected { reason });
+                return Err(Some(BackendEvent::Lost { reason }));
             }
 
-            if PacketKind::CommandSuggestionsResponse.matches(raw_packet.id, version)
-                && let Ok(mut backend_suggestions) =
-                    decode_packet::<CommandSuggestions>(&raw_packet.payload, version)
-                && let Some(pending) = self
-                    .pending_suggestions
-                    .lock()
-                    .await
-                    .remove(&backend_suggestions.id)
-            {
-                merge_suggestions(
-                    &mut backend_suggestions.matches,
-                    pending.proxy_matches,
-                    version,
-                );
-                packet = encode_packet(&backend_suggestions, version).ok();
-            } else if PacketKind::ClientboundPluginMessage.matches(raw_packet.id, version)
+            if watched(raw_packet.id, version) {
+                if PacketKind::StartConfiguration.matches(raw_packet.id, version) {
+                    *phase = Phase::Config;
+                }
+                return self.through_tunnel(raw_packet, events).await;
+            }
+
+            if PacketKind::ClientboundPluginMessage.matches(raw_packet.id, version)
                 && !self
                     .plugin_message_event(&mut raw_packet, server_name, PluginMessageSource::Server)
                     .await
@@ -2324,135 +2716,31 @@ impl Shared {
         }
 
         let bytes = packet.unwrap_or_else(|| raw_packet.to_bytes());
-        if !client_tx.send(bytes).await {
-            return Err(BackendEvent::ClientGone);
+        if !self.client_out.send(bytes).await {
+            return Err(Some(BackendEvent::ClientGone));
         }
         Ok(())
     }
-}
 
-impl BackendBridge {
-    /// Tunnels packets back and forth between client and backend
-    async fn bridge_tunnel(
-        shared: &Arc<Shared>,
-        client_events: &mut mpsc::Receiver<ClientEvent>,
-        backend: &mut Backend,
-        action_rx: &mut mpsc::Receiver<PlayerAction>,
-        connecting: Option<&mut Connecting<'_>>,
-        wake_on_play: bool,
-        carried: &mut Carried,
-    ) -> Result<TunnelExit, BridgeError> {
-        let username = shared.username.as_str();
-        let client_version = shared.version;
-        let client_tx = &shared.client_tx;
-        let phase = &shared.phase;
-        let Backend {
-            writes: backend_writes,
-            events: backend_events,
-            ..
-        } = backend;
-        let Carried {
-            reached_play,
-            message: held_message,
-        } = carried;
-        if std::mem::take(reached_play) {
-            return Ok(TunnelExit::ReachedPlay);
+    /// Hands a packet to the tunnel and waits until it has been queued for the client
+    async fn through_tunnel(
+        &self,
+        packet: crate::protocol::RawPacket,
+        events: &mpsc::Sender<BackendEvent>,
+    ) -> Result<(), Option<BackendEvent>> {
+        let Some(permit) = self.client_out.reserve(packet.payload.len() + 1).await else {
+            return Err(Some(BackendEvent::ClientGone));
+        };
+        let (done, queued) = oneshot::channel();
+        let event = BackendEvent::Packet {
+            packet,
+            permit,
+            done,
+        };
+        if events.send(event).await.is_err() {
+            return Err(None);
         }
-
-        let client_writer = async {
-            client_tx.closed().await;
-            TunnelExit::ClientDisconnected
-        };
-
-        let client_to_backend = async {
-            loop {
-                let packet = match client_events.recv().await {
-                    Some(ClientEvent::Packet { packet, entered }) => {
-                        if let Some(next) = entered {
-                            phase.set(next);
-                            *reached_play = next == Phase::Play && wake_on_play;
-                        }
-                        packet
-                    }
-                    Some(ClientEvent::KeepAliveResponse { id, packet }) => {
-                        if !shared.answers_challenge(id) {
-                            debug!("Dropping stale keep-alive {} from '{}'", id, username);
-                            continue;
-                        }
-                        packet
-                    }
-                    Some(ClientEvent::Kick(reason)) => return TunnelExit::Kicked { reason },
-                    Some(ClientEvent::Closed) | None => return TunnelExit::ClientDisconnected,
-                };
-                if backend_writes.send(packet).await.is_err() {
-                    return TunnelExit::BackendDisconnected { reason: None };
-                }
-                if std::mem::take(reached_play) {
-                    return TunnelExit::ReachedPlay;
-                }
-            }
-        };
-
-        let backend_to_client = async {
-            match backend_events.recv().await {
-                Some(BackendEvent::Disconnected { reason }) => {
-                    TunnelExit::BackendDisconnected { reason }
-                }
-                Some(BackendEvent::ClientGone) => TunnelExit::ClientDisconnected,
-                None => TunnelExit::BackendDisconnected { reason: None },
-            }
-        };
-
-        let action_loop = async {
-            loop {
-                if let Some(bytes) = held_message.as_ref() {
-                    if !client_tx.send_in_play(bytes.clone(), phase).await {
-                        debug!("Dropping a message for '{}' outside play", username);
-                    }
-                    *held_message = None;
-                }
-                let Some(action) = action_rx.recv().await else {
-                    return TunnelExit::ClientDisconnected;
-                };
-                let encoded = match action {
-                    PlayerAction::Connect { server_name } => {
-                        return TunnelExit::Connect { server_name };
-                    }
-                    PlayerAction::Disconnect(reason) => {
-                        return TunnelExit::Kicked { reason };
-                    }
-                    PlayerAction::Message(content) => encode_packet(
-                        &SystemChat {
-                            content: component_json(&content, client_version),
-                            overlay: false,
-                        },
-                        client_version,
-                    ),
-                    PlayerAction::PluginMessage { channel, data } => {
-                        encode_packet(&ClientboundPluginMessage { channel, data }, client_version)
-                    }
-                };
-                *held_message = encoded.ok();
-            }
-        };
-
-        // A switch logs in to the next backend while this tunnel keeps the current one running
-        let prepared = async {
-            match connecting {
-                Some(future) => TunnelExit::Prepared(Box::new(future.as_mut().await)),
-                None => std::future::pending().await,
-            }
-        };
-
-        let exit = tokio::select! {
-            exit = client_to_backend => exit,
-            exit = backend_to_client => exit,
-            exit = action_loop => exit,
-            exit = client_writer => exit,
-            exit = prepared => exit,
-        };
-
-        Ok(exit)
+        queued.await.map_err(|_| None)
     }
 }
 
@@ -2504,15 +2792,6 @@ mod tests {
             serverbound_transition(Phase::Play, 0x0F, ProtocolVersion(763)),
             None
         );
-    }
-
-    #[test]
-    fn test_phase_cell_round_trip() {
-        let cell = PhaseCell::new(Phase::Login);
-        for phase in [Phase::Config, Phase::Play, Phase::Login] {
-            cell.set(phase);
-            assert_eq!(cell.get(), phase);
-        }
     }
 
     #[tokio::test]
