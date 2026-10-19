@@ -9,7 +9,7 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
@@ -365,7 +365,7 @@ impl BackendBridge {
     /// Establishes connection to backend, handles login handshake, and tunnels packets
     pub async fn run<R, W>(
         self,
-        mut client_reader: PacketReader<R>,
+        client_reader: PacketReader<R>,
         mut client_writer: PacketWriter<W>,
         action_tx: mpsc::Sender<PlayerAction>,
         mut action_rx: mpsc::Receiver<PlayerAction>,
@@ -476,21 +476,6 @@ impl BackendBridge {
 
         // Forward login success packet to the client
         client_writer.send(success_bytes).await?;
-        // Keep-alive replies meant for a previous backend would make the current one kick the
-        // player, so only replies to the current backend's latest challenge are forwarded
-        let keep_alive_challenge = std::sync::Mutex::new(None::<i64>);
-        let leftovers = std::sync::Mutex::new(Leftovers::default());
-        let client_settings = std::sync::Mutex::new(ClientSettings::default());
-        let phase = Arc::new(PhaseCell::new(
-            if self.client_version >= ProtocolVersion::V1_20_2 {
-                Phase::Login
-            } else {
-                Phase::Play
-            },
-        ));
-        let suggesting = Arc::new(std::sync::Mutex::new(Suggesting::default()));
-        // Kept for the whole session, so restarting the tunnel does not reset it
-        let mut client_rate_limiter = PacketRateLimiter::new(self.max_packets_per_sec);
 
         self.online_players.fetch_add(1, Ordering::Relaxed);
         info!(
@@ -527,6 +512,37 @@ impl BackendBridge {
             client_tx.budget.clone(),
             self.player.username.clone(),
         ));
+        let shared = Arc::new(Shared {
+            username: self.player.username.clone(),
+            uuid: self.player.id,
+            version: self.client_version,
+            plugin_manager: self.plugin_manager.clone(),
+            session_manager: self.session_manager.clone(),
+            command_dispatcher: self.command_dispatcher.clone(),
+            proxy_config: self.proxy_config.clone(),
+            action_tx: action_tx.clone(),
+            client_tx,
+            phase: PhaseCell::new(if self.client_version >= ProtocolVersion::V1_20_2 {
+                Phase::Login
+            } else {
+                Phase::Play
+            }),
+            served: watch::Sender::new(current_server_name.clone()),
+            keep_alive_challenge: std::sync::Mutex::new(None),
+            leftovers: std::sync::Mutex::new(Leftovers::default()),
+            client_settings: std::sync::Mutex::new(ClientSettings::default()),
+            suggesting: std::sync::Mutex::new(Suggesting::default()),
+            pending_suggestions: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        });
+        let (client_events_tx, mut client_events) = mpsc::channel(CLIENT_EVENTS);
+        let _client_reader = Task::spawn(read_client(
+            shared.clone(),
+            client_reader,
+            PacketRateLimiter::new(self.max_packets_per_sec),
+            client_events_tx,
+        ));
+        let client_tx = &shared.client_tx;
+        let phase = &shared.phase;
         let bridge = &self;
         let mut connecting: Option<(String, Connecting<'_>)> = None;
         // A switch asked for, or a backend that finished logging in, while the client is still
@@ -537,34 +553,22 @@ impl BackendBridge {
         let mut pending_exit: Option<TunnelExit> = None;
         // Set when the current backend is gone, so a waiting switch must finish right away
         let mut backend_gone = false;
+        let mut reached_play = false;
 
         loop {
             let tunnel_res = if let Some(exit) = pending_exit.take() {
                 Ok(exit)
             } else {
                 Self::bridge_tunnel(
-                    &self.player.username,
-                    &mut client_reader,
-                    &client_tx,
+                    &shared,
+                    &mut client_events,
                     &mut backend_reader,
                     &mut backend_writer,
-                    &mut client_rate_limiter,
-                    self.client_version,
                     &mut action_rx,
-                    &action_tx,
-                    self.command_dispatcher.clone(),
-                    self.proxy_config.clone(),
-                    self.session_manager.clone(),
-                    self.plugin_manager.clone(),
-                    self.player.id,
-                    current_server_name.clone(),
-                    &phase,
-                    &suggesting,
-                    &keep_alive_challenge,
-                    &leftovers,
-                    &client_settings,
+                    &current_server_name,
                     connecting.as_mut().map(|(_, future)| future),
                     deferred.is_some() || early.is_some(),
+                    &mut reached_play,
                 )
                 .await
             };
@@ -585,7 +589,7 @@ impl BackendBridge {
             match exit {
                 TunnelExit::Kicked { reason } => {
                     info!("Kicking player '{}': {}", self.player.username, reason);
-                    self.disconnect_client(writer, &client_tx, phase.backend(), &reason)
+                    self.disconnect_client(writer, client_tx, phase.backend(), &reason)
                         .await;
                     break;
                 }
@@ -621,8 +625,8 @@ impl BackendBridge {
                     }
                     if connecting.is_some() {
                         self.notify(
-                            &client_tx,
-                            &phase,
+                            client_tx,
+                            phase,
                             translate(
                                 self.locale().as_deref(),
                                 "vine.server.already_connecting",
@@ -656,8 +660,8 @@ impl BackendBridge {
                             )
                         });
                         self.notify(
-                            &client_tx,
-                            &phase,
+                            client_tx,
+                            phase,
                             translate(
                                 self.locale().as_deref(),
                                 "vine.server.switch_cancelled",
@@ -669,8 +673,8 @@ impl BackendBridge {
                     let server_name = connect_event.target_server;
                     if server_name == current_server_name {
                         self.notify(
-                            &client_tx,
-                            &phase,
+                            client_tx,
+                            phase,
                             translate(
                                 self.locale().as_deref(),
                                 "vine.command.server.already_connected",
@@ -683,8 +687,8 @@ impl BackendBridge {
                     let Some(target_config) = self.proxy_config.servers.get(&server_name).cloned()
                     else {
                         self.notify(
-                            &client_tx,
-                            &phase,
+                            client_tx,
+                            phase,
                             translate(
                                 self.locale().as_deref(),
                                 "vine.server.unknown",
@@ -719,11 +723,9 @@ impl BackendBridge {
                     let switched = match *prepared {
                         Ok(prepared) => {
                             self.finish_switch(
-                                &mut client_reader,
-                                &client_tx,
-                                &phase,
-                                &leftovers,
-                                &client_settings,
+                                &shared,
+                                &mut client_events,
+                                &mut backend_writer,
                                 &server_name,
                                 prepared,
                             )
@@ -735,7 +737,7 @@ impl BackendBridge {
                         Ok((new_reader, new_writer)) => {
                             backend_reader = new_reader;
                             backend_writer = new_writer;
-                            if let Ok(mut challenge) = keep_alive_challenge.lock() {
+                            if let Ok(mut challenge) = shared.keep_alive_challenge.lock() {
                                 *challenge = None;
                             }
                             current_server_name = server_name;
@@ -760,8 +762,8 @@ impl BackendBridge {
                                 self.player.username, server_name, e
                             );
                             self.notify(
-                                &client_tx,
-                                &phase,
+                                client_tx,
+                                phase,
                                 translate(
                                     self.locale().as_deref(),
                                     "vine.server.connect_failed",
@@ -776,7 +778,7 @@ impl BackendBridge {
                             );
                             self.disconnect_client(
                                 writer,
-                                &client_tx,
+                                client_tx,
                                 phase.backend(),
                                 &translate(
                                     self.locale().as_deref(),
@@ -833,7 +835,7 @@ impl BackendBridge {
                         .clone()
                         .filter(|(fb_name, _)| fb_name != &current_server_name);
                     let Some((fb_name, fb_cfg)) = fallback else {
-                        self.disconnect_client(writer, &client_tx, phase.backend(), &reason)
+                        self.disconnect_client(writer, client_tx, phase.backend(), &reason)
                             .await;
                         break;
                     };
@@ -853,7 +855,7 @@ impl BackendBridge {
                         .await;
                     if connect_event.cancelled {
                         let reason = connect_event.cancel_reason.unwrap_or(reason);
-                        self.disconnect_client(writer, &client_tx, phase.backend(), &reason)
+                        self.disconnect_client(writer, client_tx, phase.backend(), &reason)
                             .await;
                         break;
                     }
@@ -870,8 +872,8 @@ impl BackendBridge {
                         self.player.username, fb_name, current_server_name, reason
                     );
                     self.notify(
-                        &client_tx,
-                        &phase,
+                        client_tx,
+                        phase,
                         translate(
                             self.locale().as_deref(),
                             "vine.server.fallback",
@@ -881,11 +883,9 @@ impl BackendBridge {
 
                     match self
                         .switch_backend(
-                            &mut client_reader,
-                            &client_tx,
-                            &phase,
-                            &leftovers,
-                            &client_settings,
+                            &shared,
+                            &mut client_events,
+                            &mut backend_writer,
                             &fb_name,
                             &fb_cfg,
                         )
@@ -894,7 +894,7 @@ impl BackendBridge {
                         Ok((new_reader, new_writer)) => {
                             backend_reader = new_reader;
                             backend_writer = new_writer;
-                            if let Ok(mut challenge) = keep_alive_challenge.lock() {
+                            if let Ok(mut challenge) = shared.keep_alive_challenge.lock() {
                                 *challenge = None;
                             }
                             current_server_name = fb_name;
@@ -920,7 +920,7 @@ impl BackendBridge {
                             );
                             self.disconnect_client(
                                 writer,
-                                &client_tx,
+                                client_tx,
                                 phase.backend(),
                                 &translate(
                                     self.locale().as_deref(),
@@ -959,34 +959,20 @@ impl BackendBridge {
 
     /// Logs into another backend and moves the client over to it. On 1.20.2+ the client is sent
     /// back into the configuration phase so the new backend can configure it from scratch.
-    #[allow(clippy::too_many_arguments)]
-    async fn switch_backend<R>(
+    async fn switch_backend(
         &self,
-        client_reader: &mut PacketReader<R>,
-        client_tx: &ClientQueue,
-        phase: &PhaseCell,
-        leftovers: &std::sync::Mutex<Leftovers>,
-        client_settings: &std::sync::Mutex<ClientSettings>,
+        shared: &Shared,
+        client_events: &mut mpsc::Receiver<ClientEvent>,
+        old_backend: &mut BackendWriter,
         server_name: &str,
         config: &BackendConfig,
-    ) -> Result<(BackendReader, BackendWriter), SwitchError>
-    where
-        R: AsyncRead + Unpin,
-    {
+    ) -> Result<(BackendReader, BackendWriter), SwitchError> {
         let prepared = self
             .prepare_backend(server_name, config)
             .await
             .map_err(SwitchError::Unreachable)?;
-        self.finish_switch(
-            client_reader,
-            client_tx,
-            phase,
-            leftovers,
-            client_settings,
-            server_name,
-            prepared,
-        )
-        .await
+        self.finish_switch(shared, client_events, old_backend, server_name, prepared)
+            .await
     }
 
     /// Logs in to the next backend without touching the client, so the current one keeps running
@@ -1027,26 +1013,23 @@ impl BackendBridge {
     }
 
     /// Moves the client over to a backend that `prepare_backend` already logged in to
-    #[allow(clippy::too_many_arguments)]
-    async fn finish_switch<R>(
+    async fn finish_switch(
         &self,
-        client_reader: &mut PacketReader<R>,
-        client_tx: &ClientQueue,
-        phase: &PhaseCell,
-        leftovers: &std::sync::Mutex<Leftovers>,
-        client_settings: &std::sync::Mutex<ClientSettings>,
+        shared: &Shared,
+        client_events: &mut mpsc::Receiver<ClientEvent>,
+        old_backend: &mut BackendWriter,
         server_name: &str,
         prepared: PreparedBackend,
-    ) -> Result<(BackendReader, BackendWriter), SwitchError>
-    where
-        R: AsyncRead + Unpin,
-    {
+    ) -> Result<(BackendReader, BackendWriter), SwitchError> {
         let PreparedBackend {
             reader: backend_reader,
             writer: mut backend_writer,
             join_game,
         } = prepared;
         let version = self.client_version;
+        let client_tx = &shared.client_tx;
+        let phase = &shared.phase;
+        shared.served.send_replace(server_name.to_string());
         if let Some((mut pending, join_game)) = join_game {
             let joining = join_game_sequence(&join_game, version).unwrap_or_else(|e| {
                 debug!(
@@ -1056,7 +1039,8 @@ impl BackendBridge {
                 vec![join_game.to_bytes()]
             });
             {
-                let mut leftovers = leftovers
+                let mut leftovers = shared
+                    .leftovers
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 pending.extend(leftovers.clear_players(version));
@@ -1072,9 +1056,7 @@ impl BackendBridge {
         let awaited = match phase.get() {
             // The old backend already asked for reconfiguration, so the client is about to
             // acknowledge that one
-            Phase::Play if phase.backend() == Phase::Config => {
-                Some(PacketKind::ConfigurationAcknowledged)
-            }
+            Phase::Play if phase.backend() == Phase::Config => true,
             Phase::Play => {
                 let start = encode_packet(&StartConfiguration, version)
                     .map_err(|e| SwitchError::Fatal(e.into()))?;
@@ -1083,30 +1065,41 @@ impl BackendBridge {
                     return Err(SwitchError::Fatal(client_timeout()));
                 }
                 phase.backend_started_configuration();
-                Some(PacketKind::ConfigurationAcknowledged)
+                true
             }
-            Phase::Login => Some(PacketKind::LoginAcknowledged),
-            Phase::Config => None,
+            Phase::Login => true,
+            Phase::Config => false,
         };
 
-        // Packets the client sends before acknowledging belong to the old backend
-        if let Some(kind) = awaited {
-            let current = phase.get();
+        if awaited {
+            // Packets the client sends before acknowledging, plugin events and all, still go to the
+            // old backend; a kick over one of them is moot as that backend is left right after
             let acknowledged = async {
                 loop {
-                    let packet = client_reader.read_packet().await?;
-                    if kind.matches(packet.id, version) {
-                        return Ok::<_, ProtocolError>(());
-                    }
-                    client_settings
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .observe(&packet, current, version);
+                    let packet = match client_events.recv().await {
+                        Some(ClientEvent::Packet {
+                            entered: Some(Phase::Config),
+                            ..
+                        }) => return true,
+                        Some(ClientEvent::Packet { packet, .. }) => packet,
+                        Some(ClientEvent::KeepAliveResponse { id, packet })
+                            if shared.answers_challenge(id) =>
+                        {
+                            packet
+                        }
+                        Some(ClientEvent::KeepAliveResponse { .. } | ClientEvent::Kick(_)) => {
+                            continue;
+                        }
+                        Some(ClientEvent::Closed) | None => return false,
+                    };
+                    let _ = old_backend.send(packet).await;
                 }
             };
             match timeout(SWITCH_ACK_TIMEOUT, acknowledged).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => return Err(SwitchError::Fatal(e.into())),
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(SwitchError::Fatal(ProtocolError::ConnectionClosed.into()));
+                }
                 Err(_) => return Err(SwitchError::Fatal(client_timeout())),
             }
         }
@@ -1115,7 +1108,8 @@ impl BackendBridge {
 
         let ack =
             encode_packet(&LoginAcknowledged, version).map_err(|e| SwitchError::Fatal(e.into()))?;
-        let repeated = client_settings
+        let repeated = shared
+            .client_settings
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .repeat(version);
@@ -1129,131 +1123,6 @@ impl BackendBridge {
             .await
             .map_err(|e| SwitchError::Fatal(e.into()))?;
         Ok((backend_reader, backend_writer))
-    }
-
-    // The backend tracks which chat messages the client has seen through these packets, so one the
-    // proxy drops must still hand its acknowledgements on, and a signed one cannot be dropped at all
-    async fn swallow_chat<W: AsyncWrite + Unpin>(
-        packet: &crate::protocol::RawPacket,
-        version: ProtocolVersion,
-        backend_writer: &mut PacketWriter<W>,
-        username: &str,
-        locale: Option<&str>,
-    ) -> Option<TunnelExit> {
-        let kind = if PacketKind::ChatCommand.matches(packet.id, version) {
-            PacketKind::ChatCommand
-        } else if PacketKind::SignedChatCommand.matches(packet.id, version) {
-            PacketKind::SignedChatCommand
-        } else {
-            PacketKind::ChatMessage
-        };
-        let signing = chat_signing(kind, &packet.payload, version).unwrap_or_default();
-        if signing.signed && version >= ProtocolVersion::V1_19_1 {
-            error!(
-                "Disconnecting '{}': a signed chat message was cancelled, which would break their chat with the backend",
-                username
-            );
-            return Some(TunnelExit::Kicked {
-                reason: translate(locale, "vine.chat.signed_cancelled", &[]),
-            });
-        }
-        if signing.acknowledged > 0
-            && let Ok(ack) = encode_packet(
-                &ChatAcknowledgement {
-                    offset: signing.acknowledged,
-                },
-                version,
-            )
-            && backend_writer.send(ack).await.is_err()
-        {
-            return Some(TunnelExit::BackendDisconnected { reason: None });
-        }
-        None
-    }
-
-    fn rewrite_chat(
-        packet: &mut crate::protocol::RawPacket,
-        version: ProtocolVersion,
-        text: &str,
-        username: &str,
-        locale: Option<&str>,
-    ) -> Option<TunnelExit> {
-        let kind = if PacketKind::ChatCommand.matches(packet.id, version) {
-            PacketKind::ChatCommand
-        } else if PacketKind::SignedChatCommand.matches(packet.id, version) {
-            PacketKind::SignedChatCommand
-        } else {
-            PacketKind::ChatMessage
-        };
-        if chat_signing(kind, &packet.payload, version)
-            .unwrap_or_default()
-            .signed
-        {
-            error!(
-                "Disconnecting '{}': a plugin changed a signed chat message, which the backend would reject",
-                username
-            );
-            return Some(TunnelExit::Kicked {
-                reason: translate(locale, "vine.chat.signed_changed", &[]),
-            });
-        }
-        let limit = match kind {
-            PacketKind::ChatMessage => chat_length_limit(version),
-            _ => command_length_limit(version),
-        };
-        if text.encode_utf16().count() > limit {
-            warn!(
-                "A plugin made a chat message from '{}' longer than the client limit; sending the original",
-                username
-            );
-            return None;
-        }
-        match replace_leading_string(&packet.payload, text) {
-            Ok(payload) => packet.payload = payload.into(),
-            Err(e) => warn!(
-                "Could not rewrite a chat message from '{}': {}",
-                username, e
-            ),
-        }
-        None
-    }
-
-    /// Returns false when a plugin cancelled the message.
-    async fn plugin_message_event(
-        plugin_manager: &PluginManager,
-        packet: &mut crate::protocol::RawPacket,
-        version: ProtocolVersion,
-        player_uuid: uuid::Uuid,
-        server_name: &str,
-        source: PluginMessageSource,
-    ) -> bool {
-        let Ok((channel, data)) = read_plugin_message(&mut &packet.payload[..], version) else {
-            return true;
-        };
-        // Backends trust this channel to come from the proxy, so players cannot use it
-        if source == PluginMessageSource::Player
-            && (channel == "BungeeCord" || channel == "bungeecord:main")
-        {
-            return false;
-        }
-        let mut event = PluginMessageEvent {
-            channel: channel.clone(),
-            data: data.clone(),
-            player_uuid: Some(player_uuid.to_string()),
-            server_name: Some(server_name.to_string()),
-            source,
-            cancelled: false,
-        };
-        plugin_manager.fire_plugin_message(&mut event).await;
-        if event.cancelled {
-            return false;
-        }
-        if event.data != data {
-            let mut payload = Vec::new();
-            write_plugin_message(&mut payload, &channel, &event.data, version);
-            packet.payload = payload.into();
-        }
-        true
     }
 
     /// Every player that got past PlayerLogin gets a PlayerDisconnect, even if no backend took them
@@ -1544,7 +1413,7 @@ struct SuggestionRequest {
     input: String,
     offset: usize,
     source: ProxyCommandSource,
-    alive: Arc<AtomicBool>,
+    served: watch::Receiver<String>,
 }
 
 /// One argument suggestion per player is worked out at a time. The client only uses the answer
@@ -1553,14 +1422,6 @@ struct SuggestionRequest {
 struct Suggesting {
     busy: bool,
     next: Option<SuggestionRequest>,
-}
-
-struct TunnelAlive(Arc<AtomicBool>);
-
-impl Drop for TunnelAlive {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
 }
 
 enum ClientWrite {
@@ -1699,45 +1560,545 @@ struct PendingSuggestion {
     proxy_matches: Vec<(String, Option<String>)>,
 }
 
+/// What one player's session tasks and tunnel share
+struct Shared {
+    username: String,
+    uuid: uuid::Uuid,
+    version: ProtocolVersion,
+    plugin_manager: Arc<PluginManager>,
+    session_manager: Arc<SessionManager>,
+    command_dispatcher: Arc<CommandDispatcher>,
+    proxy_config: Arc<Config>,
+    action_tx: mpsc::Sender<PlayerAction>,
+    client_tx: ClientQueue,
+    phase: PhaseCell,
+    // The backend the client's packets go to; changing it drops answers worked out for the last one
+    served: watch::Sender<String>,
+    // Keep-alive replies meant for a previous backend would make the current one kick the
+    // player, so only replies to the current backend's latest challenge are forwarded
+    keep_alive_challenge: std::sync::Mutex<Option<i64>>,
+    leftovers: std::sync::Mutex<Leftovers>,
+    client_settings: std::sync::Mutex<ClientSettings>,
+    suggesting: std::sync::Mutex<Suggesting>,
+    pending_suggestions: tokio::sync::Mutex<std::collections::HashMap<i32, PendingSuggestion>>,
+}
+
+/// What the client reader hands the tunnel, in the order the client sent it
+enum ClientEvent {
+    /// A packet for the backend, and the phase the client entered by sending it
+    Packet {
+        packet: Bytes,
+        entered: Option<Phase>,
+    },
+    KeepAliveResponse {
+        id: i64,
+        packet: Bytes,
+    },
+    Kick(String),
+    Closed,
+}
+
+const CLIENT_EVENTS: usize = 16;
+
+/// Reads the client for the whole session. Its packets are handled one at a time, plugin events
+/// included, so a slow plugin only holds up what the client sends.
+async fn read_client<R: AsyncRead + Unpin>(
+    shared: Arc<Shared>,
+    mut reader: PacketReader<R>,
+    mut rate_limiter: PacketRateLimiter,
+    events: mpsc::Sender<ClientEvent>,
+) {
+    let mut served = shared.served.subscribe();
+    let mut phase = shared.phase.get();
+    loop {
+        let event = match reader.read_packet().await {
+            Ok(_) if !rate_limiter.record_packet() => {
+                warn!(
+                    "Player '{}' exceeded packet rate limit (flood protection kicked in)",
+                    shared.username
+                );
+                ClientEvent::Closed
+            }
+            Ok(packet) => {
+                let server = served.borrow_and_update().clone();
+                match shared
+                    .client_packet(packet, &mut phase, &server, &served)
+                    .await
+                {
+                    Some(event) => event,
+                    None => continue,
+                }
+            }
+            Err(e) => {
+                debug!("Client '{}' stream ended: {:?}", shared.username, e);
+                ClientEvent::Closed
+            }
+        };
+        let closed = matches!(event, ClientEvent::Closed);
+        if events.send(event).await.is_err() || closed {
+            break;
+        }
+    }
+}
+
+impl Shared {
+    fn command_source(&self) -> ProxyCommandSource {
+        ProxyCommandSource {
+            sender: CommandSender::Player {
+                username: self.username.clone(),
+                action_tx: self.action_tx.clone(),
+            },
+            config: self.proxy_config.clone(),
+            session_manager: self.session_manager.clone(),
+        }
+    }
+
+    fn locale(&self) -> Option<String> {
+        self.session_manager.locale(&self.username)
+    }
+
+    fn answers_challenge(&self, id: i64) -> bool {
+        self.keep_alive_challenge.lock().ok().and_then(|c| *c) == Some(id)
+    }
+
+    /// Works out what a packet from the client becomes; `None` when it is swallowed
+    async fn client_packet(
+        self: &Arc<Self>,
+        mut raw_packet: crate::protocol::RawPacket,
+        phase: &mut Phase,
+        server: &str,
+        served: &watch::Receiver<String>,
+    ) -> Option<ClientEvent> {
+        let version = self.version;
+        let current = *phase;
+        if let Some(locale) = client_locale(&raw_packet, current, version) {
+            self.session_manager.update_locale(&self.username, &locale);
+        }
+        let entered = serverbound_transition(current, raw_packet.id, version);
+        if let Some(next) = entered {
+            *phase = next;
+        } else if current == Phase::Config
+            && PacketKind::ConfigServerboundPluginMessage.matches(raw_packet.id, version)
+            && !self
+                .plugin_message_event(&mut raw_packet, server, PluginMessageSource::Player)
+                .await
+        {
+            return None;
+        } else if current == Phase::Play {
+            if PacketKind::PlayKeepAliveResponse.matches(raw_packet.id, version)
+                && let Ok(reply) =
+                    decode_packet::<PlayKeepAliveResponse>(&raw_packet.payload, version)
+            {
+                return Some(ClientEvent::KeepAliveResponse {
+                    id: reply.id,
+                    packet: raw_packet.to_bytes(),
+                });
+            }
+
+            let chat_message = if PacketKind::ChatMessage.matches(raw_packet.id, version) {
+                decode_packet::<ChatMessage>(&raw_packet.payload, version)
+                    .ok()
+                    .map(|m| m.message)
+            } else {
+                None
+            };
+            let command = if PacketKind::ChatCommand.matches(raw_packet.id, version) {
+                decode_packet::<ChatCommand>(&raw_packet.payload, version).map(|c| Some(c.command))
+            } else if PacketKind::SignedChatCommand.matches(raw_packet.id, version) {
+                decode_packet::<SignedChatCommand>(&raw_packet.payload, version)
+                    .map(|c| Some(c.command))
+            } else if version < ProtocolVersion::V1_19 {
+                // Before 1.19 commands arrive as chat messages starting with '/'
+                Ok(chat_message
+                    .as_deref()
+                    .and_then(|m| m.strip_prefix('/'))
+                    .map(str::to_owned))
+            } else {
+                Ok(None)
+            };
+            // Passing on a command the plugins could not see would skip them
+            let command = match command {
+                Ok(command) => command,
+                Err(e) => {
+                    warn!(
+                        "Dropping an unreadable command from '{}': {}",
+                        self.username, e
+                    );
+                    return self.swallow_chat(&raw_packet);
+                }
+            };
+
+            if let Some(command) = command {
+                let mut cmd_event = PlayerCommandEvent {
+                    uuid: self.uuid.to_string(),
+                    username: self.username.clone(),
+                    command: command.clone(),
+                    cancelled: false,
+                };
+                self.plugin_manager
+                    .fire_player_command(&mut cmd_event)
+                    .await;
+                if cmd_event.cancelled {
+                    return self.swallow_chat(&raw_packet);
+                }
+
+                let first_word = cmd_event
+                    .command
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or(&cmd_event.command);
+                let source = self.command_source();
+                if self.command_dispatcher.handles(first_word, &source) {
+                    self.command_dispatcher
+                        .handle_command(&source, &cmd_event.command);
+                    return self.swallow_chat(&raw_packet);
+                }
+
+                if cmd_event.command != command {
+                    let text = if version < ProtocolVersion::V1_19 {
+                        format!("/{}", cmd_event.command)
+                    } else {
+                        cmd_event.command
+                    };
+                    if let Some(reason) = self.rewrite_chat(&mut raw_packet, &text) {
+                        return Some(ClientEvent::Kick(reason));
+                    }
+                }
+            } else if let Some(message) = chat_message {
+                let mut chat_event = PlayerChatEvent {
+                    uuid: self.uuid.to_string(),
+                    username: self.username.clone(),
+                    message: message.clone(),
+                    cancelled: false,
+                };
+                self.plugin_manager.fire_player_chat(&mut chat_event).await;
+                if chat_event.cancelled {
+                    return self.swallow_chat(&raw_packet);
+                }
+                if chat_event.message != message
+                    && let Some(reason) = self.rewrite_chat(&mut raw_packet, &chat_event.message)
+                {
+                    return Some(ClientEvent::Kick(reason));
+                }
+            }
+
+            if PacketKind::ServerboundPluginMessage.matches(raw_packet.id, version)
+                && !self
+                    .plugin_message_event(&mut raw_packet, server, PluginMessageSource::Player)
+                    .await
+            {
+                return None;
+            }
+
+            if PacketKind::CommandSuggestionRequest.matches(raw_packet.id, version)
+                && let Ok(suggestion_req) =
+                    decode_packet::<CommandSuggestionRequest>(&raw_packet.payload, version)
+                && self.suggest(suggestion_req, served).await
+            {
+                return None;
+            }
+        }
+
+        if version >= ProtocolVersion::V1_20_2 {
+            self.client_settings
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .observe(&raw_packet, current, version);
+        }
+        Some(ClientEvent::Packet {
+            packet: raw_packet.to_bytes(),
+            entered,
+        })
+    }
+
+    /// Answers a suggestion request for a proxy command; true when the backend must not see it
+    async fn suggest(
+        self: &Arc<Self>,
+        suggestion_req: CommandSuggestionRequest,
+        served: &watch::Receiver<String>,
+    ) -> bool {
+        let version = self.version;
+        let raw_cmd = &suggestion_req.text;
+        let clean_cmd = raw_cmd.strip_prefix('/').unwrap_or(raw_cmd);
+        let first_word = clean_cmd.split_whitespace().next().unwrap_or(clean_cmd);
+        let source = self.command_source();
+
+        // 1. Arguments to a proxy command (contains a space, e.g. "/server ", "/send ")
+        if clean_cmd.contains(' ') && self.command_dispatcher.handles(first_word, &source) {
+            // Plugins answer these, so they run off the reader to keep its traffic flowing
+            let request = SuggestionRequest {
+                id: suggestion_req.id,
+                input: clean_cmd.to_string(),
+                offset: if raw_cmd.starts_with('/') { 1 } else { 0 },
+                source,
+                served: served.clone(),
+            };
+            {
+                let mut state = self.suggesting.lock().unwrap_or_else(|e| e.into_inner());
+                if state.busy {
+                    state.next = Some(request);
+                    return true;
+                }
+                state.busy = true;
+            }
+            let shared = self.clone();
+            tokio::spawn(async move {
+                let mut request = request;
+                loop {
+                    let SuggestionRequest {
+                        id,
+                        input,
+                        offset,
+                        source,
+                        served,
+                    } = request;
+                    let dispatcher = shared.command_dispatcher.clone();
+                    let suggestions = tokio::task::spawn_blocking(move || {
+                        dispatcher.suggest_with_range(&input, &source)
+                    })
+                    .await;
+                    let next = {
+                        let mut state = shared.suggesting.lock().unwrap_or_else(|e| e.into_inner());
+                        let next = state.next.take();
+                        state.busy = next.is_some();
+                        next
+                    };
+                    if next.is_none()
+                        && served.has_changed().is_ok_and(|changed| !changed)
+                        && let Ok(suggestions) = suggestions
+                    {
+                        let response = CommandSuggestions {
+                            id,
+                            start: (suggestions.range.start + offset) as i32,
+                            length: suggestions.range.len() as i32,
+                            matches: suggestions
+                                .suggestions
+                                .into_iter()
+                                .map(|s| Suggestion {
+                                    text: s.text.cached_text().clone(),
+                                    tooltip: s.tooltip.map(|t| component_json(&t, version)),
+                                })
+                                .collect(),
+                        };
+                        if let Ok(bytes) = encode_packet(&response, version) {
+                            shared.client_tx.send_in_play(bytes, &shared.phase).await;
+                        }
+                    }
+                    match next {
+                        Some(next) => request = next,
+                        None => break,
+                    }
+                }
+            });
+            return true;
+        }
+
+        // 2. Root command name completion (no space, e.g. "/", "/s", "/ser", "/server")
+        if !clean_cmd.contains(' ') {
+            let clean_lower = clean_cmd.to_ascii_lowercase();
+            let permitted = self.command_dispatcher.get_all_permitted_commands(&source);
+            let proxy_matches: Vec<(String, Option<String>)> = permitted
+                .into_iter()
+                .filter(|(cmd_name, _)| cmd_name.starts_with(&clean_lower))
+                .map(|(cmd_name, description)| {
+                    (cmd_name.to_string(), Some(description.to_string()))
+                })
+                .collect();
+
+            if !proxy_matches.is_empty() {
+                let offset = if raw_cmd.starts_with('/') { 1 } else { 0 };
+                let req_id = suggestion_req.id;
+
+                self.pending_suggestions.lock().await.insert(
+                    req_id,
+                    PendingSuggestion {
+                        clean_cmd: clean_cmd.to_string(),
+                        offset,
+                        proxy_matches,
+                    },
+                );
+
+                let shared = self.clone();
+                let served = served.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    if let Some(pending) = shared.pending_suggestions.lock().await.remove(&req_id) {
+                        let response = CommandSuggestions {
+                            id: req_id,
+                            start: pending.offset as i32,
+                            length: pending.clean_cmd.len() as i32,
+                            matches: pending
+                                .proxy_matches
+                                .into_iter()
+                                .map(|(cmd, tip)| Suggestion {
+                                    text: cmd,
+                                    tooltip: tip
+                                        .map(|t| component_json(&TextComponent::text(t), version)),
+                                })
+                                .collect(),
+                        };
+                        if served.has_changed().is_ok_and(|changed| !changed)
+                            && let Ok(bytes) = encode_packet(&response, version)
+                        {
+                            shared.client_tx.send_in_play(bytes, &shared.phase).await;
+                        }
+                    }
+                });
+            }
+        }
+        false
+    }
+
+    // The backend tracks which chat messages the client has seen through these packets, so one the
+    // proxy drops must still hand its acknowledgements on, and a signed one cannot be dropped at all
+    fn swallow_chat(&self, packet: &crate::protocol::RawPacket) -> Option<ClientEvent> {
+        let version = self.version;
+        let kind = if PacketKind::ChatCommand.matches(packet.id, version) {
+            PacketKind::ChatCommand
+        } else if PacketKind::SignedChatCommand.matches(packet.id, version) {
+            PacketKind::SignedChatCommand
+        } else {
+            PacketKind::ChatMessage
+        };
+        let signing = chat_signing(kind, &packet.payload, version).unwrap_or_default();
+        if signing.signed && version >= ProtocolVersion::V1_19_1 {
+            error!(
+                "Disconnecting '{}': a signed chat message was cancelled, which would break their chat with the backend",
+                self.username
+            );
+            return Some(ClientEvent::Kick(translate(
+                self.locale().as_deref(),
+                "vine.chat.signed_cancelled",
+                &[],
+            )));
+        }
+        if signing.acknowledged > 0
+            && let Ok(ack) = encode_packet(
+                &ChatAcknowledgement {
+                    offset: signing.acknowledged,
+                },
+                version,
+            )
+        {
+            return Some(ClientEvent::Packet {
+                packet: ack,
+                entered: None,
+            });
+        }
+        None
+    }
+
+    /// Returns the reason to kick the player for, if the message cannot be changed
+    fn rewrite_chat(&self, packet: &mut crate::protocol::RawPacket, text: &str) -> Option<String> {
+        let version = self.version;
+        let kind = if PacketKind::ChatCommand.matches(packet.id, version) {
+            PacketKind::ChatCommand
+        } else if PacketKind::SignedChatCommand.matches(packet.id, version) {
+            PacketKind::SignedChatCommand
+        } else {
+            PacketKind::ChatMessage
+        };
+        if chat_signing(kind, &packet.payload, version)
+            .unwrap_or_default()
+            .signed
+        {
+            error!(
+                "Disconnecting '{}': a plugin changed a signed chat message, which the backend would reject",
+                self.username
+            );
+            return Some(translate(
+                self.locale().as_deref(),
+                "vine.chat.signed_changed",
+                &[],
+            ));
+        }
+        let limit = match kind {
+            PacketKind::ChatMessage => chat_length_limit(version),
+            _ => command_length_limit(version),
+        };
+        if text.encode_utf16().count() > limit {
+            warn!(
+                "A plugin made a chat message from '{}' longer than the client limit; sending the original",
+                self.username
+            );
+            return None;
+        }
+        match replace_leading_string(&packet.payload, text) {
+            Ok(payload) => packet.payload = payload.into(),
+            Err(e) => warn!(
+                "Could not rewrite a chat message from '{}': {}",
+                self.username, e
+            ),
+        }
+        None
+    }
+
+    /// Returns false when a plugin cancelled the message.
+    async fn plugin_message_event(
+        &self,
+        packet: &mut crate::protocol::RawPacket,
+        server_name: &str,
+        source: PluginMessageSource,
+    ) -> bool {
+        let version = self.version;
+        let Ok((channel, data)) = read_plugin_message(&mut &packet.payload[..], version) else {
+            return true;
+        };
+        // Backends trust this channel to come from the proxy, so players cannot use it
+        if source == PluginMessageSource::Player
+            && (channel == "BungeeCord" || channel == "bungeecord:main")
+        {
+            return false;
+        }
+        let mut event = PluginMessageEvent {
+            channel: channel.clone(),
+            data: data.clone(),
+            player_uuid: Some(self.uuid.to_string()),
+            server_name: Some(server_name.to_string()),
+            source,
+            cancelled: false,
+        };
+        self.plugin_manager.fire_plugin_message(&mut event).await;
+        if event.cancelled {
+            return false;
+        }
+        if event.data != data {
+            let mut payload = Vec::new();
+            write_plugin_message(&mut payload, &channel, &event.data, version);
+            packet.payload = payload.into();
+        }
+        true
+    }
+}
+
 impl BackendBridge {
     /// Tunnels packets back and forth between client and backend
     #[allow(clippy::too_many_arguments)]
-    async fn bridge_tunnel<R1, R2, W2>(
-        username: &str,
-        client_reader: &mut PacketReader<R1>,
-        client_tx: &ClientQueue,
-        backend_reader: &mut PacketReader<R2>,
-        backend_writer: &mut PacketWriter<W2>,
-        client_rate_limiter: &mut PacketRateLimiter,
-        client_version: ProtocolVersion,
+    async fn bridge_tunnel<R, W>(
+        shared: &Arc<Shared>,
+        client_events: &mut mpsc::Receiver<ClientEvent>,
+        backend_reader: &mut PacketReader<R>,
+        backend_writer: &mut PacketWriter<W>,
         action_rx: &mut mpsc::Receiver<PlayerAction>,
-        action_tx: &mpsc::Sender<PlayerAction>,
-        command_dispatcher: Arc<CommandDispatcher>,
-        proxy_config: Arc<Config>,
-        session_manager: Arc<SessionManager>,
-        plugin_manager: Arc<PluginManager>,
-        player_uuid: uuid::Uuid,
-        current_server_name: String,
-        phase: &Arc<PhaseCell>,
-        suggesting: &Arc<std::sync::Mutex<Suggesting>>,
-        keep_alive_challenge: &std::sync::Mutex<Option<i64>>,
-        leftovers: &std::sync::Mutex<Leftovers>,
-        client_settings: &std::sync::Mutex<ClientSettings>,
+        current_server_name: &str,
         connecting: Option<&mut Connecting<'_>>,
         wake_on_play: bool,
+        reached_play: &mut bool,
     ) -> Result<TunnelExit, BridgeError>
     where
-        R1: AsyncRead + Unpin,
-        R2: AsyncRead + Unpin,
-        W2: AsyncWrite + Unpin,
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
     {
-        // Answers worked out on other tasks are dropped once this tunnel ends, since the client
-        // may have moved to another backend or phase by then
-        let alive = Arc::new(AtomicBool::new(true));
-        let _alive = TunnelAlive(alive.clone());
-        let pending_suggestions: Arc<
-            tokio::sync::Mutex<std::collections::HashMap<i32, PendingSuggestion>>,
-        > = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let username = shared.username.as_str();
+        let client_version = shared.version;
+        let client_tx = &shared.client_tx;
+        let phase = &shared.phase;
+        // Set while the client's last acknowledgement is on its way to the backend, so the wake-up
+        // it calls for survives this tunnel ending meanwhile
+        if std::mem::take(reached_play) {
+            backend_writer.flush().await?;
+            return Ok(TunnelExit::ReachedPlay);
+        }
 
         let client_writer = async {
             client_tx.closed().await;
@@ -1746,419 +2107,30 @@ impl BackendBridge {
 
         let client_to_backend = async {
             loop {
-                match client_reader.read_packet().await {
-                    Ok(mut raw_packet) => {
-                        let mut reached_play = false;
-                        if !client_rate_limiter.record_packet() {
-                            warn!(
-                                "Player '{}' exceeded packet rate limit (flood protection kicked in)",
-                                username
-                            );
-                            return TunnelExit::ClientDisconnected;
-                        }
-
-                        let current = phase.get();
-                        if let Some(locale) = client_locale(&raw_packet, current, client_version) {
-                            session_manager.update_locale(username, &locale);
-                        }
-                        if let Some(next) =
-                            serverbound_transition(current, raw_packet.id, client_version)
-                        {
+                let packet = match client_events.recv().await {
+                    Some(ClientEvent::Packet { packet, entered }) => {
+                        if let Some(next) = entered {
                             phase.set(next);
-                            reached_play = next == Phase::Play;
-                        } else if current == Phase::Config
-                            && PacketKind::ConfigServerboundPluginMessage
-                                .matches(raw_packet.id, client_version)
-                            && !Self::plugin_message_event(
-                                &plugin_manager,
-                                &mut raw_packet,
-                                client_version,
-                                player_uuid,
-                                &current_server_name,
-                                PluginMessageSource::Player,
-                            )
-                            .await
-                        {
+                            *reached_play = next == Phase::Play && wake_on_play;
+                        }
+                        packet
+                    }
+                    Some(ClientEvent::KeepAliveResponse { id, packet }) => {
+                        if !shared.answers_challenge(id) {
+                            debug!("Dropping stale keep-alive {} from '{}'", id, username);
                             continue;
-                        } else if current == Phase::Play {
-                            if PacketKind::PlayKeepAliveResponse
-                                .matches(raw_packet.id, client_version)
-                                && let Ok(reply) = decode_packet::<PlayKeepAliveResponse>(
-                                    &raw_packet.payload,
-                                    client_version,
-                                )
-                                && keep_alive_challenge.lock().ok().and_then(|c| *c)
-                                    != Some(reply.id)
-                            {
-                                debug!(
-                                    "Dropping stale keep-alive {} from '{}'",
-                                    reply.id, username
-                                );
-                                continue;
-                            }
-
-                            let chat_message = if PacketKind::ChatMessage
-                                .matches(raw_packet.id, client_version)
-                            {
-                                decode_packet::<ChatMessage>(&raw_packet.payload, client_version)
-                                    .ok()
-                                    .map(|m| m.message)
-                            } else {
-                                None
-                            };
-                            let command = if PacketKind::ChatCommand
-                                .matches(raw_packet.id, client_version)
-                            {
-                                decode_packet::<ChatCommand>(&raw_packet.payload, client_version)
-                                    .map(|c| Some(c.command))
-                            } else if PacketKind::SignedChatCommand
-                                .matches(raw_packet.id, client_version)
-                            {
-                                decode_packet::<SignedChatCommand>(
-                                    &raw_packet.payload,
-                                    client_version,
-                                )
-                                .map(|c| Some(c.command))
-                            } else if client_version < ProtocolVersion::V1_19 {
-                                // Before 1.19 commands arrive as chat messages starting with '/'
-                                Ok(chat_message
-                                    .as_deref()
-                                    .and_then(|m| m.strip_prefix('/'))
-                                    .map(str::to_owned))
-                            } else {
-                                Ok(None)
-                            };
-                            // Passing on a command the plugins could not see would skip them
-                            let command = match command {
-                                Ok(command) => command,
-                                Err(e) => {
-                                    warn!(
-                                        "Dropping an unreadable command from '{}': {}",
-                                        username, e
-                                    );
-                                    match Self::swallow_chat(
-                                        &raw_packet,
-                                        client_version,
-                                        backend_writer,
-                                        username,
-                                        session_manager.locale(username).as_deref(),
-                                    )
-                                    .await
-                                    {
-                                        Some(exit) => return exit,
-                                        None => continue,
-                                    }
-                                }
-                            };
-
-                            if let Some(command) = command {
-                                let mut cmd_event = PlayerCommandEvent {
-                                    uuid: player_uuid.to_string(),
-                                    username: username.to_string(),
-                                    command: command.clone(),
-                                    cancelled: false,
-                                };
-                                plugin_manager.fire_player_command(&mut cmd_event).await;
-                                if cmd_event.cancelled {
-                                    match Self::swallow_chat(
-                                        &raw_packet,
-                                        client_version,
-                                        backend_writer,
-                                        username,
-                                        session_manager.locale(username).as_deref(),
-                                    )
-                                    .await
-                                    {
-                                        Some(exit) => return exit,
-                                        None => continue,
-                                    }
-                                }
-
-                                let first_word = cmd_event
-                                    .command
-                                    .split_whitespace()
-                                    .next()
-                                    .unwrap_or(&cmd_event.command);
-                                let source = ProxyCommandSource {
-                                    sender: CommandSender::Player {
-                                        username: username.to_string(),
-                                        action_tx: action_tx.clone(),
-                                    },
-                                    config: proxy_config.clone(),
-                                    session_manager: session_manager.clone(),
-                                };
-                                if command_dispatcher.handles(first_word, &source) {
-                                    command_dispatcher.handle_command(&source, &cmd_event.command);
-                                    match Self::swallow_chat(
-                                        &raw_packet,
-                                        client_version,
-                                        backend_writer,
-                                        username,
-                                        session_manager.locale(username).as_deref(),
-                                    )
-                                    .await
-                                    {
-                                        Some(exit) => return exit,
-                                        None => continue,
-                                    }
-                                }
-
-                                if cmd_event.command != command {
-                                    let text = if client_version < ProtocolVersion::V1_19 {
-                                        format!("/{}", cmd_event.command)
-                                    } else {
-                                        cmd_event.command
-                                    };
-                                    if let Some(exit) = Self::rewrite_chat(
-                                        &mut raw_packet,
-                                        client_version,
-                                        &text,
-                                        username,
-                                        session_manager.locale(username).as_deref(),
-                                    ) {
-                                        return exit;
-                                    }
-                                }
-                            } else if let Some(message) = chat_message {
-                                let mut chat_event = PlayerChatEvent {
-                                    uuid: player_uuid.to_string(),
-                                    username: username.to_string(),
-                                    message: message.clone(),
-                                    cancelled: false,
-                                };
-                                plugin_manager.fire_player_chat(&mut chat_event).await;
-                                if chat_event.cancelled {
-                                    match Self::swallow_chat(
-                                        &raw_packet,
-                                        client_version,
-                                        backend_writer,
-                                        username,
-                                        session_manager.locale(username).as_deref(),
-                                    )
-                                    .await
-                                    {
-                                        Some(exit) => return exit,
-                                        None => continue,
-                                    }
-                                }
-                                if chat_event.message != message
-                                    && let Some(exit) = Self::rewrite_chat(
-                                        &mut raw_packet,
-                                        client_version,
-                                        &chat_event.message,
-                                        username,
-                                        session_manager.locale(username).as_deref(),
-                                    )
-                                {
-                                    return exit;
-                                }
-                            }
-
-                            if PacketKind::ServerboundPluginMessage
-                                .matches(raw_packet.id, client_version)
-                                && !Self::plugin_message_event(
-                                    &plugin_manager,
-                                    &mut raw_packet,
-                                    client_version,
-                                    player_uuid,
-                                    &current_server_name,
-                                    PluginMessageSource::Player,
-                                )
-                                .await
-                            {
-                                continue;
-                            }
-
-                            if PacketKind::CommandSuggestionRequest
-                                .matches(raw_packet.id, client_version)
-                                && let Ok(suggestion_req) = decode_packet::<CommandSuggestionRequest>(
-                                    &raw_packet.payload,
-                                    client_version,
-                                )
-                            {
-                                let raw_cmd = &suggestion_req.text;
-                                let clean_cmd = raw_cmd.strip_prefix('/').unwrap_or(raw_cmd);
-                                let first_word =
-                                    clean_cmd.split_whitespace().next().unwrap_or(clean_cmd);
-                                let source = ProxyCommandSource {
-                                    sender: CommandSender::Player {
-                                        username: username.to_string(),
-                                        action_tx: action_tx.clone(),
-                                    },
-                                    config: proxy_config.clone(),
-                                    session_manager: session_manager.clone(),
-                                };
-
-                                // 1. Arguments to a proxy command (contains a space, e.g. "/server ", "/send ")
-                                if clean_cmd.contains(' ')
-                                    && command_dispatcher.handles(first_word, &source)
-                                {
-                                    // Plugins answer these, so they run off the tunnel to keep its traffic flowing
-                                    let request = SuggestionRequest {
-                                        id: suggestion_req.id,
-                                        input: clean_cmd.to_string(),
-                                        offset: if raw_cmd.starts_with('/') { 1 } else { 0 },
-                                        source,
-                                        alive: alive.clone(),
-                                    };
-                                    {
-                                        let mut state =
-                                            suggesting.lock().unwrap_or_else(|e| e.into_inner());
-                                        if state.busy {
-                                            state.next = Some(request);
-                                            continue;
-                                        }
-                                        state.busy = true;
-                                    }
-                                    let dispatcher = command_dispatcher.clone();
-                                    let client_tx = client_tx.clone();
-                                    let phase = phase.clone();
-                                    let suggesting = suggesting.clone();
-                                    tokio::spawn(async move {
-                                        let mut request = request;
-                                        loop {
-                                            let SuggestionRequest {
-                                                id,
-                                                input,
-                                                offset,
-                                                source,
-                                                alive,
-                                            } = request;
-                                            let dispatcher = dispatcher.clone();
-                                            let suggestions =
-                                                tokio::task::spawn_blocking(move || {
-                                                    dispatcher.suggest_with_range(&input, &source)
-                                                })
-                                                .await;
-                                            let next = {
-                                                let mut state = suggesting
-                                                    .lock()
-                                                    .unwrap_or_else(|e| e.into_inner());
-                                                let next = state.next.take();
-                                                state.busy = next.is_some();
-                                                next
-                                            };
-                                            if next.is_none()
-                                                && alive.load(Ordering::Acquire)
-                                                && let Ok(suggestions) = suggestions
-                                            {
-                                                let response = CommandSuggestions {
-                                                    id,
-                                                    start: (suggestions.range.start + offset)
-                                                        as i32,
-                                                    length: suggestions.range.len() as i32,
-                                                    matches: suggestions
-                                                        .suggestions
-                                                        .into_iter()
-                                                        .map(|s| Suggestion {
-                                                            text: s.text.cached_text().clone(),
-                                                            tooltip: s.tooltip.map(|t| {
-                                                                component_json(&t, client_version)
-                                                            }),
-                                                        })
-                                                        .collect(),
-                                                };
-                                                if let Ok(bytes) =
-                                                    encode_packet(&response, client_version)
-                                                {
-                                                    client_tx.send_in_play(bytes, &phase).await;
-                                                }
-                                            }
-                                            match next {
-                                                Some(next) => request = next,
-                                                None => break,
-                                            }
-                                        }
-                                    });
-                                    continue;
-                                }
-
-                                // 2. Root command name completion (no space, e.g. "/", "/s", "/ser", "/server")
-                                if !clean_cmd.contains(' ') {
-                                    let clean_lower = clean_cmd.to_ascii_lowercase();
-                                    let permitted =
-                                        command_dispatcher.get_all_permitted_commands(&source);
-                                    let proxy_matches: Vec<(String, Option<String>)> = permitted
-                                        .into_iter()
-                                        .filter(|(cmd_name, _)| cmd_name.starts_with(&clean_lower))
-                                        .map(|(cmd_name, description)| {
-                                            (cmd_name.to_string(), Some(description.to_string()))
-                                        })
-                                        .collect();
-
-                                    if !proxy_matches.is_empty() {
-                                        let offset = if raw_cmd.starts_with('/') { 1 } else { 0 };
-                                        let req_id = suggestion_req.id;
-
-                                        pending_suggestions.lock().await.insert(
-                                            req_id,
-                                            PendingSuggestion {
-                                                clean_cmd: clean_cmd.to_string(),
-                                                offset,
-                                                proxy_matches,
-                                            },
-                                        );
-
-                                        let pending_ref = pending_suggestions.clone();
-                                        let client_tx_clone = client_tx.clone();
-                                        let alive = alive.clone();
-                                        let phase = phase.clone();
-                                        tokio::spawn(async move {
-                                            tokio::time::sleep(Duration::from_millis(200)).await;
-                                            if let Some(pending) =
-                                                pending_ref.lock().await.remove(&req_id)
-                                            {
-                                                let response = CommandSuggestions {
-                                                    id: req_id,
-                                                    start: pending.offset as i32,
-                                                    length: pending.clean_cmd.len() as i32,
-                                                    matches: pending
-                                                        .proxy_matches
-                                                        .into_iter()
-                                                        .map(|(cmd, tip)| Suggestion {
-                                                            text: cmd,
-                                                            tooltip: tip.map(|t| {
-                                                                component_json(
-                                                                    &TextComponent::text(t),
-                                                                    client_version,
-                                                                )
-                                                            }),
-                                                        })
-                                                        .collect(),
-                                                };
-                                                if alive.load(Ordering::Acquire)
-                                                    && let Ok(bytes) =
-                                                        encode_packet(&response, client_version)
-                                                {
-                                                    client_tx_clone
-                                                        .send_in_play(bytes, &phase)
-                                                        .await;
-                                                }
-                                            }
-                                        });
-                                    }
-                                }
-                            }
                         }
-
-                        if client_version >= ProtocolVersion::V1_20_2 {
-                            client_settings
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .observe(&raw_packet, current, client_version);
-                        }
-                        if let Err(e) = backend_writer.send(raw_packet.to_bytes()).await {
-                            debug!("Backend write failed for '{}': {:?}", username, e);
-                            return TunnelExit::BackendDisconnected { reason: None };
-                        }
-                        if reached_play && wake_on_play {
-                            return TunnelExit::ReachedPlay;
-                        }
+                        packet
                     }
-                    Err(e) => {
-                        debug!("Client '{}' stream ended: {:?}", username, e);
-                        return TunnelExit::ClientDisconnected;
-                    }
+                    Some(ClientEvent::Kick(reason)) => return TunnelExit::Kicked { reason },
+                    Some(ClientEvent::Closed) | None => return TunnelExit::ClientDisconnected,
+                };
+                if let Err(e) = backend_writer.send(packet).await {
+                    debug!("Backend write failed for '{}': {:?}", username, e);
+                    return TunnelExit::BackendDisconnected { reason: None };
+                }
+                if std::mem::take(reached_play) {
+                    return TunnelExit::ReachedPlay;
                 }
             }
         };
@@ -2189,22 +2161,20 @@ impl BackendBridge {
                         if current == Phase::Config
                             && PacketKind::ConfigClientboundPluginMessage
                                 .matches(raw_packet.id, client_version)
-                            && !Self::plugin_message_event(
-                                &plugin_manager,
-                                &mut raw_packet,
-                                client_version,
-                                player_uuid,
-                                &current_server_name,
-                                PluginMessageSource::Server,
-                            )
-                            .await
+                            && !shared
+                                .plugin_message_event(
+                                    &mut raw_packet,
+                                    current_server_name,
+                                    PluginMessageSource::Server,
+                                )
+                                .await
                         {
                             continue;
                         }
 
                         if current == Phase::Play {
                             if client_version < ProtocolVersion::V1_20_2
-                                && let Ok(mut leftovers) = leftovers.lock()
+                                && let Ok(mut leftovers) = shared.leftovers.lock()
                             {
                                 leftovers.observe(&raw_packet, client_version);
                             }
@@ -2214,7 +2184,7 @@ impl BackendBridge {
                                     &raw_packet.payload,
                                     client_version,
                                 )
-                                && let Ok(mut current) = keep_alive_challenge.lock()
+                                && let Ok(mut current) = shared.keep_alive_challenge.lock()
                             {
                                 *current = Some(challenge.id);
                             }
@@ -2241,7 +2211,8 @@ impl BackendBridge {
                                         &raw_packet.payload,
                                         client_version,
                                     )
-                                && let Some(pending) = pending_suggestions
+                                && let Some(pending) = shared
+                                    .pending_suggestions
                                     .lock()
                                     .await
                                     .remove(&backend_suggestions.id)
@@ -2263,30 +2234,22 @@ impl BackendBridge {
 
                             if PacketKind::ClientboundPluginMessage
                                 .matches(raw_packet.id, client_version)
-                                && !Self::plugin_message_event(
-                                    &plugin_manager,
-                                    &mut raw_packet,
-                                    client_version,
-                                    player_uuid,
-                                    &current_server_name,
-                                    PluginMessageSource::Server,
-                                )
-                                .await
+                                && !shared
+                                    .plugin_message_event(
+                                        &mut raw_packet,
+                                        current_server_name,
+                                        PluginMessageSource::Server,
+                                    )
+                                    .await
                             {
                                 continue;
                             }
 
                             if PacketKind::Commands.matches(raw_packet.id, client_version) {
-                                let source = ProxyCommandSource {
-                                    sender: CommandSender::Player {
-                                        username: username.to_string(),
-                                        action_tx: action_tx.clone(),
-                                    },
-                                    config: proxy_config.clone(),
-                                    session_manager: session_manager.clone(),
-                                };
-                                let permitted =
-                                    command_dispatcher.get_all_permitted_command_shapes(&source);
+                                let source = shared.command_source();
+                                let permitted = shared
+                                    .command_dispatcher
+                                    .get_all_permitted_command_shapes(&source);
                                 let injected: Vec<InjectedCommand<'_>> = permitted
                                     .iter()
                                     .map(|shape| InjectedCommand {
