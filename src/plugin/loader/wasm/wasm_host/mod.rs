@@ -116,13 +116,26 @@ impl WasmPlugin {
         }
     }
 
+    /// Stops the plugin, letting calls already running finish within the call timeout. A call
+    /// still running after that is interrupted and the plugin is disabled.
     pub async fn shutdown(&self) {
         self.stopping.store(true, Ordering::Relaxed);
-        let _ = tokio::time::timeout(
+        if tokio::time::timeout(
             self.call_timeout,
             self.store.shutdown(|_| Box::pin(async { Ok(()) })),
         )
-        .await;
+        .await
+        .is_err()
+        {
+            if !self.is_disabled() {
+                tracing::warn!(
+                    "Plugin '{}' did not stop within {:?} and has been disabled",
+                    self.metadata.name,
+                    self.call_timeout
+                );
+            }
+            self.kill();
+        }
     }
 
     fn kill(&self) {
