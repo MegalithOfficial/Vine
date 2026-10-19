@@ -1094,7 +1094,7 @@ impl BackendBridge {
                         }
                         Some(ClientEvent::Closed) | None => return false,
                     };
-                    let _ = old_backend.writer.send(packet).await;
+                    let _ = old_backend.writes.send(packet).await;
                 }
             };
             match timeout(SWITCH_ACK_TIMEOUT, acknowledged).await {
@@ -1576,6 +1576,21 @@ impl Drop for Task {
         }
     }
 }
+
+/// A task that may finish what it has in hand once its handle is dropped, but not forever
+struct Lingering(tokio::task::JoinHandle<()>);
+
+impl Drop for Lingering {
+    fn drop(&mut self) {
+        let abort = self.0.abort_handle();
+        tokio::spawn(async move {
+            tokio::time::sleep(LINGER).await;
+            abort.abort();
+        });
+    }
+}
+
+const LINGER: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 struct PendingSuggestion {
@@ -2110,11 +2125,12 @@ enum BackendEvent {
     ClientGone,
 }
 
-/// The backend the client is on; its packets are read by a task of its own
+/// The backend the client is on; it is read and written by tasks of its own
 struct Backend {
-    writer: BackendWriter,
+    writes: mpsc::Sender<Bytes>,
     events: mpsc::Receiver<BackendEvent>,
     reader: Task,
+    _writer: Lingering,
 }
 
 impl Backend {
@@ -2134,10 +2150,17 @@ impl Backend {
             server_name.to_string(),
             events_tx,
         ));
-        Self {
+        let (writes, rx) = mpsc::channel(BACKEND_WRITES);
+        let writer = Lingering(tokio::spawn(write_backend(
             writer,
+            rx,
+            shared.username.clone(),
+        )));
+        Self {
+            writes,
             events,
             reader,
+            _writer: writer,
         }
     }
 
@@ -2145,6 +2168,23 @@ impl Backend {
     async fn stop_reading(&mut self) {
         self.events.close();
         self.reader.join().await;
+    }
+}
+
+const BACKEND_WRITES: usize = 128;
+
+/// Writes what the client sends to the backend, flushing once per batch
+async fn write_backend(mut writer: BackendWriter, mut rx: mpsc::Receiver<Bytes>, username: String) {
+    let mut batch = Vec::new();
+    while rx.recv_many(&mut batch, BACKEND_WRITES).await > 0 {
+        let written = batch.drain(..).try_for_each(|packet| writer.queue(&packet));
+        if let Err(e) = match written {
+            Ok(()) => writer.flush().await,
+            Err(e) => Err(e),
+        } {
+            debug!("Backend write failed for '{}': {:?}", username, e);
+            return;
+        }
     }
 }
 
@@ -2307,7 +2347,7 @@ impl BackendBridge {
         let client_tx = &shared.client_tx;
         let phase = &shared.phase;
         let Backend {
-            writer: backend_writer,
+            writes: backend_writes,
             events: backend_events,
             ..
         } = backend;
@@ -2316,7 +2356,6 @@ impl BackendBridge {
             message: held_message,
         } = carried;
         if std::mem::take(reached_play) {
-            backend_writer.flush().await?;
             return Ok(TunnelExit::ReachedPlay);
         }
 
@@ -2345,8 +2384,7 @@ impl BackendBridge {
                     Some(ClientEvent::Kick(reason)) => return TunnelExit::Kicked { reason },
                     Some(ClientEvent::Closed) | None => return TunnelExit::ClientDisconnected,
                 };
-                if let Err(e) = backend_writer.send(packet).await {
-                    debug!("Backend write failed for '{}': {:?}", username, e);
+                if backend_writes.send(packet).await.is_err() {
                     return TunnelExit::BackendDisconnected { reason: None };
                 }
                 if std::mem::take(reached_play) {
