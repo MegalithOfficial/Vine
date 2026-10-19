@@ -404,14 +404,14 @@ impl BackendBridge {
                 "Player '{}' connection to '{}' cancelled by plugin: {}",
                 self.player.username, connect_event.target_server, reason
             );
-            Self::disconnect_client(
-                &mut client_writer,
+            if let Some(kick) = disconnect_packet(
                 self.client_version,
                 Phase::Login,
                 self.locale().as_deref(),
                 &reason,
-            )
-            .await;
+            ) {
+                let _ = timeout(CLIENT_WRITE_TIMEOUT, client_writer.send(kick)).await;
+            }
             self.fire_disconnect(None).await;
             return Ok(());
         }
@@ -520,8 +520,13 @@ impl BackendBridge {
         self.session_manager
             .update_server(&self.player.username, &current_server_name);
 
-        // Outlives each tunnel so packets still queued when one ends are not lost
-        let (client_tx, mut client_rx) = ClientQueue::new();
+        let (client_tx, client_rx) = ClientQueue::new();
+        let writer = Task::spawn(write_client(
+            client_writer,
+            client_rx,
+            client_tx.budget.clone(),
+            self.player.username.clone(),
+        ));
         let bridge = &self;
         let mut connecting: Option<(String, Connecting<'_>)> = None;
         // A switch asked for, or a backend that finished logging in, while the client is still
@@ -540,9 +545,7 @@ impl BackendBridge {
                 Self::bridge_tunnel(
                     &self.player.username,
                     &mut client_reader,
-                    &mut client_writer,
                     &client_tx,
-                    &mut client_rx,
                     &mut backend_reader,
                     &mut backend_writer,
                     &mut client_rate_limiter,
@@ -578,21 +581,12 @@ impl BackendBridge {
                     }
                 }
             };
-            if !matches!(exit, TunnelExit::ClientDisconnected) {
-                Self::flush_queue(&mut client_rx, &mut client_writer).await;
-            }
 
             match exit {
                 TunnelExit::Kicked { reason } => {
                     info!("Kicking player '{}': {}", self.player.username, reason);
-                    Self::disconnect_client(
-                        &mut client_writer,
-                        self.client_version,
-                        phase.backend(),
-                        self.locale().as_deref(),
-                        &reason,
-                    )
-                    .await;
+                    self.disconnect_client(writer, &client_tx, phase.backend(), &reason)
+                        .await;
                     break;
                 }
                 TunnelExit::ClientDisconnected => {
@@ -627,15 +621,14 @@ impl BackendBridge {
                     }
                     if connecting.is_some() {
                         self.notify(
-                            &mut client_writer,
+                            &client_tx,
                             &phase,
                             translate(
                                 self.locale().as_deref(),
                                 "vine.server.already_connecting",
                                 &[],
                             ),
-                        )
-                        .await;
+                        );
                         continue;
                     }
                     info!(
@@ -663,44 +656,41 @@ impl BackendBridge {
                             )
                         });
                         self.notify(
-                            &mut client_writer,
+                            &client_tx,
                             &phase,
                             translate(
                                 self.locale().as_deref(),
                                 "vine.server.switch_cancelled",
                                 &[&reason],
                             ),
-                        )
-                        .await;
+                        );
                         continue;
                     }
                     let server_name = connect_event.target_server;
                     if server_name == current_server_name {
                         self.notify(
-                            &mut client_writer,
+                            &client_tx,
                             &phase,
                             translate(
                                 self.locale().as_deref(),
                                 "vine.command.server.already_connected",
                                 &[&server_name],
                             ),
-                        )
-                        .await;
+                        );
                         continue;
                     }
 
                     let Some(target_config) = self.proxy_config.servers.get(&server_name).cloned()
                     else {
                         self.notify(
-                            &mut client_writer,
+                            &client_tx,
                             &phase,
                             translate(
                                 self.locale().as_deref(),
                                 "vine.server.unknown",
                                 &[&server_name],
                             ),
-                        )
-                        .await;
+                        );
                         continue;
                     };
 
@@ -730,7 +720,7 @@ impl BackendBridge {
                         Ok(prepared) => {
                             self.finish_switch(
                                 &mut client_reader,
-                                &mut client_writer,
+                                &client_tx,
                                 &phase,
                                 &leftovers,
                                 &client_settings,
@@ -770,26 +760,24 @@ impl BackendBridge {
                                 self.player.username, server_name, e
                             );
                             self.notify(
-                                &mut client_writer,
+                                &client_tx,
                                 &phase,
                                 translate(
                                     self.locale().as_deref(),
                                     "vine.server.connect_failed",
                                     &[&server_name, &e],
                                 ),
-                            )
-                            .await;
+                            );
                         }
                         Err(SwitchError::Fatal(e)) => {
                             warn!(
                                 "Lost player '{}' while switching to '{}': {}",
                                 self.player.username, server_name, e
                             );
-                            Self::disconnect_client(
-                                &mut client_writer,
-                                self.client_version,
+                            self.disconnect_client(
+                                writer,
+                                &client_tx,
                                 phase.backend(),
-                                self.locale().as_deref(),
                                 &translate(
                                     self.locale().as_deref(),
                                     "vine.server.switch_failed",
@@ -845,14 +833,8 @@ impl BackendBridge {
                         .clone()
                         .filter(|(fb_name, _)| fb_name != &current_server_name);
                     let Some((fb_name, fb_cfg)) = fallback else {
-                        Self::disconnect_client(
-                            &mut client_writer,
-                            self.client_version,
-                            phase.backend(),
-                            self.locale().as_deref(),
-                            &reason,
-                        )
-                        .await;
+                        self.disconnect_client(writer, &client_tx, phase.backend(), &reason)
+                            .await;
                         break;
                     };
 
@@ -871,14 +853,8 @@ impl BackendBridge {
                         .await;
                     if connect_event.cancelled {
                         let reason = connect_event.cancel_reason.unwrap_or(reason);
-                        Self::disconnect_client(
-                            &mut client_writer,
-                            self.client_version,
-                            phase.backend(),
-                            self.locale().as_deref(),
-                            &reason,
-                        )
-                        .await;
+                        self.disconnect_client(writer, &client_tx, phase.backend(), &reason)
+                            .await;
                         break;
                     }
                     let (fb_name, fb_cfg) =
@@ -894,20 +870,19 @@ impl BackendBridge {
                         self.player.username, fb_name, current_server_name, reason
                     );
                     self.notify(
-                        &mut client_writer,
+                        &client_tx,
                         &phase,
                         translate(
                             self.locale().as_deref(),
                             "vine.server.fallback",
                             &[&fb_name, &reason],
                         ),
-                    )
-                    .await;
+                    );
 
                     match self
                         .switch_backend(
                             &mut client_reader,
-                            &mut client_writer,
+                            &client_tx,
                             &phase,
                             &leftovers,
                             &client_settings,
@@ -943,11 +918,10 @@ impl BackendBridge {
                                 "Failed to connect player '{}' to fallback server '{}': {}",
                                 self.player.username, fb_name, e
                             );
-                            Self::disconnect_client(
-                                &mut client_writer,
-                                self.client_version,
+                            self.disconnect_client(
+                                writer,
+                                &client_tx,
                                 phase.backend(),
-                                self.locale().as_deref(),
                                 &translate(
                                     self.locale().as_deref(),
                                     "vine.server.fallback_failed",
@@ -986,10 +960,10 @@ impl BackendBridge {
     /// Logs into another backend and moves the client over to it. On 1.20.2+ the client is sent
     /// back into the configuration phase so the new backend can configure it from scratch.
     #[allow(clippy::too_many_arguments)]
-    async fn switch_backend<R, W>(
+    async fn switch_backend<R>(
         &self,
         client_reader: &mut PacketReader<R>,
-        client_writer: &mut PacketWriter<W>,
+        client_tx: &ClientQueue,
         phase: &PhaseCell,
         leftovers: &std::sync::Mutex<Leftovers>,
         client_settings: &std::sync::Mutex<ClientSettings>,
@@ -998,7 +972,6 @@ impl BackendBridge {
     ) -> Result<(BackendReader, BackendWriter), SwitchError>
     where
         R: AsyncRead + Unpin,
-        W: AsyncWrite + Unpin,
     {
         let prepared = self
             .prepare_backend(server_name, config)
@@ -1006,7 +979,7 @@ impl BackendBridge {
             .map_err(SwitchError::Unreachable)?;
         self.finish_switch(
             client_reader,
-            client_writer,
+            client_tx,
             phase,
             leftovers,
             client_settings,
@@ -1055,10 +1028,10 @@ impl BackendBridge {
 
     /// Moves the client over to a backend that `prepare_backend` already logged in to
     #[allow(clippy::too_many_arguments)]
-    async fn finish_switch<R, W>(
+    async fn finish_switch<R>(
         &self,
         client_reader: &mut PacketReader<R>,
-        client_writer: &mut PacketWriter<W>,
+        client_tx: &ClientQueue,
         phase: &PhaseCell,
         leftovers: &std::sync::Mutex<Leftovers>,
         client_settings: &std::sync::Mutex<ClientSettings>,
@@ -1067,7 +1040,6 @@ impl BackendBridge {
     ) -> Result<(BackendReader, BackendWriter), SwitchError>
     where
         R: AsyncRead + Unpin,
-        W: AsyncWrite + Unpin,
     {
         let PreparedBackend {
             reader: backend_reader,
@@ -1091,15 +1063,8 @@ impl BackendBridge {
                 pending.extend(joining);
                 pending.extend(leftovers.clear_overlays(version));
             }
-            for packet in pending {
-                client_writer
-                    .queue(&packet)
-                    .map_err(|e| SwitchError::Fatal(e.into()))?;
-            }
-            match timeout(CLIENT_WRITE_TIMEOUT, client_writer.flush()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => return Err(SwitchError::Fatal(e.into())),
-                Err(_) => return Err(SwitchError::Fatal(client_timeout())),
+            if !client_tx.push(pending) {
+                return Err(SwitchError::Fatal(client_timeout()));
             }
             return Ok((backend_reader, backend_writer));
         }
@@ -1113,10 +1078,9 @@ impl BackendBridge {
             Phase::Play => {
                 let start = encode_packet(&StartConfiguration, version)
                     .map_err(|e| SwitchError::Fatal(e.into()))?;
-                match timeout(CLIENT_WRITE_TIMEOUT, client_writer.send(start)).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => return Err(SwitchError::Fatal(e.into())),
-                    Err(_) => return Err(SwitchError::Fatal(client_timeout())),
+                // The client's wait for its acknowledgement starts once it has the request
+                if !client_tx.push([start]) || !client_tx.written().await {
+                    return Err(SwitchError::Fatal(client_timeout()));
                 }
                 phase.backend_started_configuration();
                 Some(PacketKind::ConfigurationAcknowledged)
@@ -1302,66 +1266,76 @@ impl BackendBridge {
         self.plugin_manager.fire_player_disconnect(&event).await;
     }
 
-    /// Sends whatever the last tunnel left in the client queue
-    async fn flush_queue<W: AsyncWrite + Unpin>(
-        rx: &mut ClientQueueRx,
-        writer: &mut PacketWriter<W>,
-    ) {
-        while let Ok((bytes, _permit)) = rx.try_recv() {
-            if !matches!(
-                timeout(CLIENT_WRITE_TIMEOUT, writer.send(bytes)).await,
-                Ok(Ok(()))
-            ) {
-                break;
-            }
-        }
-    }
-
     fn locale(&self) -> Option<String> {
         self.session_manager.locale(&self.player.username)
     }
 
-    async fn notify<W: AsyncWrite + Unpin>(
-        &self,
-        writer: &mut PacketWriter<W>,
-        phase: &PhaseCell,
-        text: String,
-    ) {
-        if phase.backend() == Phase::Play {
-            let content = component_json(&parse_message(&text), self.client_version);
-            let message = SystemChat {
-                content,
-                overlay: false,
-            };
-            send_best_effort(writer, &message, self.client_version).await;
+    fn notify(&self, client_tx: &ClientQueue, phase: &PhaseCell, text: String) {
+        let content = component_json(&parse_message(&text), self.client_version);
+        let message = SystemChat {
+            content,
+            overlay: false,
+        };
+        match encode_packet(&message, self.client_version) {
+            Ok(bytes) => {
+                client_tx.push_in_play(bytes, phase);
+            }
+            Err(e) => debug!("Skipping a notice for {}: {}", self.client_version, e),
         }
     }
 
-    /// Helper to send formatted disconnect packet to client in either play or configuration state
-    async fn disconnect_client<W: AsyncWrite + Unpin>(
-        writer: &mut PacketWriter<W>,
-        version: ProtocolVersion,
+    /// Sends the kick after everything already queued and closes the connection behind it
+    async fn disconnect_client(
+        &self,
+        writer: Task,
+        client_tx: &ClientQueue,
         phase: Phase,
-        locale: Option<&str>,
         reason: &str,
     ) {
-        match phase {
-            Phase::Login => {
-                let kick = LoginDisconnect {
-                    reason_json: crate::client::kick_reason(locale, reason, version).to_string(),
-                };
-                send_best_effort(writer, &kick, version).await;
-            }
-            Phase::Config => {
-                let reason = crate::client::kick_reason(locale, reason, version);
-                send_best_effort(writer, &ConfigDisconnect { reason }, version).await;
-            }
-            Phase::Play => {
-                let reason = component_json(&parse_message(reason), version);
-                send_best_effort(writer, &PlayDisconnect { reason }, version).await;
-            }
+        let locale = self.locale();
+        if let Some(kick) = disconnect_packet(self.client_version, phase, locale.as_deref(), reason)
+        {
+            client_tx.push([kick]);
+        }
+        let _ = client_tx.tx.send(ClientWrite::Close);
+        if timeout(CLIENT_WRITE_TIMEOUT, writer.join()).await.is_err() {
+            debug!(
+                "Gave up writing to '{}' before disconnecting",
+                self.player.username
+            );
         }
     }
+}
+
+fn disconnect_packet(
+    version: ProtocolVersion,
+    phase: Phase,
+    locale: Option<&str>,
+    reason: &str,
+) -> Option<Bytes> {
+    let encoded = match phase {
+        Phase::Login => encode_packet(
+            &LoginDisconnect {
+                reason_json: crate::client::kick_reason(locale, reason, version).to_string(),
+            },
+            version,
+        ),
+        Phase::Config => encode_packet(
+            &ConfigDisconnect {
+                reason: crate::client::kick_reason(locale, reason, version),
+            },
+            version,
+        ),
+        Phase::Play => encode_packet(
+            &PlayDisconnect {
+                reason: component_json(&parse_message(reason), version),
+            },
+            version,
+        ),
+    };
+    encoded
+        .map_err(|e| debug!("Skipping a disconnect for {}: {}", version, e))
+        .ok()
 }
 
 fn client_locale(
@@ -1589,11 +1563,20 @@ impl Drop for TunnelAlive {
     }
 }
 
-type ClientQueueRx = mpsc::UnboundedReceiver<(Bytes, OwnedSemaphorePermit)>;
+enum ClientWrite {
+    // Packets of the proxy's own carry no permit, so they never wait for room
+    Packet(Bytes, Option<OwnedSemaphorePermit>),
+    // Answered once everything queued before it is written
+    Written(tokio::sync::oneshot::Sender<()>),
+    Close,
+}
 
+type ClientQueueRx = mpsc::UnboundedReceiver<ClientWrite>;
+
+/// Everything for the client goes through here, in order, to the one task writing to it
 #[derive(Clone)]
 struct ClientQueue {
-    tx: mpsc::UnboundedSender<(Bytes, OwnedSemaphorePermit)>,
+    tx: mpsc::UnboundedSender<ClientWrite>,
     budget: Arc<Semaphore>,
     // Held while the backend's reconfiguration is noted, so a packet checked as in play cannot
     // be queued behind the backend's StartConfiguration
@@ -1608,22 +1591,104 @@ impl ClientQueue {
         (Self { tx, budget, order }, rx)
     }
 
+    async fn reserve(&self, bytes: &Bytes) -> Option<OwnedSemaphorePermit> {
+        let cost = bytes.len().clamp(1, CLIENT_QUEUE_BYTES) as u32;
+        Arc::clone(&self.budget).acquire_many_owned(cost).await.ok()
+    }
+
     /// Queues a packet only if the client and backend are still playing
     async fn send_in_play(&self, bytes: Bytes, phase: &PhaseCell) -> bool {
-        let cost = bytes.len().clamp(1, CLIENT_QUEUE_BYTES) as u32;
-        let Ok(permit) = Arc::clone(&self.budget).acquire_many_owned(cost).await else {
+        let Some(permit) = self.reserve(&bytes).await else {
             return false;
         };
         let _order = self.order.lock().unwrap_or_else(|e| e.into_inner());
-        phase.backend() == Phase::Play && self.tx.send((bytes, permit)).is_ok()
+        phase.backend() == Phase::Play
+            && self
+                .tx
+                .send(ClientWrite::Packet(bytes, Some(permit)))
+                .is_ok()
     }
 
     async fn send(&self, bytes: Bytes) -> bool {
-        let cost = bytes.len().clamp(1, CLIENT_QUEUE_BYTES) as u32;
-        match Arc::clone(&self.budget).acquire_many_owned(cost).await {
-            Ok(permit) => self.tx.send((bytes, permit)).is_ok(),
-            Err(_) => false,
+        match self.reserve(&bytes).await {
+            Some(permit) => self
+                .tx
+                .send(ClientWrite::Packet(bytes, Some(permit)))
+                .is_ok(),
+            None => false,
         }
+    }
+
+    fn push(&self, packets: impl IntoIterator<Item = Bytes>) -> bool {
+        let _order = self.order.lock().unwrap_or_else(|e| e.into_inner());
+        packets
+            .into_iter()
+            .all(|bytes| self.tx.send(ClientWrite::Packet(bytes, None)).is_ok())
+    }
+
+    fn push_in_play(&self, bytes: Bytes, phase: &PhaseCell) -> bool {
+        let _order = self.order.lock().unwrap_or_else(|e| e.into_inner());
+        phase.backend() == Phase::Play && self.tx.send(ClientWrite::Packet(bytes, None)).is_ok()
+    }
+
+    /// Waits until everything queued so far is written; false if the client is gone
+    async fn written(&self) -> bool {
+        let (done, wait) = tokio::sync::oneshot::channel();
+        self.tx.send(ClientWrite::Written(done)).is_ok() && wait.await.is_ok()
+    }
+
+    /// Resolves once nothing is written to the client anymore
+    async fn closed(&self) {
+        self.tx.closed().await
+    }
+}
+
+async fn write_client<W: AsyncWrite + Unpin>(
+    mut writer: PacketWriter<W>,
+    mut rx: ClientQueueRx,
+    budget: Arc<Semaphore>,
+    username: String,
+) {
+    while let Some(write) = rx.recv().await {
+        match write {
+            ClientWrite::Packet(bytes, _permit) => {
+                match timeout(CLIENT_WRITE_TIMEOUT, writer.send(bytes)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        debug!("Client write failed for '{}': {:?}", username, e);
+                        break;
+                    }
+                    Err(_) => {
+                        warn!("Client '{}' stopped reading, disconnecting", username);
+                        break;
+                    }
+                }
+            }
+            ClientWrite::Written(done) => {
+                let _ = done.send(());
+            }
+            ClientWrite::Close => break,
+        }
+    }
+    budget.close();
+}
+
+/// A task that is stopped when its handle is dropped
+struct Task(tokio::task::JoinHandle<()>);
+
+impl Task {
+    fn spawn(future: impl Future<Output = ()> + Send + 'static) -> Self {
+        Self(tokio::spawn(future))
+    }
+
+    async fn join(mut self) {
+        let _ = (&mut self.0).await;
+    }
+}
+
+impl Drop for Task {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -1637,12 +1702,10 @@ struct PendingSuggestion {
 impl BackendBridge {
     /// Tunnels packets back and forth between client and backend
     #[allow(clippy::too_many_arguments)]
-    async fn bridge_tunnel<R1, W1, R2, W2>(
+    async fn bridge_tunnel<R1, R2, W2>(
         username: &str,
         client_reader: &mut PacketReader<R1>,
-        client_writer: &mut PacketWriter<W1>,
         client_tx: &ClientQueue,
-        client_rx: &mut ClientQueueRx,
         backend_reader: &mut PacketReader<R2>,
         backend_writer: &mut PacketWriter<W2>,
         client_rate_limiter: &mut PacketRateLimiter,
@@ -1665,7 +1728,6 @@ impl BackendBridge {
     ) -> Result<TunnelExit, BridgeError>
     where
         R1: AsyncRead + Unpin,
-        W1: AsyncWrite + Unpin,
         R2: AsyncRead + Unpin,
         W2: AsyncWrite + Unpin,
     {
@@ -1678,19 +1740,7 @@ impl BackendBridge {
         > = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
         let client_writer = async {
-            while let Some((packet_bytes, _permit)) = client_rx.recv().await {
-                match timeout(CLIENT_WRITE_TIMEOUT, client_writer.send(packet_bytes)).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        debug!("Client write failed for '{}': {:?}", username, e);
-                        return TunnelExit::ClientDisconnected;
-                    }
-                    Err(_) => {
-                        warn!("Client '{}' stopped reading, disconnecting", username);
-                        return TunnelExit::ClientDisconnected;
-                    }
-                }
-            }
+            client_tx.closed().await;
             TunnelExit::ClientDisconnected
         };
 
@@ -2403,7 +2453,9 @@ mod tests {
         );
         assert!(blocked.await.is_err());
 
-        let (first, permit) = rx.recv().await.unwrap();
+        let Some(ClientWrite::Packet(first, permit)) = rx.recv().await else {
+            panic!("expected the first packet");
+        };
         assert_eq!(first.len(), CLIENT_QUEUE_BYTES - 1);
         drop(permit);
         assert!(queue.send(Bytes::from_static(b"y")).await);
