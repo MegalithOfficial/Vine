@@ -46,6 +46,8 @@ type RunningCommands = Arc<std::sync::Mutex<std::collections::HashSet<Option<Str
 
 /// Event handlers a plugin may register across all events
 pub const MAX_EVENT_HANDLERS: usize = 256;
+/// Command names and aliases a plugin may register
+pub const MAX_COMMAND_NAMES: usize = 64;
 
 pub struct PluginManager {
     plugins_dir: PathBuf,
@@ -130,6 +132,8 @@ impl PluginManager {
         true
     }
 
+    /// Returns false if some names were left out because the plugin already has as many
+    /// command names and aliases as it may register
     pub async fn register_command(
         &self,
         command_id: u32,
@@ -138,7 +142,8 @@ impl PluginManager {
         aliases: Vec<String>,
         permission: Option<String>,
         plugin: Arc<WasmPlugin>,
-    ) {
+    ) -> bool {
+        let mut capped = false;
         if let Some(proxy) = self.proxy_ctx.get() {
             // A name owned by a built-in or another plugin instance would keep that owner's
             // permission. Owners are looked up in the routes, which change right away unlike
@@ -162,21 +167,37 @@ impl PluginManager {
                 })
                 .collect::<Vec<_>>();
             let Ok(mut routes) = self.command_routes.write() else {
-                return;
+                return true;
             };
             if plugin.is_stopping() || plugin.is_disabled() {
-                return;
+                return true;
             }
-            for cmd_name in &names {
-                routes.insert(
-                    cmd_name.to_ascii_lowercase(),
-                    CommandRoute {
-                        plugin: plugin.clone(),
-                        command_id,
-                        permission: permission.clone(),
-                    },
-                );
-            }
+            let mut owned = routes
+                .values()
+                .filter(|route| Arc::ptr_eq(&route.plugin, &plugin))
+                .count();
+            let names = names
+                .into_iter()
+                .filter(|cmd_name| {
+                    let key = cmd_name.to_ascii_lowercase();
+                    if !routes.contains_key(&key) {
+                        if owned >= MAX_COMMAND_NAMES {
+                            capped = true;
+                            return false;
+                        }
+                        owned += 1;
+                    }
+                    routes.insert(
+                        key,
+                        CommandRoute {
+                            plugin: plugin.clone(),
+                            command_id,
+                            permission: permission.clone(),
+                        },
+                    );
+                    true
+                })
+                .collect::<Vec<_>>();
             drop(routes);
             for cmd_name in names {
                 let route = cmd_name.to_ascii_lowercase();
@@ -224,6 +245,7 @@ impl PluginManager {
                 );
             }
         }
+        !capped
     }
 
     pub async fn load_plugins(&self) -> Result<usize, Box<dyn std::error::Error>> {

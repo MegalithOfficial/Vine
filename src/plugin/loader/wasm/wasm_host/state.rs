@@ -97,6 +97,7 @@ pub struct PluginHostState {
     // Translations registered before the plugin's name is known, which is their namespace
     early_translations: Option<Vec<(String, Translations)>>,
     event_cap_warned: bool,
+    command_cap_warned: bool,
 }
 
 impl Default for PluginHostState {
@@ -137,6 +138,7 @@ impl PluginHostState {
             killed: Arc::new(AtomicBool::new(false)),
             early_translations: Some(Vec::new()),
             event_cap_warned: false,
+            command_cap_warned: false,
         }
     }
 
@@ -538,11 +540,19 @@ impl wit::vine::plugin::context::HostContext for PluginHostState {
             .and_then(|p| p.upgrade())
             .ok_or_else(|| wasmtime::Error::msg("Plugin reference is no longer valid"))?;
 
-        if let Some(proxy) = &self.proxy {
-            proxy
+        if let Some(proxy) = &self.proxy
+            && !proxy
                 .plugin_manager
                 .register_command(command_id, name, description, aliases, permission, plugin)
-                .await;
+                .await
+            && !self.command_cap_warned
+        {
+            self.command_cap_warned = true;
+            tracing::warn!(
+                "[Plugin: {}] Ignoring command names and aliases beyond the first {}",
+                self.plugin_name,
+                crate::plugin::MAX_COMMAND_NAMES
+            );
         }
         Ok(())
     }
