@@ -60,6 +60,10 @@ pub enum BridgeError {
     LoginTimeout(String),
     #[error("Backend disconnected player during login: {0}")]
     LoginDisconnected(String),
+    #[error(
+        "Backend server '{0}' is in online mode; set online-mode=false on it and use player info forwarding"
+    )]
+    OnlineMode(String),
     #[error("Velocity forwarding error: {0}")]
     VelocityError(String),
     #[error("Vine forwarding error: {0}")]
@@ -260,6 +264,8 @@ impl BackendBridge {
                     server_name, self.player.username, reason
                 );
                 return Err(BridgeError::LoginDisconnected(reason));
+            } else if PacketKind::EncryptionRequest.matches(raw_packet.id, version) {
+                return Err(BridgeError::OnlineMode(server_name.to_string()));
             } else if PacketKind::LoginPluginRequest.matches(raw_packet.id, version) {
                 let request: LoginPluginRequest = decode_packet(&raw_packet.payload, version)?;
 
