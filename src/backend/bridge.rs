@@ -561,10 +561,7 @@ impl BackendBridge {
 
         match tunnel.run().await {
             End::Kicked(reason) => {
-                info!(
-                    "Disconnecting player '{}': {}",
-                    bridge.player.username, reason
-                );
+                info!("Kicking player '{}': {}", bridge.player.username, reason);
                 tunnel.disconnect_client(writer, &reason).await;
             }
             End::Closed => debug!(
