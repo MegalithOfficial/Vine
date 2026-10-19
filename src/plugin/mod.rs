@@ -316,6 +316,7 @@ impl PluginManager {
 
     async fn enable_plugin(&self, plugin: Arc<WasmPlugin>, path: PathBuf) -> Result<(), String> {
         let metadata = plugin.metadata.clone();
+        crate::i18n::load_namespace(&crate::i18n::namespace(&metadata.name));
         plugin.register_early_translations();
         if let Err(e) = plugin.on_load(Arc::default()).await {
             // Whatever it registered before failing would otherwise outlive it
@@ -397,9 +398,10 @@ impl PluginManager {
         Some(loaded.path)
     }
 
-    /// Stops a plugin and drops its event handlers and commands
+    /// Stops a plugin and drops its event handlers, commands and translations
     async fn forget(&self, plugin: &Arc<WasmPlugin>, name: &str) {
         plugin.shutdown().await;
+        crate::i18n::unregister(&crate::i18n::namespace(name));
         for handlers in self.event_handlers.write().await.values_mut() {
             handlers.retain(|handler| !Arc::ptr_eq(&handler.plugin, plugin));
         }

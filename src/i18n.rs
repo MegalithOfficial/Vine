@@ -198,6 +198,28 @@ pub fn register(
     Ok(())
 }
 
+/// Reads a plugin's files in `lang/<namespace>/` again, such as languages it never registers
+/// itself, after its texts were dropped by [`unregister`]
+pub fn load_namespace(namespace: &str) {
+    if let Some(translations) = TRANSLATIONS.get() {
+        let _ = translations.load_dir(&translations.dir.join(namespace), Some(namespace));
+    }
+}
+
+/// Drops every text of a plugin that is no longer loaded. Its files stay on disk.
+pub fn unregister(namespace: &str) {
+    let Some(translations) = TRANSLATIONS.get() else {
+        return;
+    };
+    let prefix = format!("{namespace}:");
+    if let Ok(mut locales) = translations.locales.write() {
+        for table in locales.values_mut() {
+            table.retain(|key, _| !key.starts_with(&prefix));
+        }
+        locales.retain(|_, table| !table.is_empty());
+    }
+}
+
 fn load_file(path: &Path, namespace: Option<&str>) -> Option<Table> {
     let table: Table = match std::fs::read_to_string(path)
         .map_err(|e| e.to_string())
@@ -220,7 +242,7 @@ fn load_file(path: &Path, namespace: Option<&str>) -> Option<Table> {
     )
 }
 
-fn normalize(locale: &str) -> String {
+pub(crate) fn normalize(locale: &str) -> String {
     locale.trim().to_ascii_lowercase().replace('-', "_")
 }
 

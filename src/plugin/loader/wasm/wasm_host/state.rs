@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Weak};
@@ -30,6 +31,13 @@ const MAX_TABLE_ELEMENTS: usize = 1_000_000;
 // Open files, streams and other handles a plugin may hold at once; files are real descriptors
 // that the proxy needs for its own connections
 const MAX_RESOURCES: usize = 1024;
+
+const MAX_TRANSLATION_LOCALES: usize = 64;
+// Keys across all locales
+const MAX_TRANSLATIONS: usize = 10_000;
+const MAX_LOCALE_LEN: usize = 32;
+const MAX_TRANSLATION_KEY_LEN: usize = 256;
+const MAX_TRANSLATION_TEXT_LEN: usize = 4096;
 
 /// Caps what a plugin allocates across all of its memories and tables, not per memory
 // Failed grows stay counted, since wasmtime also reports failures it never asked about
@@ -98,6 +106,9 @@ pub struct PluginHostState {
     early_translations: Option<Vec<(String, Translations)>>,
     event_cap_warned: bool,
     command_cap_warned: bool,
+    // Keys taken so far in each locale, early ones included
+    translation_keys: HashMap<String, HashSet<String>>,
+    translations_refused_warned: bool,
 }
 
 impl Default for PluginHostState {
@@ -139,6 +150,8 @@ impl PluginHostState {
             early_translations: Some(Vec::new()),
             event_cap_warned: false,
             command_cap_warned: false,
+            translation_keys: HashMap::new(),
+            translations_refused_warned: false,
         }
     }
 
@@ -146,6 +159,63 @@ impl PluginHostState {
     /// later ones are registered right away
     pub fn take_early_translations(&mut self) -> Vec<(String, Translations)> {
         self.early_translations.take().unwrap_or_default()
+    }
+
+    /// Leaves out texts over the length limits and refuses a call that would take the plugin
+    /// past its locale or key limits
+    fn limit_translations(
+        &mut self,
+        locale: &str,
+        entries: Translations,
+    ) -> Result<Translations, String> {
+        if locale.len() > MAX_LOCALE_LEN {
+            return Err(format!("locales are limited to {MAX_LOCALE_LEN} bytes"));
+        }
+        let count = entries.len();
+        let entries: Translations = entries
+            .into_iter()
+            .filter(|(key, text)| {
+                key.len() <= MAX_TRANSLATION_KEY_LEN && text.len() <= MAX_TRANSLATION_TEXT_LEN
+            })
+            .collect();
+        let locale = crate::i18n::normalize(locale);
+        let known = self.translation_keys.get(&locale);
+        if known.is_none() && self.translation_keys.len() >= MAX_TRANSLATION_LOCALES {
+            return Err(format!(
+                "'{locale}' would go over {MAX_TRANSLATION_LOCALES} locales"
+            ));
+        }
+        let added: HashSet<String> = entries
+            .iter()
+            .filter(|(key, _)| known.is_none_or(|keys| !keys.contains(key)))
+            .map(|(key, _)| key.clone())
+            .collect();
+        let total: usize = self.translation_keys.values().map(HashSet::len).sum();
+        if total + added.len() > MAX_TRANSLATIONS {
+            return Err(format!("'{locale}' would go over {MAX_TRANSLATIONS} keys"));
+        }
+        self.translation_keys
+            .entry(locale)
+            .or_default()
+            .extend(added);
+        if entries.len() < count {
+            self.warn_translations_refused(format!(
+                "keys over {MAX_TRANSLATION_KEY_LEN} bytes and texts over \
+                 {MAX_TRANSLATION_TEXT_LEN} bytes are left out"
+            ));
+        }
+        Ok(entries)
+    }
+
+    fn warn_translations_refused(&mut self, reason: String) {
+        if !self.translations_refused_warned {
+            self.translations_refused_warned = true;
+            tracing::warn!(
+                "[Plugin: {}] Ignoring translations: {}; later ones are not reported",
+                self.plugin_name,
+                reason
+            );
+        }
     }
 
     pub fn add_context(
@@ -204,8 +274,21 @@ impl wit::vine::plugin::translation::Host for PluginHostState {
         locale: String,
         entries: Vec<(String, String)>,
     ) -> wasmtime::Result<()> {
+        let entries = match self.limit_translations(&locale, entries) {
+            Ok(entries) => entries,
+            Err(reason) => {
+                self.warn_translations_refused(reason);
+                return Ok(());
+            }
+        };
         match &mut self.early_translations {
             Some(early) => early.push((locale, entries)),
+            // A stopping plugin's texts are about to be dropped
+            None if self
+                .plugin
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .is_some_and(|plugin| plugin.is_stopping()) => {}
             None => register_translations(&self.plugin_name, locale, entries),
         }
         Ok(())
