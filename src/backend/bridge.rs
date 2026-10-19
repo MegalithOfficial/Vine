@@ -474,6 +474,7 @@ impl BackendBridge {
         // player, so only replies to the current backend's latest challenge are forwarded
         let keep_alive_challenge = std::sync::Mutex::new(None::<i64>);
         let leftovers = std::sync::Mutex::new(Leftovers::default());
+        let client_settings = std::sync::Mutex::new(ClientSettings::default());
         let phase = Arc::new(PhaseCell::new(
             if self.client_version >= ProtocolVersion::V1_20_2 {
                 Phase::Login
@@ -552,6 +553,7 @@ impl BackendBridge {
                     &suggesting,
                     &keep_alive_challenge,
                     &leftovers,
+                    &client_settings,
                     connecting.as_mut().map(|(_, future)| future),
                     deferred.is_some() || early.is_some(),
                 )
@@ -725,6 +727,7 @@ impl BackendBridge {
                                 &mut client_writer,
                                 &phase,
                                 &leftovers,
+                                &client_settings,
                                 &server_name,
                                 prepared,
                             )
@@ -901,6 +904,7 @@ impl BackendBridge {
                             &mut client_writer,
                             &phase,
                             &leftovers,
+                            &client_settings,
                             &fb_name,
                             &fb_cfg,
                         )
@@ -975,12 +979,14 @@ impl BackendBridge {
 
     /// Logs into another backend and moves the client over to it. On 1.20.2+ the client is sent
     /// back into the configuration phase so the new backend can configure it from scratch.
+    #[allow(clippy::too_many_arguments)]
     async fn switch_backend<R, W>(
         &self,
         client_reader: &mut PacketReader<R>,
         client_writer: &mut PacketWriter<W>,
         phase: &PhaseCell,
         leftovers: &std::sync::Mutex<Leftovers>,
+        client_settings: &std::sync::Mutex<ClientSettings>,
         server_name: &str,
         config: &BackendConfig,
     ) -> Result<(BackendReader, BackendWriter), SwitchError>
@@ -997,6 +1003,7 @@ impl BackendBridge {
             client_writer,
             phase,
             leftovers,
+            client_settings,
             server_name,
             prepared,
         )
@@ -1041,12 +1048,14 @@ impl BackendBridge {
     }
 
     /// Moves the client over to a backend that `prepare_backend` already logged in to
+    #[allow(clippy::too_many_arguments)]
     async fn finish_switch<R, W>(
         &self,
         client_reader: &mut PacketReader<R>,
         client_writer: &mut PacketWriter<W>,
         phase: &PhaseCell,
         leftovers: &std::sync::Mutex<Leftovers>,
+        client_settings: &std::sync::Mutex<ClientSettings>,
         server_name: &str,
         prepared: PreparedBackend,
     ) -> Result<(BackendReader, BackendWriter), SwitchError>
@@ -1112,12 +1121,17 @@ impl BackendBridge {
 
         // Packets the client sends before acknowledging belong to the old backend
         if let Some(kind) = awaited {
+            let current = phase.get();
             let acknowledged = async {
                 loop {
                     let packet = client_reader.read_packet().await?;
                     if kind.matches(packet.id, version) {
                         return Ok::<_, ProtocolError>(());
                     }
+                    client_settings
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .observe(&packet, current, version);
                 }
             };
             match timeout(SWITCH_ACK_TIMEOUT, acknowledged).await {
@@ -1131,8 +1145,17 @@ impl BackendBridge {
 
         let ack =
             encode_packet(&LoginAcknowledged, version).map_err(|e| SwitchError::Fatal(e.into()))?;
+        let repeated = client_settings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .repeat(version);
+        for packet in std::iter::once(ack).chain(repeated) {
+            backend_writer
+                .queue(&packet)
+                .map_err(|e| SwitchError::Fatal(e.into()))?;
+        }
         backend_writer
-            .send(ack)
+            .flush()
             .await
             .map_err(|e| SwitchError::Fatal(e.into()))?;
         Ok((backend_reader, backend_writer))
@@ -1351,6 +1374,75 @@ fn client_locale(
     }
 }
 
+/// A backend switched to on 1.20.2+ configures the client from scratch, but the client only
+/// tells the first backend about its settings and brand, so they are repeated to every next one
+#[derive(Default)]
+struct ClientSettings {
+    information: Option<Bytes>,
+    brand: Option<Vec<u8>>,
+}
+
+impl ClientSettings {
+    fn observe(
+        &mut self,
+        packet: &crate::protocol::RawPacket,
+        phase: Phase,
+        version: ProtocolVersion,
+    ) {
+        let (information, plugin_message) = match phase {
+            Phase::Config => (
+                PacketKind::ConfigClientInformation,
+                PacketKind::ConfigServerboundPluginMessage,
+            ),
+            Phase::Play => (
+                PacketKind::ClientInformation,
+                PacketKind::ServerboundPluginMessage,
+            ),
+            Phase::Login => return,
+        };
+        if information.matches(packet.id, version) {
+            self.information = Some(packet.payload.clone());
+        } else if plugin_message.matches(packet.id, version)
+            && let Ok((channel, data)) = read_plugin_message(&mut &packet.payload[..], version)
+            && channel == BRAND_CHANNEL
+        {
+            self.brand = Some(data);
+        }
+    }
+
+    /// The packets to send a backend that has just entered configuration
+    fn repeat(&self, version: ProtocolVersion) -> Vec<Bytes> {
+        let mut packets = Vec::new();
+        if let Some(data) = &self.brand
+            && let Some(id) = PacketKind::ConfigServerboundPluginMessage.id(version)
+        {
+            let mut payload = Vec::new();
+            write_plugin_message(&mut payload, BRAND_CHANNEL, data, version);
+            packets.push(
+                crate::protocol::RawPacket {
+                    id,
+                    payload: payload.into(),
+                }
+                .to_bytes(),
+            );
+        }
+        if let Some(payload) = &self.information
+            && let Some(id) = PacketKind::ConfigClientInformation.id(version)
+        {
+            packets.push(
+                crate::protocol::RawPacket {
+                    id,
+                    payload: payload.clone(),
+                }
+                .to_bytes(),
+            );
+        }
+        packets
+    }
+}
+
+const BRAND_CHANNEL: &str = "minecraft:brand";
+
 async fn send_best_effort<P: Packet, W: AsyncWrite + Unpin>(
     writer: &mut PacketWriter<W>,
     packet: &P,
@@ -1557,6 +1649,7 @@ impl BackendBridge {
         suggesting: &Arc<std::sync::Mutex<Suggesting>>,
         keep_alive_challenge: &std::sync::Mutex<Option<i64>>,
         leftovers: &std::sync::Mutex<Leftovers>,
+        client_settings: &std::sync::Mutex<ClientSettings>,
         connecting: Option<&mut Connecting<'_>>,
         wake_on_play: bool,
     ) -> Result<TunnelExit, BridgeError>
@@ -1968,6 +2061,12 @@ impl BackendBridge {
                             }
                         }
 
+                        if client_version >= ProtocolVersion::V1_20_2 {
+                            client_settings
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .observe(&raw_packet, current, client_version);
+                        }
                         if let Err(e) = backend_writer.send(raw_packet.to_bytes()).await {
                             debug!("Backend write failed for '{}': {:?}", username, e);
                             return TunnelExit::BackendDisconnected { reason: None };
