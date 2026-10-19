@@ -12,6 +12,8 @@ use super::wire::{ReadExt, WriteExt, varint_len};
 
 pub const MAX_FRAME_LEN: usize = 2_097_151;
 pub const MAX_PACKET_DATA_LEN: usize = 8_388_608;
+// Larger packets grow the buffer as their bytes arrive instead of up front
+const MAX_PREALLOC: usize = 64 * 1024;
 
 type Encryptor = cfb8::Encryptor<aes::Aes128>;
 type Decryptor = cfb8::Decryptor<aes::Aes128>;
@@ -51,6 +53,8 @@ pub struct PacketReader<R> {
     buf: BytesMut,
     compression: Option<usize>,
     decryptor: Option<Decryptor>,
+    max_frame: usize,
+    max_data: usize,
 }
 
 impl<R: AsyncRead + Unpin> PacketReader<R> {
@@ -60,7 +64,14 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
             buf: BytesMut::with_capacity(4096),
             compression: None,
             decryptor: None,
+            max_frame: MAX_FRAME_LEN,
+            max_data: MAX_PACKET_DATA_LEN,
         }
+    }
+
+    pub fn set_limits(&mut self, max_frame: usize, max_data: usize) {
+        self.max_frame = max_frame.min(MAX_FRAME_LEN);
+        self.max_data = max_data.min(MAX_PACKET_DATA_LEN);
     }
 
     pub async fn read_packet(&mut self) -> Result<RawPacket, ProtocolError> {
@@ -93,11 +104,12 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
         };
         let len = usize::try_from(len)
             .ok()
-            .filter(|len| (1..=MAX_FRAME_LEN).contains(len))
+            .filter(|len| (1..=self.max_frame).contains(len))
             .ok_or_else(|| ProtocolError::Malformed(format!("invalid frame length {len}")))?;
         let header = self.buf.len() - cur.len();
         if cur.len() < len {
-            self.buf.reserve(header + len - self.buf.len());
+            self.buf
+                .reserve((header + len - self.buf.len()).min(MAX_PREALLOC));
             return Ok(None);
         }
         self.buf.advance(header);
@@ -118,7 +130,7 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
 
         let data_len = usize::try_from(data_len)
             .ok()
-            .filter(|len| *len <= MAX_PACKET_DATA_LEN)
+            .filter(|len| *len <= self.max_data)
             .ok_or_else(|| {
                 ProtocolError::Malformed(format!("invalid uncompressed length {data_len}"))
             })?;
@@ -128,7 +140,7 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
             )));
         }
 
-        let mut data = Vec::with_capacity(data_len);
+        let mut data = Vec::with_capacity(data_len.min(MAX_PREALLOC));
         ZlibDecoder::new(&body[..])
             .take(data_len as u64 + 1)
             .read_to_end(&mut data)
@@ -353,6 +365,26 @@ mod tests {
         let mut reader = PacketReader::new(&data[..]);
         reader.set_compression(256);
         assert!(reader.read_packet().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_announced_length_does_not_allocate_up_front() {
+        let (client, mut server) = tokio::io::duplex(64);
+        let mut reader = PacketReader::new(client);
+        let mut header = Vec::new();
+        header.write_varint(MAX_FRAME_LEN as i32);
+        server.write_all(&header).await.unwrap();
+        let pending =
+            tokio::time::timeout(std::time::Duration::from_millis(20), reader.read_packet()).await;
+        assert!(pending.is_err());
+        assert!(reader.buf.capacity() <= 2 * MAX_PREALLOC);
+
+        let mut reader = PacketReader::new(&header[..]);
+        reader.set_limits(8192, 8192);
+        assert!(matches!(
+            reader.read_packet().await,
+            Err(ProtocolError::Malformed(_))
+        ));
     }
 
     #[tokio::test]
