@@ -18,13 +18,27 @@ pub enum PlayerAction {
     PluginMessage { channel: String, data: Vec<u8> },
 }
 
+/// Actions a player's connection holds before senders that cannot wait start dropping theirs
+pub const ACTION_QUEUE: usize = 1024;
+
+/// Queues an action the proxy must not lose. If the queue is full, it waits for room on its own
+/// task rather than holding up the caller.
+pub fn send_reliably(tx: &mpsc::Sender<PlayerAction>, action: PlayerAction) {
+    if let Err(mpsc::error::TrySendError::Full(action)) = tx.try_send(action) {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(action).await;
+        });
+    }
+}
+
 /// Represents an active connected player session on the proxy
 #[derive(Clone)]
 pub struct PlayerSession {
     pub username: String,
     pub uuid: Uuid,
     pub current_server: String,
-    pub action_tx: mpsc::UnboundedSender<PlayerAction>,
+    pub action_tx: mpsc::Sender<PlayerAction>,
     pub client_ip: String,
     pub protocol_version: u32,
     /// Language reported by the client, e.g. `en_us`
@@ -204,7 +218,7 @@ mod tests {
     fn test_try_register_rejects_duplicates_until_guard_drops() {
         let manager = Arc::new(SessionManager::new());
         let session = |name: &str, uuid: u128| {
-            let (tx, _rx) = mpsc::unbounded_channel();
+            let (tx, _rx) = mpsc::channel(1);
             PlayerSession {
                 username: name.to_string(),
                 uuid: Uuid::from_u128(uuid),

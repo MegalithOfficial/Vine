@@ -9,7 +9,7 @@ use pumpkin_command::suggestion::provider::{SuggestionProvider, SuggestionProvid
 use pumpkin_command::suggestion::suggestions::SuggestionsBuilder;
 
 use super::{ProxyCommandSource, command_error};
-use crate::session::PlayerAction;
+use crate::session::{PlayerAction, send_reliably};
 
 struct TargetSuggestionProvider;
 
@@ -105,9 +105,12 @@ impl CommandExecutor<ProxyCommandSource> for SendCommandExecutor {
 
             let count = sessions.len();
             for session in &sessions {
-                let _ = session.action_tx.send(PlayerAction::Connect {
-                    server_name: canonical_server.clone(),
-                });
+                send_reliably(
+                    &session.action_tx,
+                    PlayerAction::Connect {
+                        server_name: canonical_server.clone(),
+                    },
+                );
             }
 
             context
@@ -127,9 +130,12 @@ impl CommandExecutor<ProxyCommandSource> for SendCommandExecutor {
                     )
                 })?;
 
-            let _ = session.action_tx.send(PlayerAction::Connect {
-                server_name: canonical_server.clone(),
-            });
+            send_reliably(
+                &session.action_tx,
+                PlayerAction::Connect {
+                    server_name: canonical_server.clone(),
+                },
+            );
 
             context.source.reply(
                 "vine.command.send.sent",
@@ -185,7 +191,7 @@ mod tests {
         );
 
         let session_manager = Arc::new(SessionManager::new());
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(16);
         let _guard1 = session_manager
             .try_register(PlayerSession {
                 username: "Steve".to_string(),
@@ -218,7 +224,7 @@ mod tests {
         );
 
         // Player not in admin list is rejected
-        let (non_admin_tx, _) = mpsc::unbounded_channel();
+        let (non_admin_tx, _) = mpsc::channel(16);
         let non_admin_source = ProxyCommandSource {
             sender: CommandSender::Player {
                 username: "RegularPlayer".to_string(),
@@ -309,7 +315,7 @@ mod tests {
         );
 
         let session_manager = Arc::new(SessionManager::new());
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel(16);
         let _guard2 = session_manager
             .try_register(PlayerSession {
                 username: "Steve".to_string(),

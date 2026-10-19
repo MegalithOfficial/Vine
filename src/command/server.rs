@@ -9,7 +9,7 @@ use pumpkin_command::suggestion::provider::{SuggestionProvider, SuggestionProvid
 use pumpkin_command::suggestion::suggestions::SuggestionsBuilder;
 
 use super::{CommandSender, ProxyCommandSource, command_error};
-use crate::session::PlayerAction;
+use crate::session::{PlayerAction, send_reliably};
 
 struct ServerSuggestionProvider;
 
@@ -140,9 +140,12 @@ impl CommandExecutor<ProxyCommandSource> for ServerSwitchCommandExecutor {
             .source
             .reply("vine.command.server.connecting", &[&target_server]);
 
-        let _ = action_tx.send(PlayerAction::Connect {
-            server_name: target_server,
-        });
+        send_reliably(
+            &action_tx,
+            PlayerAction::Connect {
+                server_name: target_server,
+            },
+        );
 
         Ok(1)
     }
@@ -177,7 +180,7 @@ mod tests {
 
         let config = Arc::new(Config::default());
         let session_manager = Arc::new(SessionManager::new());
-        let (action_tx, mut action_rx) = mpsc::unbounded_channel();
+        let (action_tx, mut action_rx) = mpsc::channel(16);
 
         let session = PlayerSession {
             username: "Steve".to_string(),

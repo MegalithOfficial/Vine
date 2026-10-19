@@ -42,7 +42,7 @@ pub enum CommandSender {
     /// Command invoked by an in-game player
     Player {
         username: String,
-        action_tx: mpsc::UnboundedSender<PlayerAction>,
+        action_tx: mpsc::Sender<PlayerAction>,
     },
 }
 
@@ -54,7 +54,7 @@ impl CommandSender {
                 info!("{}", message.to_pretty_console());
             }
             Self::Player { action_tx, .. } => {
-                let _ = action_tx.send(PlayerAction::Message(message));
+                let _ = action_tx.try_send(PlayerAction::Message(message));
             }
         }
     }

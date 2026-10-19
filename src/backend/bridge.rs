@@ -46,7 +46,7 @@ use crate::protocol::{
     encode_packet,
 };
 use crate::security::PacketRateLimiter;
-use crate::session::{PlayerAction, SessionManager};
+use crate::session::{PlayerAction, SessionManager, send_reliably};
 
 #[derive(Error, Debug)]
 pub enum BridgeError {
@@ -367,8 +367,8 @@ impl BackendBridge {
         self,
         mut client_reader: PacketReader<R>,
         mut client_writer: PacketWriter<W>,
-        action_tx: mpsc::UnboundedSender<PlayerAction>,
-        mut action_rx: mpsc::UnboundedReceiver<PlayerAction>,
+        action_tx: mpsc::Sender<PlayerAction>,
+        mut action_rx: mpsc::Receiver<PlayerAction>,
     ) -> Result<(), BridgeError>
     where
         R: AsyncRead + Unpin + Send + 'static,
@@ -604,7 +604,7 @@ impl BackendBridge {
                 }
                 TunnelExit::ReachedPlay => {
                     if let Some(server_name) = deferred.take() {
-                        let _ = action_tx.send(PlayerAction::Connect { server_name });
+                        send_reliably(&action_tx, PlayerAction::Connect { server_name });
                     }
                     if let Some((held_since, prepared)) = early.take() {
                         // A backend kept waiting this long may have given up on the login, so it
@@ -1647,8 +1647,8 @@ impl BackendBridge {
         backend_writer: &mut PacketWriter<W2>,
         client_rate_limiter: &mut PacketRateLimiter,
         client_version: ProtocolVersion,
-        action_rx: &mut mpsc::UnboundedReceiver<PlayerAction>,
-        action_tx: &mpsc::UnboundedSender<PlayerAction>,
+        action_rx: &mut mpsc::Receiver<PlayerAction>,
+        action_tx: &mpsc::Sender<PlayerAction>,
         command_dispatcher: Arc<CommandDispatcher>,
         proxy_config: Arc<Config>,
         session_manager: Arc<SessionManager>,

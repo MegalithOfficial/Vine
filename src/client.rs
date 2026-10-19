@@ -564,7 +564,7 @@ impl ClientHandler {
             None
         };
 
-        let (action_tx, action_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (action_tx, action_rx) = tokio::sync::mpsc::channel(crate::session::ACTION_QUEUE);
         let Some(_session_guard) = self.session_manager.try_register(PlayerSession {
             username: authenticated_player.username.clone(),
             uuid: authenticated_player.id,

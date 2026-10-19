@@ -356,7 +356,7 @@ impl wit::vine::plugin::command::Host for PluginHostState {
                             .into_iter()
                             .find(|s| s.uuid == target_uuid)
                     {
-                        let _ = session.action_tx.send(PlayerAction::Message(
+                        let _ = session.action_tx.try_send(PlayerAction::Message(
                             crate::protocol::text::parse_message(&message),
                         ));
                     }
@@ -461,7 +461,7 @@ impl wit::vine::plugin::proxy::Host for PluginHostState {
     async fn broadcast(&mut self, message: String) -> wasmtime::Result<()> {
         if let Some(proxy) = &self.proxy {
             for session in proxy.session_manager.list_sessions() {
-                let _ = session.action_tx.send(PlayerAction::Message(
+                let _ = session.action_tx.try_send(PlayerAction::Message(
                     crate::protocol::text::parse_message(&message),
                 ));
             }
@@ -483,10 +483,12 @@ impl wit::vine::plugin::proxy::Host for PluginHostState {
                 .into_iter()
                 .find(|s| s.uuid == target_uuid)
         {
-            let _ = session.action_tx.send(PlayerAction::Message(
-                crate::protocol::text::parse_message(&message),
-            ));
-            return Ok(true);
+            return Ok(session
+                .action_tx
+                .try_send(PlayerAction::Message(crate::protocol::text::parse_message(
+                    &message,
+                )))
+                .is_ok());
         }
         Ok(false)
     }
@@ -504,8 +506,10 @@ impl wit::vine::plugin::proxy::Host for PluginHostState {
                 .into_iter()
                 .find(|s| s.uuid == target_uuid)
         {
-            let _ = session.action_tx.send(PlayerAction::Disconnect(reason));
-            return Ok(true);
+            return Ok(session
+                .action_tx
+                .try_send(PlayerAction::Disconnect(reason))
+                .is_ok());
         }
         Ok(false)
     }
@@ -524,10 +528,10 @@ impl wit::vine::plugin::proxy::Host for PluginHostState {
                 .into_iter()
                 .find(|s| s.uuid == target_uuid)
         {
-            let _ = session
+            return Ok(session
                 .action_tx
-                .send(PlayerAction::Connect { server_name });
-            return Ok(true);
+                .try_send(PlayerAction::Connect { server_name })
+                .is_ok());
         }
         Ok(false)
     }
@@ -546,10 +550,10 @@ impl wit::vine::plugin::proxy::Host for PluginHostState {
                 .into_iter()
                 .find(|s| s.uuid == target_uuid)
         {
-            let _ = session
+            return Ok(session
                 .action_tx
-                .send(PlayerAction::PluginMessage { channel, data });
-            return Ok(true);
+                .try_send(PlayerAction::PluginMessage { channel, data })
+                .is_ok());
         }
         Ok(false)
     }

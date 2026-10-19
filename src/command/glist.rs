@@ -105,7 +105,7 @@ mod tests {
         );
 
         let session_manager = Arc::new(SessionManager::new());
-        let (action_tx, mut action_rx) = mpsc::unbounded_channel();
+        let (action_tx, mut action_rx) = mpsc::channel(16);
         let source = ProxyCommandSource {
             sender: CommandSender::Player {
                 username: "TestPlayer".to_string(),
@@ -155,8 +155,8 @@ mod tests {
         );
 
         let session_manager = Arc::new(SessionManager::new());
-        let (tx1, _) = mpsc::unbounded_channel();
-        let (tx2, _) = mpsc::unbounded_channel();
+        let (tx1, _) = mpsc::channel(16);
+        let (tx2, _) = mpsc::channel(16);
 
         let _guard1 = session_manager
             .try_register(PlayerSession {
@@ -183,7 +183,7 @@ mod tests {
             })
             .unwrap();
 
-        let (action_tx, mut action_rx) = mpsc::unbounded_channel();
+        let (action_tx, mut action_rx) = mpsc::channel(16);
         let source = ProxyCommandSource {
             sender: CommandSender::Player {
                 username: "Admin".to_string(),
