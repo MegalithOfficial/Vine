@@ -191,7 +191,7 @@ impl PluginManager {
                             routes: self.command_routes.clone(),
                         })
                         .executes(PluginCommandExecutor {
-                            name: route,
+                            name: route.clone(),
                             routes: self.command_routes.clone(),
                             running: self.running_commands.clone(),
                         }),
@@ -199,11 +199,11 @@ impl PluginManager {
                 proxy
                     .command_dispatcher
                     .register_for(cmd_builder, &plugin.metadata.name);
+                info!(
+                    "Registered command '/{}' from plugin '{}'",
+                    route, plugin.metadata.name
+                );
             }
-            info!(
-                "Registered command '/{}' from plugin '{}'",
-                name, plugin.metadata.name
-            );
         }
     }
 
