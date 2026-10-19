@@ -217,6 +217,12 @@ pub struct CommandDispatcher {
     pending: Mutex<Vec<PendingChange>>,
 }
 
+pub struct CommandShape {
+    pub name: String,
+    pub takes_args: bool,
+    pub executable: bool,
+}
+
 enum PendingChange {
     Register(CommandBuilder, Option<String>),
     Deactivate(String),
@@ -350,6 +356,34 @@ impl CommandDispatcher {
         } else {
             Vec::new()
         }
+    }
+
+    /// Returns the shape of every permitted command, as the client's command tree needs it
+    pub fn get_all_permitted_command_shapes(
+        &self,
+        source: &ProxyCommandSource,
+    ) -> Vec<CommandShape> {
+        let Some(lock) = self.read() else {
+            return Vec::new();
+        };
+        let mut shapes: Vec<CommandShape> = lock
+            .tree
+            .get_root_children()
+            .into_iter()
+            .filter_map(|id| {
+                let node = &lock.tree[id];
+                let name = &node.meta.literal_lowercase;
+                (lock.tree.can_use(id.into(), source) && !lock.is_disabled(name)).then(|| {
+                    CommandShape {
+                        name: name.to_string(),
+                        takes_args: !node.children.is_empty() || node.redirect.is_some(),
+                        executable: node.owned.command.is_some(),
+                    }
+                })
+            })
+            .collect();
+        shapes.sort_by(|a, b| a.name.cmp(&b.name));
+        shapes
     }
 
     /// Returns true if `name` is one of the proxy's own commands, which plugins cannot take over

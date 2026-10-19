@@ -2212,16 +2212,13 @@ impl BackendBridge {
                                     session_manager: session_manager.clone(),
                                 };
                                 let permitted =
-                                    command_dispatcher.get_all_permitted_commands(&source);
+                                    command_dispatcher.get_all_permitted_command_shapes(&source);
                                 let injected: Vec<InjectedCommand<'_>> = permitted
                                     .iter()
-                                    .map(|(name, _)| InjectedCommand {
-                                        name: name.as_str(),
-                                        takes_args: matches!(
-                                            name.as_str(),
-                                            "server" | "send" | "help"
-                                        ),
-                                        executable_without_args: name != "send",
+                                    .map(|shape| InjectedCommand {
+                                        name: shape.name.as_str(),
+                                        takes_args: shape.takes_args,
+                                        executable_without_args: shape.executable,
                                     })
                                     .collect();
 
