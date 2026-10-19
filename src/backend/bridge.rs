@@ -36,8 +36,8 @@ use crate::protocol::packets::play::{
     ChatAcknowledgement, ChatCommand, ChatMessage, ClientInformation, ClientboundPluginMessage,
     CommandSuggestionRequest, CommandSuggestions, ConfigClientInformation, InjectedCommand,
     PlayDisconnect, PlayKeepAlive, PlayKeepAliveResponse, SignedChatCommand, StartConfiguration,
-    Suggestion, SystemChat, chat_length_limit, chat_signing, inject_commands, read_plugin_message,
-    replace_leading_string, write_plugin_message,
+    Suggestion, SystemChat, chat_length_limit, chat_signing, command_length_limit, inject_commands,
+    read_plugin_message, replace_leading_string, write_plugin_message,
 };
 use crate::protocol::packets::switch::{Leftovers, join_game_sequence};
 use crate::protocol::text::{component_json, parse_message, plain_text};
@@ -1233,7 +1233,11 @@ impl BackendBridge {
                 reason: translate(locale, "vine.chat.signed_changed", &[]),
             });
         }
-        if text.encode_utf16().count() > chat_length_limit(version) {
+        let limit = match kind {
+            PacketKind::ChatMessage => chat_length_limit(version),
+            _ => command_length_limit(version),
+        };
+        if text.encode_utf16().count() > limit {
             warn!(
                 "A plugin made a chat message from '{}' longer than the client limit; sending the original",
                 username
@@ -1756,8 +1760,7 @@ impl BackendBridge {
                                 .matches(raw_packet.id, client_version)
                             {
                                 decode_packet::<ChatCommand>(&raw_packet.payload, client_version)
-                                    .ok()
-                                    .map(|c| c.command)
+                                    .map(|c| Some(c.command))
                             } else if PacketKind::SignedChatCommand
                                 .matches(raw_packet.id, client_version)
                             {
@@ -1765,16 +1768,37 @@ impl BackendBridge {
                                     &raw_packet.payload,
                                     client_version,
                                 )
-                                .ok()
-                                .map(|c| c.command)
+                                .map(|c| Some(c.command))
                             } else if client_version < ProtocolVersion::V1_19 {
                                 // Before 1.19 commands arrive as chat messages starting with '/'
-                                chat_message
+                                Ok(chat_message
                                     .as_deref()
                                     .and_then(|m| m.strip_prefix('/'))
-                                    .map(str::to_owned)
+                                    .map(str::to_owned))
                             } else {
-                                None
+                                Ok(None)
+                            };
+                            // Passing on a command the plugins could not see would skip them
+                            let command = match command {
+                                Ok(command) => command,
+                                Err(e) => {
+                                    warn!(
+                                        "Dropping an unreadable command from '{}': {}",
+                                        username, e
+                                    );
+                                    match Self::swallow_chat(
+                                        &raw_packet,
+                                        client_version,
+                                        backend_writer,
+                                        username,
+                                        session_manager.locale(username).as_deref(),
+                                    )
+                                    .await
+                                    {
+                                        Some(exit) => return exit,
+                                        None => continue,
+                                    }
+                                }
                             };
 
                             if let Some(command) = command {

@@ -9,12 +9,16 @@ use crate::protocol::wire::{ReadExt, WriteExt};
 use crate::protocol::{ProtocolError, ProtocolVersion};
 
 const MAX_CHAT_LEN: usize = 256;
+const MAX_COMMAND_LEN: usize = 32767;
 const MAX_SUGGESTION_INPUT_LEN: usize = 32500;
 
 empty_packet!(StartConfiguration, StartConfiguration);
 
 macro_rules! leading_string_packet {
     ($name:ident, $kind:ident, $field:ident) => {
+        leading_string_packet!($name, $kind, $field, |_| MAX_CHAT_LEN);
+    };
+    ($name:ident, $kind:ident, $field:ident, $limit:expr) => {
         #[derive(Clone, Debug)]
         pub struct $name {
             pub $field: String,
@@ -23,9 +27,9 @@ macro_rules! leading_string_packet {
         impl Packet for $name {
             const KIND: PacketKind = PacketKind::$kind;
 
-            fn read(buf: &mut &[u8], _version: ProtocolVersion) -> Result<Self, ProtocolError> {
+            fn read(buf: &mut &[u8], version: ProtocolVersion) -> Result<Self, ProtocolError> {
                 Ok(Self {
-                    $field: buf.read_string_bounded(MAX_CHAT_LEN)?,
+                    $field: buf.read_string_bounded($limit(version))?,
                 })
             }
 
@@ -40,8 +44,13 @@ macro_rules! leading_string_packet {
     };
 }
 
-leading_string_packet!(ChatCommand, ChatCommand, command);
-leading_string_packet!(SignedChatCommand, SignedChatCommand, command);
+leading_string_packet!(ChatCommand, ChatCommand, command, command_length_limit);
+leading_string_packet!(
+    SignedChatCommand,
+    SignedChatCommand,
+    command,
+    command_length_limit
+);
 leading_string_packet!(ChatMessage, ChatMessage, message);
 leading_string_packet!(ClientInformation, ClientInformation, locale);
 leading_string_packet!(ConfigClientInformation, ConfigClientInformation, locale);
@@ -54,10 +63,19 @@ pub fn chat_length_limit(version: ProtocolVersion) -> usize {
     }
 }
 
+/// Since 1.20.5 commands are no longer held to the chat limit
+pub fn command_length_limit(version: ProtocolVersion) -> usize {
+    if version >= ProtocolVersion::V1_20_5 {
+        MAX_COMMAND_LEN
+    } else {
+        MAX_CHAT_LEN
+    }
+}
+
 /// Replaces the text a chat message or command packet starts with, keeping the rest as is.
 pub fn replace_leading_string(payload: &[u8], text: &str) -> Result<Vec<u8>, ProtocolError> {
     let mut rest = payload;
-    rest.read_string_bounded(MAX_CHAT_LEN)?;
+    rest.read_string()?;
     let mut out = Vec::with_capacity(text.len() + rest.len() + 3);
     out.write_string(text);
     out.extend_from_slice(rest);
