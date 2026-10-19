@@ -580,7 +580,7 @@ impl BackendBridge {
                     Self::disconnect_client(
                         &mut client_writer,
                         self.client_version,
-                        phase.get(),
+                        phase.backend(),
                         self.locale().as_deref(),
                         &reason,
                     )
@@ -779,7 +779,7 @@ impl BackendBridge {
                             Self::disconnect_client(
                                 &mut client_writer,
                                 self.client_version,
-                                phase.get(),
+                                phase.backend(),
                                 self.locale().as_deref(),
                                 &translate(
                                     self.locale().as_deref(),
@@ -839,7 +839,7 @@ impl BackendBridge {
                         Self::disconnect_client(
                             &mut client_writer,
                             self.client_version,
-                            phase.get(),
+                            phase.backend(),
                             self.locale().as_deref(),
                             &reason,
                         )
@@ -865,7 +865,7 @@ impl BackendBridge {
                         Self::disconnect_client(
                             &mut client_writer,
                             self.client_version,
-                            phase.get(),
+                            phase.backend(),
                             self.locale().as_deref(),
                             &reason,
                         )
@@ -936,7 +936,7 @@ impl BackendBridge {
                             Self::disconnect_client(
                                 &mut client_writer,
                                 self.client_version,
-                                phase.get(),
+                                phase.backend(),
                                 self.locale().as_deref(),
                                 &translate(
                                     self.locale().as_deref(),
@@ -1103,6 +1103,7 @@ impl BackendBridge {
                     Ok(Err(e)) => return Err(SwitchError::Fatal(e.into())),
                     Err(_) => return Err(SwitchError::Fatal(client_timeout())),
                 }
+                phase.backend_started_configuration();
                 Some(PacketKind::ConfigurationAcknowledged)
             }
             Phase::Login => Some(PacketKind::LoginAcknowledged),
@@ -1293,7 +1294,7 @@ impl BackendBridge {
         phase: &PhaseCell,
         text: String,
     ) {
-        if phase.get() == Phase::Play {
+        if phase.backend() == Phase::Play {
             let content = component_json(&parse_message(&text), self.client_version);
             let message = SystemChat {
                 content,
@@ -2154,18 +2155,15 @@ impl BackendBridge {
                     PlayerAction::Connect { server_name } => {
                         return TunnelExit::Connect { server_name };
                     }
-                    PlayerAction::Message(_) | PlayerAction::PluginMessage { .. }
-                        if phase.get() != Phase::Play =>
-                    {
-                        debug!("Dropping {:?} for '{}' outside play", action, username);
-                    }
                     PlayerAction::Message(content) => {
                         let chat_msg = SystemChat {
                             content: component_json(&content, client_version),
                             overlay: false,
                         };
-                        if let Ok(bytes) = encode_packet(&chat_msg, client_version) {
-                            client_tx.send(bytes).await;
+                        if let Ok(bytes) = encode_packet(&chat_msg, client_version)
+                            && !client_tx.send_in_play(bytes, phase).await
+                        {
+                            debug!("Dropping a message for '{}' outside play", username);
                         }
                     }
                     PlayerAction::Disconnect(reason) => {
@@ -2173,8 +2171,10 @@ impl BackendBridge {
                     }
                     PlayerAction::PluginMessage { channel, data } => {
                         let custom_payload = ClientboundPluginMessage { channel, data };
-                        if let Ok(bytes) = encode_packet(&custom_payload, client_version) {
-                            client_tx.send(bytes).await;
+                        if let Ok(bytes) = encode_packet(&custom_payload, client_version)
+                            && !client_tx.send_in_play(bytes, phase).await
+                        {
+                            debug!("Dropping a plugin message for '{}' outside play", username);
                         }
                     }
                 }
