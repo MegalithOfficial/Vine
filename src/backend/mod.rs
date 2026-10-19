@@ -1,5 +1,13 @@
 pub mod bridge;
+mod client_queue;
+mod connection;
 pub mod forwarding;
+mod login;
+mod readers;
+mod suggestions;
+mod switch;
+mod task;
+mod tunnel;
 
 pub use bridge::{BackendBridge, BridgeError};
 
