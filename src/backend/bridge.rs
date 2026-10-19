@@ -559,7 +559,7 @@ impl BackendBridge {
         let mut pending_exit: Option<TunnelExit> = None;
         // Set when the current backend is gone, so a waiting switch must finish right away
         let mut backend_gone = false;
-        let mut reached_play = false;
+        let mut carried = Carried::default();
 
         loop {
             let tunnel_res = if let Some(exit) = pending_exit.take() {
@@ -572,7 +572,7 @@ impl BackendBridge {
                     &mut action_rx,
                     connecting.as_mut().map(|(_, future)| future),
                     deferred.is_some() || early.is_some(),
-                    &mut reached_play,
+                    &mut carried,
                 )
                 .await
             };
@@ -2095,6 +2095,15 @@ impl Shared {
     }
 }
 
+/// What a tunnel was in the middle of, for the next one to finish
+#[derive(Default)]
+struct Carried {
+    // The client's acknowledgement that it is playing is on its way to the backend
+    reached_play: bool,
+    // A message for the client waiting for room in its queue
+    message: Option<Bytes>,
+}
+
 /// Why a backend's reader stopped
 enum BackendEvent {
     Disconnected { reason: Option<String> },
@@ -2291,7 +2300,7 @@ impl BackendBridge {
         action_rx: &mut mpsc::Receiver<PlayerAction>,
         connecting: Option<&mut Connecting<'_>>,
         wake_on_play: bool,
-        reached_play: &mut bool,
+        carried: &mut Carried,
     ) -> Result<TunnelExit, BridgeError> {
         let username = shared.username.as_str();
         let client_version = shared.version;
@@ -2302,8 +2311,10 @@ impl BackendBridge {
             events: backend_events,
             ..
         } = backend;
-        // Set while the client's last acknowledgement is on its way to the backend, so the wake-up
-        // it calls for survives this tunnel ending meanwhile
+        let Carried {
+            reached_play,
+            message: held_message,
+        } = carried;
         if std::mem::take(reached_play) {
             backend_writer.flush().await?;
             return Ok(TunnelExit::ReachedPlay);
@@ -2355,36 +2366,36 @@ impl BackendBridge {
         };
 
         let action_loop = async {
-            while let Some(action) = action_rx.recv().await {
-                match action {
+            loop {
+                if let Some(bytes) = held_message.as_ref() {
+                    if !client_tx.send_in_play(bytes.clone(), phase).await {
+                        debug!("Dropping a message for '{}' outside play", username);
+                    }
+                    *held_message = None;
+                }
+                let Some(action) = action_rx.recv().await else {
+                    return TunnelExit::ClientDisconnected;
+                };
+                let encoded = match action {
                     PlayerAction::Connect { server_name } => {
                         return TunnelExit::Connect { server_name };
-                    }
-                    PlayerAction::Message(content) => {
-                        let chat_msg = SystemChat {
-                            content: component_json(&content, client_version),
-                            overlay: false,
-                        };
-                        if let Ok(bytes) = encode_packet(&chat_msg, client_version)
-                            && !client_tx.send_in_play(bytes, phase).await
-                        {
-                            debug!("Dropping a message for '{}' outside play", username);
-                        }
                     }
                     PlayerAction::Disconnect(reason) => {
                         return TunnelExit::Kicked { reason };
                     }
+                    PlayerAction::Message(content) => encode_packet(
+                        &SystemChat {
+                            content: component_json(&content, client_version),
+                            overlay: false,
+                        },
+                        client_version,
+                    ),
                     PlayerAction::PluginMessage { channel, data } => {
-                        let custom_payload = ClientboundPluginMessage { channel, data };
-                        if let Ok(bytes) = encode_packet(&custom_payload, client_version)
-                            && !client_tx.send_in_play(bytes, phase).await
-                        {
-                            debug!("Dropping a plugin message for '{}' outside play", username);
-                        }
+                        encode_packet(&ClientboundPluginMessage { channel, data }, client_version)
                     }
-                }
+                };
+                *held_message = encoded.ok();
             }
-            TunnelExit::ClientDisconnected
         };
 
         // A switch logs in to the next backend while this tunnel keeps the current one running
