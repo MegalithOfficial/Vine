@@ -98,6 +98,10 @@ impl PluginManager {
         plugin: Arc<WasmPlugin>,
     ) {
         let mut handlers = self.event_handlers.write().await;
+        // Checked under the lock, which forget takes only after marking the plugin as stopping
+        if plugin.is_stopping() || plugin.is_disabled() {
+            return;
+        }
         let list = handlers.entry(event_type).or_default();
         list.push(RegisteredEventHandler {
             handler_id,
@@ -138,18 +142,23 @@ impl PluginManager {
                     free
                 })
                 .collect::<Vec<_>>();
-            if let Ok(mut routes) = self.command_routes.write() {
-                for cmd_name in &names {
-                    routes.insert(
-                        cmd_name.to_ascii_lowercase(),
-                        CommandRoute {
-                            plugin: plugin.clone(),
-                            command_id,
-                            permission: permission.clone(),
-                        },
-                    );
-                }
+            let Ok(mut routes) = self.command_routes.write() else {
+                return;
+            };
+            if plugin.is_stopping() || plugin.is_disabled() {
+                return;
             }
+            for cmd_name in &names {
+                routes.insert(
+                    cmd_name.to_ascii_lowercase(),
+                    CommandRoute {
+                        plugin: plugin.clone(),
+                        command_id,
+                        permission: permission.clone(),
+                    },
+                );
+            }
+            drop(routes);
             for cmd_name in names {
                 let route = cmd_name.to_ascii_lowercase();
                 let routes = self.command_routes.clone();

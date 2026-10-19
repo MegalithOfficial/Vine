@@ -104,6 +104,10 @@ impl WasmPlugin {
         self.killed.load(Ordering::Relaxed)
     }
 
+    pub fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::Acquire)
+    }
+
     /// Registers the translations from init-plugin, once the plugin is accepted under its name
     pub fn register_early_translations(&self) {
         let early = self
@@ -119,7 +123,7 @@ impl WasmPlugin {
     /// Stops the plugin, letting calls already running finish within the call timeout. A call
     /// still running after that is interrupted and the plugin is disabled.
     pub async fn shutdown(&self) {
-        self.stopping.store(true, Ordering::Relaxed);
+        self.stopping.store(true, Ordering::Release);
         if tokio::time::timeout(
             self.call_timeout,
             self.store.shutdown(|_| Box::pin(async { Ok(()) })),
@@ -185,7 +189,7 @@ impl WasmPlugin {
             result = call => {
                 // A trap leaves the store unusable, so the plugin is marked as such
                 if let Err(e) = &result
-                    && !self.stopping.load(Ordering::Relaxed)
+                    && !self.is_stopping()
                 {
                     self.kill();
                     tracing::error!(
