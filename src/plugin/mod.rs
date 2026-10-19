@@ -44,6 +44,9 @@ type CommandRoutes = Arc<std::sync::RwLock<HashMap<String, CommandRoute>>>;
 // console by None.
 type RunningCommands = Arc<std::sync::Mutex<std::collections::HashSet<Option<String>>>>;
 
+/// Event handlers a plugin may register across all events
+pub const MAX_EVENT_HANDLERS: usize = 256;
+
 pub struct PluginManager {
     plugins_dir: PathBuf,
     loader: WasmPluginLoader,
@@ -90,25 +93,41 @@ impl PluginManager {
         let _ = self.proxy_ctx.set(ctx);
     }
 
+    /// Returns false if the plugin already has as many handlers as it may register.
+    /// Registering the same handler for the same event again changes nothing.
     pub async fn register_event_handler(
         &self,
         event_type: EventType,
         priority: EventPriority,
         handler_id: u32,
         plugin: Arc<WasmPlugin>,
-    ) {
+    ) -> bool {
         let mut handlers = self.event_handlers.write().await;
         // Checked under the lock, which forget takes only after marking the plugin as stopping
         if plugin.is_stopping() || plugin.is_disabled() {
-            return;
+            return true;
+        }
+        let owned = |h: &RegisteredEventHandler| Arc::ptr_eq(&h.plugin, &plugin);
+        if handlers
+            .get(&event_type)
+            .is_some_and(|list| list.iter().any(|h| owned(h) && h.handler_id == handler_id))
+        {
+            return true;
+        }
+        if handlers.values().flatten().filter(|h| owned(h)).count() >= MAX_EVENT_HANDLERS {
+            return false;
         }
         let list = handlers.entry(event_type).or_default();
-        list.push(RegisteredEventHandler {
-            handler_id,
-            priority,
-            plugin,
-        });
-        list.sort_by_key(|h| h.priority);
+        let at = list.partition_point(|h| h.priority <= priority);
+        list.insert(
+            at,
+            RegisteredEventHandler {
+                handler_id,
+                priority,
+                plugin,
+            },
+        );
+        true
     }
 
     pub async fn register_command(

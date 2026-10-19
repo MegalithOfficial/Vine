@@ -96,6 +96,7 @@ pub struct PluginHostState {
     pub killed: Arc<AtomicBool>,
     // Translations registered before the plugin's name is known, which is their namespace
     early_translations: Option<Vec<(String, Translations)>>,
+    event_cap_warned: bool,
 }
 
 impl Default for PluginHostState {
@@ -135,6 +136,7 @@ impl PluginHostState {
             plugin: None,
             killed: Arc::new(AtomicBool::new(false)),
             early_translations: Some(Vec::new()),
+            event_cap_warned: false,
         }
     }
 
@@ -150,15 +152,6 @@ impl PluginHostState {
     ) -> wasmtime::Result<Resource<wit::vine::plugin::context::Context>> {
         let res = self.resource_table.push(ContextResource { context })?;
         Ok(Resource::new_own(res.rep()))
-    }
-
-    pub fn get_context(
-        &self,
-        resource: &Resource<wit::vine::plugin::context::Context>,
-    ) -> wasmtime::Result<&ContextResource> {
-        Ok(self
-            .resource_table
-            .get(&Resource::new_borrow(resource.rep()))?)
     }
 }
 
@@ -480,7 +473,7 @@ impl wit::vine::plugin::proxy::Host for PluginHostState {
 impl wit::vine::plugin::context::HostContext for PluginHostState {
     async fn register_event(
         &mut self,
-        context: Resource<wit::vine::plugin::context::Context>,
+        _context: Resource<wit::vine::plugin::context::Context>,
         handler_id: u32,
         event_type: wit::vine::plugin::event::EventType,
         priority: wit::vine::plugin::types::EventPriority,
@@ -513,23 +506,26 @@ impl wit::vine::plugin::context::HostContext for PluginHostState {
             wit::vine::plugin::types::EventPriority::Monitor => EventPriority::Monitor,
         };
 
-        if let Some(proxy) = &self.proxy {
-            proxy
+        if let Some(proxy) = &self.proxy
+            && !proxy
                 .plugin_manager
                 .register_event_handler(api_event_type, api_priority, handler_id, plugin)
-                .await;
+                .await
+            && !self.event_cap_warned
+        {
+            self.event_cap_warned = true;
+            tracing::warn!(
+                "[Plugin: {}] Ignoring event handlers beyond the first {}",
+                self.plugin_name,
+                crate::plugin::MAX_EVENT_HANDLERS
+            );
         }
-
-        let ctx_res = self.get_context(&context)?;
-        let mut events = ctx_res.context.registered_events.lock().await;
-        events.push((handler_id, api_event_type, api_priority));
-
         Ok(())
     }
 
     async fn register_command(
         &mut self,
-        context: Resource<wit::vine::plugin::context::Context>,
+        _context: Resource<wit::vine::plugin::context::Context>,
         command_id: u32,
         name: String,
         description: String,
@@ -548,11 +544,6 @@ impl wit::vine::plugin::context::HostContext for PluginHostState {
                 .register_command(command_id, name, description, aliases, permission, plugin)
                 .await;
         }
-
-        let ctx_res = self.get_context(&context)?;
-        let mut commands = ctx_res.context.registered_commands.lock().await;
-        commands.push(command_id);
-
         Ok(())
     }
 

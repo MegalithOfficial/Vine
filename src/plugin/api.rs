@@ -1,5 +1,3 @@
-use tokio::sync::Mutex;
-
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PluginMetadata {
     pub name: String,
@@ -128,7 +126,4 @@ pub enum PluginMessageSource {
 }
 
 #[derive(Default)]
-pub struct PluginContext {
-    pub registered_commands: Mutex<Vec<u32>>,
-    pub registered_events: Mutex<Vec<(u32, EventType, EventPriority)>>,
-}
+pub struct PluginContext;
