@@ -111,6 +111,8 @@ pub(super) struct Tunnel {
     pub(super) client_events: mpsc::Receiver<ClientEvent>,
     pub(super) actions: mpsc::Receiver<PlayerAction>,
     pub(super) message: Option<HeldMessage>,
+    // What a switch tells a client that is not playing waits until it is; a repeated one once
+    pub(super) notices: Vec<String>,
     // A client packet waiting for room in the backend's queue; the client is not read meanwhile
     pub(super) stalled: Option<Bytes>,
     // The backend the client's packets go to; changing it drops answers worked out for the last one
@@ -224,7 +226,13 @@ impl Tunnel {
         }
     }
 
-    fn notify(&self, text: String) {
+    fn notify(&mut self, text: String) {
+        if self.link != Link::Play {
+            if !self.notices.contains(&text) {
+                self.notices.push(text);
+            }
+            return;
+        }
         let version = self.session.version;
         let message = SystemChat {
             content: component_json(&parse_message(&text), version),
@@ -513,6 +521,9 @@ impl Tunnel {
 
     /// The client finished configuring and is playing
     fn reached_play(&mut self) -> Result<(), End> {
+        for text in std::mem::take(&mut self.notices) {
+            self.notify(text);
+        }
         match std::mem::replace(&mut self.switch, Switch::Idle) {
             Switch::Deferred { target } => self.request_switch(target),
             Switch::Held {

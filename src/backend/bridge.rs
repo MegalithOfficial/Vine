@@ -317,6 +317,7 @@ impl BackendBridge {
             client_events,
             actions: action_rx,
             message: None,
+            notices: Vec::new(),
             stalled: None,
             served,
             stale_before: 0,
