@@ -46,16 +46,6 @@ type RunningCommands = Arc<std::sync::Mutex<std::collections::HashSet<Option<Str
 
 type WitEvent = loader::wasm::wasm_host::wit::vine::plugin::event::Event;
 
-// Monitor handlers cannot change an event, so they see it once it is decided, in order, without
-// holding up the packet it came from. Events beyond this many waiting are not shown to them.
-const MONITOR_QUEUE: usize = 1024;
-
-struct MonitorJob {
-    handlers: Vec<RegisteredEventHandler>,
-    event: WitEvent,
-    name: &'static str,
-}
-
 /// Event handlers a plugin may register across all events
 pub const MAX_EVENT_HANDLERS: usize = 256;
 /// Command names and aliases a plugin may register
@@ -71,8 +61,6 @@ pub struct PluginManager {
     proxy_ctx: OnceCell<ProxyPluginContext>,
     // Loading and reloading run one at a time so a plugin cannot end up loaded twice
     lifecycle: tokio::sync::Mutex<()>,
-    monitors: std::sync::OnceLock<tokio::sync::mpsc::Sender<MonitorJob>>,
-    monitors_behind: std::sync::atomic::AtomicBool,
 }
 
 impl PluginManager {
@@ -90,8 +78,6 @@ impl PluginManager {
             running_commands: Arc::default(),
             proxy_ctx: OnceCell::new(),
             lifecycle: tokio::sync::Mutex::new(()),
-            monitors: std::sync::OnceLock::new(),
-            monitors_behind: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 
@@ -696,44 +682,20 @@ impl PluginManager {
         }
     }
 
-    /// Shows a decided event to Monitor handlers on a task of their own
+    /// Shows a decided event to each plugin's Monitor handlers
     fn watch(&self, handlers: Vec<RegisteredEventHandler>, event: WitEvent, name: &'static str) {
-        use std::sync::atomic::Ordering;
-        if handlers.is_empty() {
-            return;
+        let mut by_plugin: Vec<(Arc<WasmPlugin>, Vec<u32>)> = Vec::new();
+        for handler in handlers {
+            match by_plugin
+                .iter_mut()
+                .find(|(plugin, _)| Arc::ptr_eq(plugin, &handler.plugin))
+            {
+                Some((_, ids)) => ids.push(handler.handler_id),
+                None => by_plugin.push((handler.plugin, vec![handler.handler_id])),
+            }
         }
-        let monitors = self.monitors.get_or_init(|| {
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<MonitorJob>(MONITOR_QUEUE);
-            tokio::spawn(async move {
-                while let Some(job) = rx.recv().await {
-                    for handler in job.handlers {
-                        if let Err(e) = handler
-                            .plugin
-                            .handle_event(handler.handler_id, job.event.clone())
-                            .await
-                        {
-                            error!(
-                                "Error in plugin '{}' handling {}: {}",
-                                handler.plugin.metadata.name, job.name, e
-                            );
-                        }
-                    }
-                }
-            });
-            tx
-        });
-        let job = MonitorJob {
-            handlers,
-            event,
-            name,
-        };
-        if monitors.try_send(job).is_ok() {
-            self.monitors_behind.store(false, Ordering::Relaxed);
-        } else if !self.monitors_behind.swap(true, Ordering::Relaxed) {
-            warn!(
-                "Monitor event handlers are falling behind; some {} events skip them",
-                name
-            );
+        for (plugin, handler_ids) in by_plugin {
+            plugin.watch(handler_ids, event.clone(), name);
         }
     }
 

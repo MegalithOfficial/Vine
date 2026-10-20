@@ -83,6 +83,19 @@ pub struct WasmPlugin {
     // Set once the plugin is being stopped, so calls that fail because of it are not crashes
     stopping: AtomicBool,
     call_timeout: Duration,
+    monitor: std::sync::OnceLock<tokio::sync::mpsc::Sender<MonitorJob>>,
+    monitor_behind: AtomicBool,
+}
+
+// Monitor handlers cannot change an event, so they see it once it is decided, in order, without
+// holding up the packet it came from. Each plugin has its own queue, so a slow one only delays
+// itself; events beyond this many waiting are not shown to it.
+const MONITOR_QUEUE: usize = 1024;
+
+struct MonitorJob {
+    handler_ids: Vec<u32>,
+    event: wit::vine::plugin::event::Event,
+    name: &'static str,
 }
 
 /// Handed to a guest call, which begins it once the guest is about to run and keeps what it
@@ -256,6 +269,52 @@ impl WasmPlugin {
             })
         })
         .await
+    }
+
+    /// Shows a decided event to this plugin's Monitor handlers on a task of its own
+    pub fn watch(
+        self: &Arc<Self>,
+        handler_ids: Vec<u32>,
+        event: wit::vine::plugin::event::Event,
+        name: &'static str,
+    ) {
+        let monitor = self.monitor.get_or_init(|| {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<MonitorJob>(MONITOR_QUEUE);
+            // Holding the plugin weakly lets the task end once the plugin is gone
+            let plugin = Arc::downgrade(self);
+            tokio::spawn(async move {
+                while let Some(job) = rx.recv().await {
+                    let Some(plugin) = plugin.upgrade() else {
+                        break;
+                    };
+                    for handler_id in job.handler_ids {
+                        if let Err(e) = plugin.handle_event(handler_id, job.event.clone()).await {
+                            tracing::error!(
+                                "Error in plugin '{}' handling {}: {}",
+                                plugin.metadata.name,
+                                job.name,
+                                e
+                            );
+                        }
+                    }
+                }
+            });
+            tx
+        });
+        let job = MonitorJob {
+            handler_ids,
+            event,
+            name,
+        };
+        if monitor.try_send(job).is_ok() {
+            self.monitor_behind.store(false, Ordering::Relaxed);
+        } else if !self.monitor_behind.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                "Plugin '{}' is falling behind on Monitor events; some {} events skip it",
+                self.metadata.name,
+                name
+            );
+        }
     }
 
     pub async fn handle_command(
@@ -443,6 +502,8 @@ impl PluginRuntime {
             early_translations: std::sync::Mutex::new(early_translations),
             stopping: AtomicBool::new(false),
             call_timeout: timeout,
+            monitor: std::sync::OnceLock::new(),
+            monitor_behind: AtomicBool::new(false),
         });
 
         let weak = Arc::downgrade(&wasm_plugin);
