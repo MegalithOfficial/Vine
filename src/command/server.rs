@@ -191,6 +191,7 @@ mod tests {
             protocol_version: 765,
             locale: None,
             locale_override: None,
+            plugin_waiting: Default::default(),
         };
         let _guard = session_manager.try_register(session).unwrap();
 

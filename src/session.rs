@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -32,6 +33,28 @@ pub fn send_reliably(tx: &mpsc::Sender<PlayerAction>, action: PlayerAction) {
     }
 }
 
+/// Queues a plugin's kick or switch for the player. With the queue full, only one of them per
+/// player waits for room and later ones are refused, so a plugin cannot pile up waiting tasks.
+/// Returns false if the action was refused or the player's connection is gone.
+pub fn send_from_plugin(session: &PlayerSession, action: PlayerAction) -> bool {
+    match session.action_tx.try_send(action) {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Closed(_)) => false,
+        Err(mpsc::error::TrySendError::Full(action)) => {
+            if session.plugin_waiting.swap(true, Ordering::AcqRel) {
+                return false;
+            }
+            let tx = session.action_tx.clone();
+            let waiting = session.plugin_waiting.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(action).await;
+                waiting.store(false, Ordering::Release);
+            });
+            true
+        }
+    }
+}
+
 /// Represents an active connected player session on the proxy
 #[derive(Clone)]
 pub struct PlayerSession {
@@ -45,6 +68,8 @@ pub struct PlayerSession {
     pub locale: Option<String>,
     /// Language set by a plugin, which wins over the client's
     pub locale_override: Option<String>,
+    /// Set while a plugin's kick or switch waits for room in the action queue
+    pub plugin_waiting: Arc<AtomicBool>,
 }
 
 impl PlayerSession {
@@ -228,6 +253,7 @@ mod tests {
                 protocol_version: 769,
                 locale: None,
                 locale_override: None,
+                plugin_waiting: Default::default(),
             }
         };
 

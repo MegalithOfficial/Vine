@@ -574,6 +574,7 @@ impl ClientHandler {
             protocol_version: client_version.0,
             locale: None,
             locale_override: None,
+            plugin_waiting: Default::default(),
         }) else {
             warn!(
                 "[{}] Rejecting duplicate login for '{}' ({})",
