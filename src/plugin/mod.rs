@@ -44,6 +44,18 @@ type CommandRoutes = Arc<std::sync::RwLock<HashMap<String, CommandRoute>>>;
 // console by None.
 type RunningCommands = Arc<std::sync::Mutex<std::collections::HashSet<Option<String>>>>;
 
+type WitEvent = loader::wasm::wasm_host::wit::vine::plugin::event::Event;
+
+// Monitor handlers cannot change an event, so they see it once it is decided, in order, without
+// holding up the packet it came from. Events beyond this many waiting are not shown to them.
+const MONITOR_QUEUE: usize = 1024;
+
+struct MonitorJob {
+    handlers: Vec<RegisteredEventHandler>,
+    event: WitEvent,
+    name: &'static str,
+}
+
 /// Event handlers a plugin may register across all events
 pub const MAX_EVENT_HANDLERS: usize = 256;
 /// Command names and aliases a plugin may register
@@ -59,6 +71,8 @@ pub struct PluginManager {
     proxy_ctx: OnceCell<ProxyPluginContext>,
     // Loading and reloading run one at a time so a plugin cannot end up loaded twice
     lifecycle: tokio::sync::Mutex<()>,
+    monitors: std::sync::OnceLock<tokio::sync::mpsc::Sender<MonitorJob>>,
+    monitors_behind: std::sync::atomic::AtomicBool,
 }
 
 impl PluginManager {
@@ -76,6 +90,8 @@ impl PluginManager {
             running_commands: Arc::default(),
             proxy_ctx: OnceCell::new(),
             lifecycle: tokio::sync::Mutex::new(()),
+            monitors: std::sync::OnceLock::new(),
+            monitors_behind: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 
@@ -680,11 +696,55 @@ impl PluginManager {
         }
     }
 
+    /// Shows a decided event to Monitor handlers on a task of their own
+    fn watch(&self, handlers: Vec<RegisteredEventHandler>, event: WitEvent, name: &'static str) {
+        use std::sync::atomic::Ordering;
+        if handlers.is_empty() {
+            return;
+        }
+        let monitors = self.monitors.get_or_init(|| {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<MonitorJob>(MONITOR_QUEUE);
+            tokio::spawn(async move {
+                while let Some(job) = rx.recv().await {
+                    for handler in job.handlers {
+                        if let Err(e) = handler
+                            .plugin
+                            .handle_event(handler.handler_id, job.event.clone())
+                            .await
+                        {
+                            error!(
+                                "Error in plugin '{}' handling {}: {}",
+                                handler.plugin.metadata.name, job.name, e
+                            );
+                        }
+                    }
+                }
+            });
+            tx
+        });
+        let job = MonitorJob {
+            handlers,
+            event,
+            name,
+        };
+        if monitors.try_send(job).is_ok() {
+            self.monitors_behind.store(false, Ordering::Relaxed);
+        } else if !self.monitors_behind.swap(true, Ordering::Relaxed) {
+            warn!(
+                "Monitor event handlers are falling behind; some {} events skip them",
+                name
+            );
+        }
+    }
+
     pub async fn fire_player_chat(&self, event: &mut PlayerChatEvent) {
         let handlers = {
             let map = self.event_handlers.read().await;
             map.get(&EventType::PlayerChat).cloned().unwrap_or_default()
         };
+        let (monitors, handlers): (Vec<_>, Vec<_>) = handlers
+            .into_iter()
+            .partition(|handler| handler.priority == EventPriority::Monitor);
         for handler in handlers {
             let wit_evt = loader::wasm::wasm_host::wit::vine::plugin::event::Event::PlayerChat(
                 loader::wasm::wasm_host::wit::vine::plugin::event::PlayerChatEvent {
@@ -699,9 +759,7 @@ impl PluginManager {
                 .handle_event(handler.handler_id, wit_evt)
                 .await
             {
-                Ok(loader::wasm::wasm_host::wit::vine::plugin::event::Event::PlayerChat(res))
-                    if handler.priority != EventPriority::Monitor =>
-                {
+                Ok(loader::wasm::wasm_host::wit::vine::plugin::event::Event::PlayerChat(res)) => {
                     event.message = res.message;
                     event.cancelled = res.cancelled;
                 }
@@ -714,6 +772,18 @@ impl PluginManager {
                 }
             }
         }
+        self.watch(
+            monitors,
+            loader::wasm::wasm_host::wit::vine::plugin::event::Event::PlayerChat(
+                loader::wasm::wasm_host::wit::vine::plugin::event::PlayerChatEvent {
+                    uuid: event.uuid.clone(),
+                    username: event.username.clone(),
+                    message: event.message.clone(),
+                    cancelled: event.cancelled,
+                },
+            ),
+            "PlayerChat",
+        );
     }
 
     pub async fn fire_player_command(&self, event: &mut PlayerCommandEvent) {
@@ -723,6 +793,9 @@ impl PluginManager {
                 .cloned()
                 .unwrap_or_default()
         };
+        let (monitors, handlers): (Vec<_>, Vec<_>) = handlers
+            .into_iter()
+            .partition(|handler| handler.priority == EventPriority::Monitor);
         for handler in handlers {
             let wit_evt = loader::wasm::wasm_host::wit::vine::plugin::event::Event::PlayerCommand(
                 loader::wasm::wasm_host::wit::vine::plugin::event::PlayerCommandEvent {
@@ -739,7 +812,7 @@ impl PluginManager {
             {
                 Ok(loader::wasm::wasm_host::wit::vine::plugin::event::Event::PlayerCommand(
                     res,
-                )) if handler.priority != EventPriority::Monitor => {
+                )) => {
                     event.command = res.command;
                     event.cancelled = res.cancelled;
                 }
@@ -752,6 +825,18 @@ impl PluginManager {
                 }
             }
         }
+        self.watch(
+            monitors,
+            loader::wasm::wasm_host::wit::vine::plugin::event::Event::PlayerCommand(
+                loader::wasm::wasm_host::wit::vine::plugin::event::PlayerCommandEvent {
+                    uuid: event.uuid.clone(),
+                    username: event.username.clone(),
+                    command: event.command.clone(),
+                    cancelled: event.cancelled,
+                },
+            ),
+            "PlayerCommand",
+        );
     }
 
     pub async fn fire_plugin_message(&self, event: &mut PluginMessageEvent) {
@@ -761,6 +846,9 @@ impl PluginManager {
                 .cloned()
                 .unwrap_or_default()
         };
+        let (monitors, handlers): (Vec<_>, Vec<_>) = handlers
+            .into_iter()
+            .partition(|handler| handler.priority == EventPriority::Monitor);
         for handler in handlers {
             let wit_evt = loader::wasm::wasm_host::wit::vine::plugin::event::Event::PluginMessage(
                 loader::wasm::wasm_host::wit::vine::plugin::event::PluginMessageEvent {
@@ -786,7 +874,7 @@ impl PluginManager {
             {
                 Ok(loader::wasm::wasm_host::wit::vine::plugin::event::Event::PluginMessage(
                     res,
-                )) if handler.priority != EventPriority::Monitor => {
+                )) => {
                     event.data = res.data;
                     event.cancelled = res.cancelled;
                 }
@@ -799,6 +887,23 @@ impl PluginManager {
                 }
             }
         }
+        self.watch(monitors, loader::wasm::wasm_host::wit::vine::plugin::event::Event::PluginMessage(
+            loader::wasm::wasm_host::wit::vine::plugin::event::PluginMessageEvent {
+                channel: event.channel.clone(),
+                data: event.data.clone(),
+                player_uuid: event.player_uuid.clone(),
+                server_name: event.server_name.clone(),
+                source: match event.source {
+                    PluginMessageSource::Player => {
+                        loader::wasm::wasm_host::wit::vine::plugin::event::PluginMessageSource::Player
+                    }
+                    PluginMessageSource::Server => {
+                        loader::wasm::wasm_host::wit::vine::plugin::event::PluginMessageSource::Server
+                    }
+                },
+                cancelled: event.cancelled,
+            },
+        ), "PluginMessage");
     }
 }
 
