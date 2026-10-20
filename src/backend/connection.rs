@@ -77,7 +77,7 @@ impl Backend {
                 open.stop = None;
                 true
             }
-            _ => false,
+            Conn::Open(_) | Conn::Gone { .. } => false,
         }
     }
 
@@ -88,7 +88,9 @@ impl Backend {
                 events: Some(events),
                 ..
             }) => events.recv().await,
-            _ => std::future::pending().await,
+            Conn::Open(OpenBackend { events: None, .. }) | Conn::Gone { .. } => {
+                std::future::pending().await
+            }
         }
     }
 }

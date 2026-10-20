@@ -298,8 +298,8 @@ impl BackendBridge {
             current_server_name,
             // A backend sends configuration right after its LoginSuccess
             match link {
-                Link::Login => Phase::Config,
-                _ => Phase::Play,
+                Link::Login | Link::Config | Link::Reconfiguring => Phase::Config,
+                Link::Play | Link::Finishing => Phase::Play,
             },
             Vec::new(),
         );

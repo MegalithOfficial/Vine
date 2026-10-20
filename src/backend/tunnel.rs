@@ -142,7 +142,7 @@ impl Tunnel {
         let held = self.message.is_some();
         let stalled = match (&self.backend.conn, &self.stalled) {
             (Conn::Open(open), Some(_)) => Some(open.writes.clone()),
-            _ => None,
+            (Conn::Open(_), None) | (Conn::Gone { .. }, _) => None,
         };
         tokio::select! {
             () = self.client_out.closed() => Event::ClientGone,
@@ -162,7 +162,11 @@ impl Tunnel {
                 Switch::Stopping { .. } => false,
                 Switch::AwaitingAck { .. } => true,
                 // With the backend gone, what the client sends waits for the next one
-                _ => matches!(self.backend.conn, Conn::Open(_)),
+                Switch::Idle
+                | Switch::Deferred { .. }
+                | Switch::Connecting { .. }
+                | Switch::Held { .. }
+                | Switch::Fallback { .. } => matches!(self.backend.conn, Conn::Open(_)),
             }
     }
 
@@ -265,13 +269,15 @@ impl Tunnel {
                 }
                 let sent_in = self.link;
                 if let Some(next) = entered {
-                    self.link = match (next, self.link) {
-                        (Phase::Login, _) => Link::Login,
-                        (Phase::Config, _) => Link::Config,
-                        // A client asked to reconfigure before it acknowledged finishing its
-                        // configuration acknowledges both in turn
-                        (Phase::Play, Link::Reconfiguring) => Link::Reconfiguring,
-                        (Phase::Play, _) => Link::Play,
+                    self.link = match next {
+                        Phase::Login => Link::Login,
+                        Phase::Config => Link::Config,
+                        Phase::Play => match self.link {
+                            // A client asked to reconfigure before it acknowledged finishing its
+                            // configuration acknowledges both in turn
+                            Link::Reconfiguring => Link::Reconfiguring,
+                            Link::Login | Link::Config | Link::Play | Link::Finishing => Link::Play,
+                        },
                     };
                 }
                 if entered == Some(Phase::Config)

@@ -103,7 +103,9 @@ pub(super) async fn switch_progress(switch: &mut Switch) -> SwitchEvent {
             tokio::time::sleep_until(*deadline).await;
             SwitchEvent::AckTimedOut
         }
-        _ => std::future::pending().await,
+        Switch::Idle | Switch::Deferred { .. } | Switch::Held { .. } | Switch::Stopping { .. } => {
+            std::future::pending().await
+        }
     }
 }
 
