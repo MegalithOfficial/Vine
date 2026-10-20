@@ -11,7 +11,7 @@ use crate::config::Config;
 use crate::plugin::PluginManager;
 use crate::plugin::api::{EventPriority, EventType, PluginContext};
 use crate::plugin::loader::wasm::wasm_host::WasmPlugin;
-use crate::session::{PlayerAction, SessionManager};
+use crate::session::{PlayerAction, SessionManager, send_reliably};
 
 use super::wit;
 
@@ -506,10 +506,11 @@ impl wit::vine::plugin::proxy::Host for PluginHostState {
                 .into_iter()
                 .find(|s| s.uuid == target_uuid)
         {
-            return Ok(session
-                .action_tx
-                .try_send(PlayerAction::Disconnect(reason))
-                .is_ok());
+            if session.action_tx.is_closed() {
+                return Ok(false);
+            }
+            send_reliably(&session.action_tx, PlayerAction::Disconnect(reason));
+            return Ok(true);
         }
         Ok(false)
     }
@@ -528,10 +529,11 @@ impl wit::vine::plugin::proxy::Host for PluginHostState {
                 .into_iter()
                 .find(|s| s.uuid == target_uuid)
         {
-            return Ok(session
-                .action_tx
-                .try_send(PlayerAction::Connect { server_name })
-                .is_ok());
+            if session.action_tx.is_closed() {
+                return Ok(false);
+            }
+            send_reliably(&session.action_tx, PlayerAction::Connect { server_name });
+            return Ok(true);
         }
         Ok(false)
     }
