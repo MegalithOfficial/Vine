@@ -535,9 +535,10 @@ impl Session {
 pub(super) enum BackendEvent {
     /// A packet whose effect on the session the tunnel decides before queueing it for the client
     /// with the room already taken for it; the reader goes on once `done` is answered, so
-    /// nothing it reads later overtakes it
+    /// nothing it reads later overtakes it. `phase` is the one it was read in.
     Packet {
         packet: crate::protocol::RawPacket,
+        phase: Phase,
         permit: OwnedSemaphorePermit,
         done: oneshot::Sender<()>,
     },
@@ -586,7 +587,15 @@ pub(super) async fn read_backend(
 }
 
 /// Backend packets the tunnel itself has to see, in the phase the reader reads them in
-fn watched(id: i32, version: ProtocolVersion) -> bool {
+fn watched(id: i32, phase: Phase, version: ProtocolVersion) -> bool {
+    match phase {
+        Phase::Config => PacketKind::ConfigFinish.matches(id, version),
+        Phase::Play => watched_in_play(id, version),
+        Phase::Login => false,
+    }
+}
+
+fn watched_in_play(id: i32, version: ProtocolVersion) -> bool {
     PacketKind::StartConfiguration.matches(id, version)
         || PacketKind::PlayKeepAlive.matches(id, version)
         || PacketKind::CommandSuggestionsResponse.matches(id, version)
@@ -624,8 +633,9 @@ impl Session {
             {
                 return Ok(());
             }
-            if PacketKind::ConfigFinish.matches(raw_packet.id, version) {
+            if watched(raw_packet.id, current, version) {
                 *phase = Phase::Play;
+                return self.through_tunnel(raw_packet, current, events).await;
             }
         } else if current == Phase::Play {
             if PacketKind::PlayDisconnect.matches(raw_packet.id, version) {
@@ -639,11 +649,11 @@ impl Session {
                 return Err(Some(BackendEvent::Lost { reason }));
             }
 
-            if watched(raw_packet.id, version) {
+            if watched(raw_packet.id, current, version) {
                 if PacketKind::StartConfiguration.matches(raw_packet.id, version) {
                     *phase = Phase::Config;
                 }
-                return self.through_tunnel(raw_packet, events).await;
+                return self.through_tunnel(raw_packet, current, events).await;
             }
 
             if PacketKind::ClientboundPluginMessage.matches(raw_packet.id, version)
@@ -688,6 +698,7 @@ impl Session {
     async fn through_tunnel(
         &self,
         packet: crate::protocol::RawPacket,
+        phase: Phase,
         events: &mpsc::Sender<BackendEvent>,
     ) -> Result<(), Option<BackendEvent>> {
         let Some(permit) = self.client_out.reserve(packet.payload.len() + 1).await else {
@@ -696,6 +707,7 @@ impl Session {
         let (done, queued) = oneshot::channel();
         let event = BackendEvent::Packet {
             packet,
+            phase,
             permit,
             done,
         };

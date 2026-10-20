@@ -37,6 +37,9 @@ pub(super) enum Link {
     // The backend asked the client to reconfigure and the client has not acknowledged yet, so what
     // reaches the client is read as configuration while what it sends is still play
     Reconfiguring,
+    // The backend finished configuring the client and the client has not acknowledged yet, so what
+    // reaches the client is read as play while what it sends is still configuration
+    Finishing,
 }
 
 impl Link {
@@ -45,7 +48,7 @@ impl Link {
     fn clientbound(self) -> Phase {
         match self {
             Link::Login | Link::Config | Link::Reconfiguring => Phase::Config,
-            Link::Play => Phase::Play,
+            Link::Play | Link::Finishing => Phase::Play,
         }
     }
 }
@@ -177,10 +180,11 @@ impl Tunnel {
             },
             Event::Backend(Some(BackendEvent::Packet {
                 packet,
+                phase,
                 permit,
                 done,
             })) => {
-                self.backend_packet(packet, permit);
+                self.backend_packet(packet, phase, permit);
                 let _ = done.send(());
                 Ok(())
             }
@@ -261,10 +265,13 @@ impl Tunnel {
                 }
                 let sent_in = self.link;
                 if let Some(next) = entered {
-                    self.link = match next {
-                        Phase::Login => Link::Login,
-                        Phase::Config => Link::Config,
-                        Phase::Play => Link::Play,
+                    self.link = match (next, self.link) {
+                        (Phase::Login, _) => Link::Login,
+                        (Phase::Config, _) => Link::Config,
+                        // A client asked to reconfigure before it acknowledged finishing its
+                        // configuration acknowledges both in turn
+                        (Phase::Play, Link::Reconfiguring) => Link::Reconfiguring,
+                        (Phase::Play, _) => Link::Play,
                     };
                 }
                 if entered == Some(Phase::Config)
@@ -272,7 +279,7 @@ impl Tunnel {
                 {
                     return self.acknowledged();
                 }
-                if sent_in == Link::Config && served < self.stale_before {
+                if matches!(sent_in, Link::Config | Link::Finishing) && served < self.stale_before {
                     debug!(
                         "Dropping a configuration packet from '{}' meant for a previous backend",
                         self.session.username
@@ -280,7 +287,7 @@ impl Tunnel {
                 } else {
                     self.forward(packet)?;
                 }
-                if entered == Some(Phase::Play) {
+                if entered == Some(Phase::Play) && self.link == Link::Play {
                     return self.reached_play();
                 }
                 Ok(())
@@ -325,10 +332,19 @@ impl Tunnel {
     }
 
     /// A packet from the backend whose effect on the session is decided here before it is queued
-    fn backend_packet(&mut self, packet: crate::protocol::RawPacket, permit: OwnedSemaphorePermit) {
+    fn backend_packet(
+        &mut self,
+        packet: crate::protocol::RawPacket,
+        phase: Phase,
+        permit: OwnedSemaphorePermit,
+    ) {
         let version = self.session.version;
         let mut replaced = None;
-        if PacketKind::StartConfiguration.matches(packet.id, version) {
+        if phase == Phase::Config {
+            if PacketKind::ConfigFinish.matches(packet.id, version) && self.link == Link::Config {
+                self.link = Link::Finishing;
+            }
+        } else if PacketKind::StartConfiguration.matches(packet.id, version) {
             if self.link == Link::Play {
                 self.link = Link::Reconfiguring;
             }
@@ -656,7 +672,8 @@ impl Tunnel {
         }
 
         let clock = match self.link {
-            Link::Play => {
+            // A client finishing configuration acknowledges that first, for the backend being left
+            Link::Play | Link::Finishing => {
                 let Ok(start) = encode_packet(&StartConfiguration, version) else {
                     return Err(End::Kicked(
                         self.translate("vine.server.switch_failed", &[&target]),
