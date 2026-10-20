@@ -624,6 +624,10 @@ impl Tunnel {
     /// Nothing more of the current backend reaches the client; hands the client over
     fn stopped(&mut self, target: String, mut prepared: Box<PreparedBackend>) -> Result<(), End> {
         let version = self.session.version;
+        // A packet still waiting for room was meant for the backend being left, never the next one
+        if let (Some(packet), Conn::Open(open)) = (self.stalled.take(), &self.backend.conn) {
+            let _ = open.writes.try_send(packet);
+        }
         if let Some((mut pending, join_game)) = prepared.join_game.take() {
             let joining = join_game_sequence(&join_game, version).unwrap_or_else(|e| {
                 debug!("Forwarding JoinGame from '{}' unchanged: {}", target, e);
@@ -636,7 +640,8 @@ impl Tunnel {
                 return Err(End::Closed);
             }
             let PreparedBackend { reader, writer, .. } = *prepared;
-            return self.install(target, reader, writer, Phase::Play, Vec::new());
+            self.install(target, reader, writer, Phase::Play, Vec::new());
+            return Ok(());
         }
 
         let clock = match self.link {
@@ -662,9 +667,6 @@ impl Tunnel {
                 return self.configure(target, prepared);
             }
         };
-        if let (Some(packet), Conn::Open(open)) = (self.stalled.take(), &self.backend.conn) {
-            let _ = open.writes.try_send(packet);
-        }
         self.switch = Switch::AwaitingAck {
             target,
             prepared,
@@ -697,7 +699,8 @@ impl Tunnel {
             .chain(self.client_settings.repeat(version))
             .collect();
         let PreparedBackend { reader, writer, .. } = *prepared;
-        self.install(target, reader, writer, Phase::Config, initial)
+        self.install(target, reader, writer, Phase::Config, initial);
+        Ok(())
     }
 
     fn install(
@@ -707,7 +710,7 @@ impl Tunnel {
         writer: BackendWriter,
         phase: Phase,
         initial: Vec<Bytes>,
-    ) -> Result<(), End> {
+    ) {
         self.backend = Backend::start(
             &self.session,
             reader,
@@ -731,10 +734,6 @@ impl Tunnel {
             self.session.username, target
         );
         self.fire_connected(target);
-        match self.stalled.take() {
-            Some(packet) => self.forward(packet),
-            None => Ok(()),
-        }
     }
 
     fn fire_connected(&mut self, server_name: String) {
