@@ -21,4 +21,4 @@ Docker users can run `docker compose up -d`, and `egg-vine.json` is a Pterodacty
 
 ## License
 
-GPL-3.0. See [NOTICE](NOTICE).
+GPL-3.0. See [NOTICE](NOTICE) and [LICENSE](LICENSE).
