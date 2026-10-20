@@ -399,6 +399,11 @@ impl Tunnel {
             self.notify(self.translate("vine.server.already_connecting", &[]));
             return Ok(());
         }
+        self.start_switch(target);
+        Ok(())
+    }
+
+    fn start_switch(&mut self, target: String) {
         info!(
             "Switching player '{}' to backend server '{}'...",
             self.session.username, target
@@ -409,7 +414,6 @@ impl Tunnel {
                 .switch_job(self.backend.name.clone(), target.clone()),
         );
         self.switch = Switch::Connecting { target, job };
-        Ok(())
     }
 
     fn switch_event(&mut self, event: SwitchEvent) -> Result<(), End> {
@@ -593,7 +597,12 @@ impl Tunnel {
                 }
             }
             Switch::Stopping { target, prepared } => self.stopped(target, prepared),
-            Switch::Idle | Switch::Deferred { .. } => self.reroute(reason),
+            // Asked for before the client played; the fallback server only if it fails
+            Switch::Deferred { target } => {
+                self.start_switch(target);
+                Ok(())
+            }
+            Switch::Idle => self.reroute(reason),
             other => {
                 self.switch = other;
                 Ok(())
