@@ -40,11 +40,11 @@ pub(super) enum Link {
 }
 
 impl Link {
-    /// The phase the client reads what is queued for it next in
+    /// The phase the client reads what is queued for it next in; the tunnel starts after the
+    /// client's LoginSuccess, so it reads what follows as configuration before acknowledging it
     fn clientbound(self) -> Phase {
         match self {
-            Link::Login => Phase::Login,
-            Link::Config | Link::Reconfiguring => Phase::Config,
+            Link::Login | Link::Config | Link::Reconfiguring => Phase::Config,
             Link::Play => Phase::Play,
         }
     }
