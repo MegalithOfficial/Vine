@@ -287,6 +287,10 @@ impl WasmPlugin {
                     let Some(plugin) = plugin.upgrade() else {
                         break;
                     };
+                    // Skipped rather than ended, so events keep being taken off the queue
+                    if plugin.is_stopping() || plugin.is_disabled() {
+                        continue;
+                    }
                     for handler_id in job.handler_ids {
                         if let Err(e) = plugin.handle_event(handler_id, job.event.clone()).await {
                             tracing::error!(
