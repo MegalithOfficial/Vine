@@ -13,12 +13,16 @@ interface types {
         player-count: u32,
     }
 
+    /// Handlers run from lowest to highest, then monitor.
     enum event-priority {
         lowest,
         low,
         normal,
         high,
         highest,
+        /// Only watches: what a monitor handler returns is ignored. For player-chat, player-command
+        /// and plugin-message it sees the decided event later, on the plugin's own queue, so it may
+        /// run after handlers of newer events, and events are skipped if it falls far behind.
         monitor,
     }
 
