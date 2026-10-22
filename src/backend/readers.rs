@@ -25,7 +25,9 @@ use crate::protocol::packets::play::{
     read_plugin_message, replace_leading_string, write_plugin_message,
 };
 use crate::protocol::text::plain_text;
-use crate::protocol::{PacketKind, PacketReader, ProtocolVersion, decode_packet, encode_packet};
+use crate::protocol::{
+    Frame, PacketKind, PacketReader, ProtocolVersion, decode_packet, encode_packet,
+};
 use crate::security::PacketRateLimiter;
 use crate::session::{PlayerAction, SessionManager};
 fn client_locale(
@@ -108,6 +110,8 @@ pub(super) struct Session {
     pub(super) proxy_config: Arc<Config>,
     pub(super) action_tx: mpsc::Sender<PlayerAction>,
     pub(super) client_out: ClientQueue,
+    // The client's compression threshold; a backend using the same one has its frames passed on
+    pub(super) client_compression: Option<usize>,
 }
 
 /// What the client reader hands the tunnel, in the order the client sent it. `served` is the
@@ -556,17 +560,36 @@ pub(super) async fn read_backend(
     events: mpsc::Sender<BackendEvent>,
     mut stop: oneshot::Receiver<()>,
 ) {
+    let version = session.version;
+    let passthrough = reader.compression() == session.client_compression;
     loop {
-        let packet = tokio::select! {
+        let current = phase;
+        let read = async {
+            if passthrough {
+                reader
+                    .read_frame(|id| !inspected(id, current, version))
+                    .await
+            } else {
+                reader.read_packet().await.map(Frame::Packet)
+            }
+        };
+        let frame = tokio::select! {
             biased;
             _ = &mut stop => return,
-            packet = reader.read_packet() => packet,
+            frame = read => frame,
         };
-        let handled = match packet {
-            Ok(packet) => {
+        let handled = match frame {
+            Ok(Frame::Packet(packet)) => {
                 session
                     .backend_packet(packet, &server_name, &mut phase, &events)
                     .await
+            }
+            Ok(Frame::Raw(frame)) => {
+                if session.client_out.send_frame(frame).await {
+                    Ok(())
+                } else {
+                    Err(Some(BackendEvent::ClientGone))
+                }
             }
             Err(e) => {
                 debug!("Backend stream ended for '{}': {:?}", session.username, e);
@@ -593,6 +616,24 @@ fn watched(id: i32, phase: Phase, version: ProtocolVersion) -> bool {
         Phase::Play => watched_in_play(id, version),
         Phase::Login => false,
     }
+}
+
+/// Backend packets the proxy reads or changes on their way to the client; the rest reach it as
+/// the backend framed them when both connections compress the same way
+fn inspected(id: i32, phase: Phase, version: ProtocolVersion) -> bool {
+    watched(id, phase, version)
+        || match phase {
+            Phase::Config => {
+                PacketKind::ConfigDisconnect.matches(id, version)
+                    || PacketKind::ConfigClientboundPluginMessage.matches(id, version)
+            }
+            Phase::Play => {
+                PacketKind::PlayDisconnect.matches(id, version)
+                    || PacketKind::ClientboundPluginMessage.matches(id, version)
+                    || PacketKind::Commands.matches(id, version)
+            }
+            Phase::Login => true,
+        }
 }
 
 fn watched_in_play(id: i32, version: ProtocolVersion) -> bool {

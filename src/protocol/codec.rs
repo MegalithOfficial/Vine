@@ -2,9 +2,9 @@ use std::io::{Read, Write};
 
 use aes::cipher::KeyIvInit;
 use bytes::{Buf, Bytes, BytesMut};
-use flate2::Compression;
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
+use flate2::{Compression, Decompress, FlushDecompress, Status};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use super::ProtocolError;
@@ -43,6 +43,12 @@ impl RawPacket {
     }
 }
 
+/// A packet as read: decoded, or kept as the frame it arrived in, length prefix included
+pub enum Frame {
+    Packet(RawPacket),
+    Raw(Bytes),
+}
+
 fn cipher_error() -> ProtocolError {
     ProtocolError::Malformed("invalid shared secret".into())
 }
@@ -55,6 +61,7 @@ pub struct PacketReader<R> {
     decryptor: Option<Decryptor>,
     max_frame: usize,
     max_data: usize,
+    inflater: Option<Decompress>,
 }
 
 impl<R: AsyncRead + Unpin> PacketReader<R> {
@@ -66,6 +73,7 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
             decryptor: None,
             max_frame: MAX_FRAME_LEN,
             max_data: MAX_PACKET_DATA_LEN,
+            inflater: None,
         }
     }
 
@@ -75,9 +83,26 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
     }
 
     pub async fn read_packet(&mut self) -> Result<RawPacket, ProtocolError> {
+        let (frame, header) = self.next_frame().await?;
+        self.decode_frame(frame.slice(header..))
+    }
+
+    /// Like `read_packet`, but a packet whose id `keep` accepts is returned as the frame it arrived
+    /// in, without decompressing more of it than its id
+    pub async fn read_frame(&mut self, keep: impl Fn(i32) -> bool) -> Result<Frame, ProtocolError> {
+        let (frame, header) = self.next_frame().await?;
+        let body = frame.slice(header..);
+        if keep(self.peek_id(&body)?) {
+            return Ok(Frame::Raw(frame));
+        }
+        self.decode_frame(body).map(Frame::Packet)
+    }
+
+    /// The next whole frame and the length of its length prefix
+    async fn next_frame(&mut self) -> Result<(Bytes, usize), ProtocolError> {
         loop {
-            if let Some(frame) = self.next_frame()? {
-                return self.decode_frame(frame);
+            if let Some(frame) = self.buffered_frame()? {
+                return Ok(frame);
             }
 
             let start = self.buf.len();
@@ -95,7 +120,7 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
         }
     }
 
-    fn next_frame(&mut self) -> Result<Option<Bytes>, ProtocolError> {
+    fn buffered_frame(&mut self) -> Result<Option<(Bytes, usize)>, ProtocolError> {
         let mut cur = &self.buf[..];
         let len = match cur.read_varint() {
             Ok(len) => len,
@@ -112,20 +137,20 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
                 .reserve((header + len - self.buf.len()).min(MAX_PREALLOC));
             return Ok(None);
         }
-        self.buf.advance(header);
-        Ok(Some(self.buf.split_to(len).freeze()))
+        Ok(Some((self.buf.split_to(header + len).freeze(), header)))
     }
 
-    fn decode_frame(&self, frame: Bytes) -> Result<RawPacket, ProtocolError> {
+    /// The packet's announced length and its data, compressed unless that length is 0
+    fn unwrap_frame(&self, frame: Bytes) -> Result<(usize, Bytes), ProtocolError> {
         let Some(threshold) = self.compression else {
-            return RawPacket::parse(frame);
+            return Ok((0, frame));
         };
 
         let mut cur = &frame[..];
         let data_len = cur.read_varint()?;
         let body = frame.slice(frame.len() - cur.len()..);
         if data_len == 0 {
-            return RawPacket::parse(body);
+            return Ok((0, body));
         }
 
         let data_len = usize::try_from(data_len)
@@ -138,6 +163,14 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
             return Err(ProtocolError::Malformed(format!(
                 "compressed packet of {data_len} bytes is below the threshold of {threshold}"
             )));
+        }
+        Ok((data_len, body))
+    }
+
+    fn decode_frame(&self, frame: Bytes) -> Result<RawPacket, ProtocolError> {
+        let (data_len, body) = self.unwrap_frame(frame)?;
+        if data_len == 0 {
+            return RawPacket::parse(body);
         }
 
         let mut data = Vec::with_capacity(data_len.min(MAX_PREALLOC));
@@ -152,6 +185,43 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
             )));
         }
         RawPacket::parse(data.into())
+    }
+
+    fn peek_id(&mut self, frame: &Bytes) -> Result<i32, ProtocolError> {
+        let (data_len, body) = self.unwrap_frame(frame.clone())?;
+        if data_len == 0 {
+            return (&body[..]).read_varint();
+        }
+
+        let inflater = self.inflater.get_or_insert_with(|| Decompress::new(true));
+        inflater.reset(true);
+        let mut id = [0u8; 5];
+        let want = id.len().min(data_len);
+        loop {
+            let (read, written) = (inflater.total_in(), inflater.total_out());
+            let status = inflater
+                .decompress(
+                    &body[read as usize..],
+                    &mut id[written as usize..want],
+                    FlushDecompress::None,
+                )
+                .map_err(|e| ProtocolError::Malformed(format!("invalid zlib data: {e}")))?;
+            let done = inflater.total_out() as usize;
+            if done == want {
+                break;
+            }
+            if status == Status::StreamEnd || (inflater.total_in(), done as u64) == (read, written)
+            {
+                return Err(ProtocolError::Malformed(format!(
+                    "decompressed {done} bytes but the header announced {data_len}"
+                )));
+            }
+        }
+        (&id[..want]).read_varint()
+    }
+
+    pub fn compression(&self) -> Option<usize> {
+        self.compression
     }
 
     pub fn set_compression(&mut self, threshold: usize) {
@@ -206,10 +276,21 @@ impl<W: AsyncWrite + Unpin> PacketWriter<W> {
             }
             None => self.write_frame(packet.len(), |out| out.extend_from_slice(packet))?,
         }
+        self.encrypt_from(start);
+        Ok(())
+    }
+
+    /// Queues a frame read off a connection compressed the same way, as it is
+    pub fn queue_frame(&mut self, frame: &[u8]) {
+        let start = self.out.len();
+        self.out.extend_from_slice(frame);
+        self.encrypt_from(start);
+    }
+
+    fn encrypt_from(&mut self, start: usize) {
         if let Some(encryptor) = &mut self.encryptor {
             encryptor.encrypt(&mut self.out[start..]);
         }
-        Ok(())
     }
 
     fn write_frame(
@@ -244,6 +325,15 @@ impl<W: AsyncWrite + Unpin> PacketWriter<W> {
     pub async fn send(&mut self, packet: Bytes) -> Result<(), ProtocolError> {
         self.queue(&packet)?;
         self.flush().await
+    }
+
+    pub async fn send_frame(&mut self, frame: Bytes) -> Result<(), ProtocolError> {
+        self.queue_frame(&frame);
+        self.flush().await
+    }
+
+    pub fn compression_threshold(&self) -> Option<usize> {
+        self.compression.map(|(threshold, _)| threshold)
     }
 
     pub fn set_compression(&mut self, threshold: usize, level: u32) {
@@ -347,6 +437,66 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_frames_passed_on_reach_an_encrypted_client() {
+        let big: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
+        let packets = vec![
+            packet(0x00, b""),
+            packet(0x2A, b"hello"),
+            packet(300, &big),
+            packet(0x07, &[1u8; 254]),
+        ];
+        let mut backend = PacketWriter::new(Vec::new());
+        backend.set_compression(256, 1);
+        for p in &packets {
+            backend.queue(p).unwrap();
+        }
+        backend.flush().await.unwrap();
+        let sent = backend.inner;
+
+        let mut proxy = PacketReader::new(&sent[..]);
+        proxy.set_compression(256);
+        let mut client = PacketWriter::new(Vec::new());
+        client.set_compression(256, 6);
+        client.enable_encryption(&[9u8; 16]).unwrap();
+        let mut raw = Vec::new();
+        for _ in &packets {
+            match proxy.read_frame(|id| id != 0x2A).await.unwrap() {
+                Frame::Raw(frame) => {
+                    raw.extend_from_slice(&frame);
+                    client.queue_frame(&frame);
+                }
+                Frame::Packet(p) => {
+                    assert_eq!(p.id, 0x2A);
+                    raw.extend_from_slice(&sent[raw.len()..raw.len() + 8]);
+                    client.queue(&p.to_bytes()).unwrap();
+                }
+            }
+        }
+        assert_eq!(raw, sent);
+
+        let mut reader = PacketReader::new(&client.out[..]);
+        reader.set_compression(256);
+        reader.enable_encryption(&[9u8; 16]).unwrap();
+        for p in &packets {
+            assert_eq!(reader.read_packet().await.unwrap().to_bytes(), &p[..]);
+        }
+
+        let mut frame = Vec::new();
+        frame.write_varint(MAX_PACKET_DATA_LEN as i32 + 1);
+        frame.extend_from_slice(
+            &ZlibEncoder::new(Vec::new(), Compression::fast())
+                .finish()
+                .unwrap(),
+        );
+        let mut data = Vec::new();
+        data.write_varint(frame.len() as i32);
+        data.extend_from_slice(&frame);
+        let mut reader = PacketReader::new(&data[..]);
+        reader.set_compression(256);
+        assert!(reader.read_frame(|_| true).await.is_err());
     }
 
     #[tokio::test]

@@ -6,7 +6,7 @@ pub mod text;
 pub mod version;
 pub mod wire;
 
-pub use codec::{PacketReader, PacketWriter, RawPacket};
+pub use codec::{Frame, PacketReader, PacketWriter, RawPacket};
 pub use packets::{Packet, PacketKind, decode_packet, encode_packet};
 pub use version::ProtocolVersion;
 

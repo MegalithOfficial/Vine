@@ -24,6 +24,8 @@ pub(super) type Room = std::pin::Pin<
 pub(super) enum ClientWrite {
     // Packets of the proxy's own carry no permit, so they never wait for room
     Packet(Bytes, Option<OwnedSemaphorePermit>),
+    // A backend frame written as it arrived
+    Frame(Bytes, OwnedSemaphorePermit),
     // Answered once everything queued before it is written
     Written(oneshot::Sender<()>),
     Close,
@@ -69,6 +71,14 @@ impl ClientQueue {
         }
     }
 
+    /// Queues a backend frame once there is room for it
+    pub(super) async fn send_frame(&self, frame: Bytes) -> bool {
+        match self.reserve(frame.len()).await {
+            Some(permit) => self.tx.send(ClientWrite::Frame(frame, permit)).is_ok(),
+            None => false,
+        }
+    }
+
     pub(super) fn push(&self, bytes: Bytes, permit: Option<OwnedSemaphorePermit>) -> bool {
         self.tx.send(ClientWrite::Packet(bytes, permit)).is_ok()
     }
@@ -101,24 +111,31 @@ pub(super) async fn write_client<W: AsyncWrite + Unpin>(
     username: String,
 ) {
     while let Some(write) = rx.recv().await {
-        match write {
-            ClientWrite::Packet(bytes, _permit) => {
-                match timeout(CLIENT_WRITE_TIMEOUT, writer.send(bytes)).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        debug!("Client write failed for '{}': {:?}", username, e);
-                        break;
-                    }
-                    Err(_) => {
-                        warn!("Client '{}' stopped reading, disconnecting", username);
-                        break;
-                    }
-                }
-            }
+        let (written, _permit) = match write {
+            ClientWrite::Packet(bytes, permit) => (
+                timeout(CLIENT_WRITE_TIMEOUT, writer.send(bytes)).await,
+                permit,
+            ),
+            ClientWrite::Frame(frame, permit) => (
+                timeout(CLIENT_WRITE_TIMEOUT, writer.send_frame(frame)).await,
+                Some(permit),
+            ),
             ClientWrite::Written(done) => {
                 let _ = done.send(());
+                continue;
             }
             ClientWrite::Close => break,
+        };
+        match written {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                debug!("Client write failed for '{}': {:?}", username, e);
+                break;
+            }
+            Err(_) => {
+                warn!("Client '{}' stopped reading, disconnecting", username);
+                break;
+            }
         }
     }
     budget.close();

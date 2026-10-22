@@ -256,6 +256,7 @@ impl BackendBridge {
             .update_server(&self.player.username, &current_server_name);
 
         let bridge = Arc::new(self);
+        let client_compression = client_writer.compression_threshold();
         let (client_out, client_rx) = ClientQueue::new();
         let writer = Task::spawn(write_client(
             client_writer,
@@ -273,6 +274,7 @@ impl BackendBridge {
             proxy_config: bridge.proxy_config.clone(),
             action_tx,
             client_out: client_out.clone(),
+            client_compression,
         });
         let (served, served_rx) = watch::channel(Served {
             generation: 0,
