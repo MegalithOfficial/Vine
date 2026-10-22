@@ -10,7 +10,7 @@ use super::bridge::{BackendBridge, Phase, disconnect_packet};
 use super::client_queue::{CLIENT_WRITE_TIMEOUT, ClientQueue, Room};
 use super::connection::{Backend, Conn};
 use super::login::{BackendReader, BackendWriter, PreparedBackend};
-use super::readers::{BRAND_CHANNEL, BackendEvent, ClientEvent, Session, Setting};
+use super::readers::{BRAND_CHANNEL, BackendEvent, ClientEvent, Session, Setting, Watched};
 use super::suggestions::{Suggesting, SuggestionEvent, merge_suggestions};
 use super::switch::{
     AckClock, Connected, HELD_BACKEND_LIMIT, Job, SWITCH_ACK_TIMEOUT, Switch, SwitchEvent,
@@ -184,11 +184,11 @@ impl Tunnel {
             },
             Event::Backend(Some(BackendEvent::Packet {
                 packet,
-                phase,
+                watched,
                 permit,
                 done,
             })) => {
-                self.backend_packet(packet, phase, permit);
+                self.backend_packet(packet, watched, permit);
                 let _ = done.send(());
                 Ok(())
             }
@@ -341,32 +341,37 @@ impl Tunnel {
     fn backend_packet(
         &mut self,
         packet: crate::protocol::RawPacket,
-        phase: Phase,
+        watched: Watched,
         permit: OwnedSemaphorePermit,
     ) {
         let version = self.session.version;
         let mut replaced = None;
-        if phase == Phase::Config {
-            if PacketKind::ConfigFinish.matches(packet.id, version) && self.link == Link::Config {
-                self.link = Link::Finishing;
+        match watched {
+            Watched::ConfigFinish => {
+                if self.link == Link::Config {
+                    self.link = Link::Finishing;
+                }
             }
-        } else if PacketKind::StartConfiguration.matches(packet.id, version) {
-            if self.link == Link::Play {
-                self.link = Link::Reconfiguring;
+            Watched::StartConfiguration => {
+                if self.link == Link::Play {
+                    self.link = Link::Reconfiguring;
+                }
             }
-        } else if PacketKind::PlayKeepAlive.matches(packet.id, version) {
-            if let Ok(challenge) = decode_packet::<PlayKeepAlive>(&packet.payload, version) {
-                self.keep_alive = Some(challenge.id);
+            Watched::KeepAlive => {
+                if let Ok(challenge) = decode_packet::<PlayKeepAlive>(&packet.payload, version) {
+                    self.keep_alive = Some(challenge.id);
+                }
             }
-        } else if PacketKind::CommandSuggestionsResponse.matches(packet.id, version) {
-            if let Ok(mut answer) = decode_packet::<CommandSuggestions>(&packet.payload, version)
-                && let Some(pending) = self.suggesting.answered(answer.id)
-            {
-                merge_suggestions(&mut answer.matches, pending.proxy_matches, version);
-                replaced = encode_packet(&answer, version).ok();
+            Watched::Suggestions => {
+                if let Ok(mut answer) =
+                    decode_packet::<CommandSuggestions>(&packet.payload, version)
+                    && let Some(pending) = self.suggesting.answered(answer.id)
+                {
+                    merge_suggestions(&mut answer.matches, pending.proxy_matches, version);
+                    replaced = encode_packet(&answer, version).ok();
+                }
             }
-        } else {
-            self.leftovers.observe(&packet, version);
+            Watched::Leftover => self.leftovers.observe(&packet, version),
         }
         self.client_out
             .push(replaced.unwrap_or_else(|| packet.to_bytes()), Some(permit));

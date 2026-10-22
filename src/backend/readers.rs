@@ -539,10 +539,10 @@ impl Session {
 pub(super) enum BackendEvent {
     /// A packet whose effect on the session the tunnel decides before queueing it for the client
     /// with the room already taken for it; the reader goes on once `done` is answered, so
-    /// nothing it reads later overtakes it. `phase` is the one it was read in.
+    /// nothing it reads later overtakes it.
     Packet {
         packet: crate::protocol::RawPacket,
-        phase: Phase,
+        watched: Watched,
         permit: OwnedSemaphorePermit,
         done: oneshot::Sender<()>,
     },
@@ -567,7 +567,10 @@ pub(super) async fn read_backend(
         let read = async {
             if passthrough {
                 reader
-                    .read_frame(|id| !inspected(id, current, version))
+                    .read_frame(|id| {
+                        current != Phase::Login
+                            && classify(id, current, version) == Handling::PassOn
+                    })
                     .await
             } else {
                 reader.read_packet().await.map(Frame::Packet)
@@ -609,41 +612,67 @@ pub(super) async fn read_backend(
     }
 }
 
-/// Backend packets the tunnel itself has to see, in the phase the reader reads them in
-fn watched(id: i32, phase: Phase, version: ProtocolVersion) -> bool {
+/// What the proxy does with a packet from the backend, in the phase the reader reads it in.
+/// Only what it passes on as it is may reach the client as the backend framed it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Handling {
+    Disconnect,
+    PluginMessage,
+    Commands,
+    Watched(Watched),
+    PassOn,
+}
+
+/// Backend packets the tunnel itself has to see
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Watched {
+    ConfigFinish,
+    StartConfiguration,
+    KeepAlive,
+    Suggestions,
+    // What a client before 1.20.2 keeps across a switch until the proxy clears it
+    Leftover,
+}
+
+fn classify(id: i32, phase: Phase, version: ProtocolVersion) -> Handling {
+    let is = |kind: PacketKind| kind.matches(id, version);
     match phase {
-        Phase::Config => PacketKind::ConfigFinish.matches(id, version),
-        Phase::Play => watched_in_play(id, version),
-        Phase::Login => false,
-    }
-}
-
-/// Backend packets the proxy reads or changes on their way to the client; the rest reach it as
-/// the backend framed them when both connections compress the same way
-fn inspected(id: i32, phase: Phase, version: ProtocolVersion) -> bool {
-    watched(id, phase, version)
-        || match phase {
-            Phase::Config => {
-                PacketKind::ConfigDisconnect.matches(id, version)
-                    || PacketKind::ConfigClientboundPluginMessage.matches(id, version)
+        Phase::Config => {
+            if is(PacketKind::ConfigDisconnect) {
+                Handling::Disconnect
+            } else if is(PacketKind::ConfigClientboundPluginMessage) {
+                Handling::PluginMessage
+            } else if is(PacketKind::ConfigFinish) {
+                Handling::Watched(Watched::ConfigFinish)
+            } else {
+                Handling::PassOn
             }
-            Phase::Play => {
-                PacketKind::PlayDisconnect.matches(id, version)
-                    || PacketKind::ClientboundPluginMessage.matches(id, version)
-                    || PacketKind::Commands.matches(id, version)
-            }
-            Phase::Login => true,
         }
-}
-
-fn watched_in_play(id: i32, version: ProtocolVersion) -> bool {
-    PacketKind::StartConfiguration.matches(id, version)
-        || PacketKind::PlayKeepAlive.matches(id, version)
-        || PacketKind::CommandSuggestionsResponse.matches(id, version)
-        || (version < ProtocolVersion::V1_20_2
-            && (PacketKind::PlayerInfo.matches(id, version)
-                || PacketKind::PlayerInfoRemove.matches(id, version)
-                || PacketKind::BossBar.matches(id, version)))
+        Phase::Play => {
+            if is(PacketKind::PlayDisconnect) {
+                Handling::Disconnect
+            } else if is(PacketKind::StartConfiguration) {
+                Handling::Watched(Watched::StartConfiguration)
+            } else if is(PacketKind::PlayKeepAlive) {
+                Handling::Watched(Watched::KeepAlive)
+            } else if is(PacketKind::CommandSuggestionsResponse) {
+                Handling::Watched(Watched::Suggestions)
+            } else if version < ProtocolVersion::V1_20_2
+                && (is(PacketKind::PlayerInfo)
+                    || is(PacketKind::PlayerInfoRemove)
+                    || is(PacketKind::BossBar))
+            {
+                Handling::Watched(Watched::Leftover)
+            } else if is(PacketKind::ClientboundPluginMessage) {
+                Handling::PluginMessage
+            } else if is(PacketKind::Commands) {
+                Handling::Commands
+            } else {
+                Handling::PassOn
+            }
+        }
+        Phase::Login => Handling::PassOn,
+    }
 }
 
 impl Session {
@@ -660,50 +689,40 @@ impl Session {
         let version = self.version;
         let current = *phase;
         let mut packet = None;
-        if current == Phase::Config {
-            if PacketKind::ConfigDisconnect.matches(raw_packet.id, version) {
-                let reason = decode_packet::<ConfigDisconnect>(&raw_packet.payload, version)
-                    .map(|d| plain_text(&d.reason))
-                    .ok();
+        match classify(raw_packet.id, current, version) {
+            Handling::Disconnect => {
+                let reason = if current == Phase::Config {
+                    decode_packet::<ConfigDisconnect>(&raw_packet.payload, version)
+                        .map(|d| plain_text(&d.reason))
+                        .ok()
+                } else {
+                    decode_packet::<PlayDisconnect>(&raw_packet.payload, version)
+                        .map(|d| plain_text(&d.reason))
+                        .ok()
+                        .or_else(|| {
+                            let s = String::from_utf8_lossy(&raw_packet.payload).to_string();
+                            if s.is_empty() { None } else { Some(s) }
+                        })
+                };
                 return Err(Some(BackendEvent::Lost { reason }));
             }
-            if PacketKind::ConfigClientboundPluginMessage.matches(raw_packet.id, version)
-                && !self
+            Handling::PluginMessage => {
+                if !self
                     .plugin_message_event(&mut raw_packet, server_name, PluginMessageSource::Server)
                     .await
-            {
-                return Ok(());
-            }
-            if watched(raw_packet.id, current, version) {
-                *phase = Phase::Play;
-                return self.through_tunnel(raw_packet, current, events).await;
-            }
-        } else if current == Phase::Play {
-            if PacketKind::PlayDisconnect.matches(raw_packet.id, version) {
-                let reason = decode_packet::<PlayDisconnect>(&raw_packet.payload, version)
-                    .map(|d| plain_text(&d.reason))
-                    .ok()
-                    .or_else(|| {
-                        let s = String::from_utf8_lossy(&raw_packet.payload).to_string();
-                        if s.is_empty() { None } else { Some(s) }
-                    });
-                return Err(Some(BackendEvent::Lost { reason }));
-            }
-
-            if watched(raw_packet.id, current, version) {
-                if PacketKind::StartConfiguration.matches(raw_packet.id, version) {
-                    *phase = Phase::Config;
+                {
+                    return Ok(());
                 }
-                return self.through_tunnel(raw_packet, current, events).await;
             }
-
-            if PacketKind::ClientboundPluginMessage.matches(raw_packet.id, version)
-                && !self
-                    .plugin_message_event(&mut raw_packet, server_name, PluginMessageSource::Server)
-                    .await
-            {
-                return Ok(());
-            } else if PacketKind::Commands.matches(raw_packet.id, version) {
+            Handling::Watched(watched) => {
+                match watched {
+                    Watched::ConfigFinish => *phase = Phase::Play,
+                    Watched::StartConfiguration => *phase = Phase::Config,
+                    Watched::KeepAlive | Watched::Suggestions | Watched::Leftover => {}
+                }
+                return self.through_tunnel(raw_packet, watched, events).await;
+            }
+            Handling::Commands => {
                 let source = self.command_source();
                 let permitted = self
                     .command_dispatcher
@@ -726,6 +745,7 @@ impl Session {
                     },
                 );
             }
+            Handling::PassOn => {}
         }
 
         let bytes = packet.unwrap_or_else(|| raw_packet.to_bytes());
@@ -739,7 +759,7 @@ impl Session {
     async fn through_tunnel(
         &self,
         packet: crate::protocol::RawPacket,
-        phase: Phase,
+        watched: Watched,
         events: &mpsc::Sender<BackendEvent>,
     ) -> Result<(), Option<BackendEvent>> {
         let Some(permit) = self.client_out.reserve(packet.payload.len() + 1).await else {
@@ -748,7 +768,7 @@ impl Session {
         let (done, queued) = oneshot::channel();
         let event = BackendEvent::Packet {
             packet,
-            phase,
+            watched,
             permit,
             done,
         };
