@@ -331,8 +331,9 @@ impl<W: AsyncWrite + Unpin> PacketWriter<W> {
         self.compression.map(|(threshold, _)| threshold)
     }
 
-    pub fn set_compression(&mut self, threshold: usize, level: u32) {
-        self.compression = Some((threshold, level.min(9)));
+    pub fn set_compression(&mut self, threshold: usize, level: i32) {
+        let level = u32::try_from(level).map_or(Compression::default().level(), |l| l.min(9));
+        self.compression = Some((threshold, level));
     }
 
     pub fn enable_encryption(&mut self, key: &[u8; 16]) -> Result<(), ProtocolError> {

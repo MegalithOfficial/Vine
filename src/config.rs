@@ -129,9 +129,9 @@ pub struct ServerConfig {
     pub online_mode: bool,
     /// Send player IP to Mojang during session authentication to prevent proxy hijacking
     pub prevent_proxy_connections: bool,
-    /// Packet compression threshold (-1 to disable, e.g. 256 for standard compression)
+    /// Packets of at least this many bytes are compressed (-1 = off, 0 = every packet, e.g. 256)
     pub compression_threshold: i32,
-    /// zlib / flate2 compression level (1 = fastest, 6 = default balance, 9 = best compression)
+    /// zlib compression level (-1 = zlib's default, 0 = none, 1 = fastest, 9 = smallest)
     #[serde(default = "default_compression_level")]
     pub compression_level: i32,
     /// Graceful shutdown timeout in seconds to wait for active connections to close
@@ -566,6 +566,12 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if self.server.compression_threshold < -1 {
+            return Err("server.compression_threshold must be -1 (off) or more".to_string());
+        }
+        if !(-1..=9).contains(&self.server.compression_level) {
+            return Err("server.compression_level must be between -1 and 9".to_string());
+        }
         let security = &self.security;
         if security.max_packets_per_sec == 0 {
             return Err("security.max_packets_per_sec must be at least 1".to_string());

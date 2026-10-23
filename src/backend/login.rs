@@ -224,8 +224,7 @@ impl BackendBridge {
                 debug!("Backend enabled compression threshold: {} bytes", threshold);
                 if threshold >= 0 {
                     backend_reader.set_compression(threshold as usize);
-                    backend_writer
-                        .set_compression(threshold as usize, self.compression_level as u32);
+                    backend_writer.set_compression(threshold as usize, self.compression_level);
                 }
             } else if PacketKind::LoginSuccess.matches(raw_packet.id, version) {
                 debug!(

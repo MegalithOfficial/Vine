@@ -508,7 +508,7 @@ impl ClientHandler {
         }
 
         let comp_threshold = self.config.server.compression_threshold;
-        if comp_threshold > 0 && PacketKind::SetCompression.id(client_version).is_some() {
+        if comp_threshold >= 0 && PacketKind::SetCompression.id(client_version).is_some() {
             let set_compression = SetCompression {
                 threshold: comp_threshold,
             };
@@ -519,7 +519,7 @@ impl ClientHandler {
             reader.set_compression(comp_threshold as usize);
             writer.set_compression(
                 comp_threshold as usize,
-                self.config.server.compression_level as u32,
+                self.config.server.compression_level,
             );
         }
         let max_packet = self.config.security.max_packet_size;
