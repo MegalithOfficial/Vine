@@ -1,10 +1,8 @@
-use std::io::{Read, Write};
+use std::cell::RefCell;
 
 use aes::cipher::KeyIvInit;
 use bytes::{Buf, Bytes, BytesMut};
-use flate2::read::ZlibDecoder;
-use flate2::write::ZlibEncoder;
-use flate2::{Compression, Decompress, FlushDecompress, Status};
+use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use super::ProtocolError;
@@ -17,6 +15,50 @@ const MAX_PREALLOC: usize = 64 * 1024;
 
 type Encryptor = cfb8::Encryptor<aes::Aes128>;
 type Decryptor = cfb8::Decryptor<aes::Aes128>;
+
+struct Deflater {
+    level: u32,
+    state: Compress,
+    out: Vec<u8>,
+}
+
+thread_local! {
+    // Setting up a deflate state costs more than compressing a small packet, and one per
+    // connection would hold a few hundred KiB each, so each thread keeps one and resets it
+    static DEFLATER: RefCell<Option<Deflater>> = const { RefCell::new(None) };
+}
+
+/// Compresses `data` as a zlib stream and hands the result to `f`
+fn deflate<T>(data: &[u8], level: u32, f: impl FnOnce(&[u8]) -> T) -> Result<T, ProtocolError> {
+    DEFLATER.with_borrow_mut(|slot| {
+        let deflater = match slot {
+            Some(d) if d.level == level => d,
+            _ => slot.insert(Deflater {
+                level,
+                state: Compress::new(Compression::new(level), true),
+                out: Vec::new(),
+            }),
+        };
+        deflater.state.reset();
+        deflater.out.clear();
+        loop {
+            deflater.out.reserve(data.len() / 2 + 64);
+            let read = deflater.state.total_in() as usize;
+            let status = deflater
+                .state
+                .compress_vec(&data[read..], &mut deflater.out, FlushCompress::Finish)
+                .map_err(|e| ProtocolError::Encode(format!("zlib: {e}")))?;
+            if status == Status::StreamEnd {
+                break;
+            }
+        }
+        let result = f(&deflater.out);
+        if deflater.out.capacity() > MAX_PREALLOC * 4 {
+            deflater.out = Vec::new();
+        }
+        Ok(result)
+    })
+}
 
 #[derive(Clone, Debug)]
 pub struct RawPacket {
@@ -167,17 +209,32 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
         Ok((data_len, body))
     }
 
-    fn decode_frame(&self, frame: Bytes) -> Result<RawPacket, ProtocolError> {
+    fn decode_frame(&mut self, frame: Bytes) -> Result<RawPacket, ProtocolError> {
         let (data_len, body) = self.unwrap_frame(frame)?;
         if data_len == 0 {
             return RawPacket::parse(body);
         }
 
+        let inflater = self.inflater.get_or_insert_with(|| Decompress::new(true));
+        inflater.reset(true);
+        // One byte past the announced length is enough to tell it was wrong
+        let limit = data_len + 1;
         let mut data = Vec::with_capacity(data_len.min(MAX_PREALLOC));
-        ZlibDecoder::new(&body[..])
-            .take(data_len as u64 + 1)
-            .read_to_end(&mut data)
-            .map_err(|e| ProtocolError::Malformed(format!("invalid zlib data: {e}")))?;
+        loop {
+            if data.len() == data.capacity() {
+                data.reserve_exact((limit - data.len()).min(MAX_PREALLOC));
+            }
+            let (read, written) = (inflater.total_in() as usize, data.len());
+            let status = inflater
+                .decompress_vec(&body[read..], &mut data, FlushDecompress::None)
+                .map_err(|e| ProtocolError::Malformed(format!("invalid zlib data: {e}")))?;
+            if status == Status::StreamEnd
+                || data.len() >= limit
+                || (inflater.total_in() as usize, data.len()) == (read, written)
+            {
+                break;
+            }
+        }
         if data.len() != data_len {
             return Err(ProtocolError::Malformed(format!(
                 "decompressed {} bytes but the header announced {data_len}",
@@ -259,14 +316,13 @@ impl<W: AsyncWrite + Unpin> PacketWriter<W> {
         let start = self.out.len();
         match self.compression {
             Some((threshold, level)) if packet.len() >= threshold => {
-                let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(level));
-                encoder.write_all(packet)?;
-                let compressed = encoder.finish()?;
                 let data_len = packet.len() as i32;
-                self.write_frame(varint_len(data_len) + compressed.len(), |out| {
-                    out.write_varint(data_len);
-                    out.extend_from_slice(&compressed);
-                })?;
+                deflate(packet, level, |compressed| {
+                    self.write_frame(varint_len(data_len) + compressed.len(), |out| {
+                        out.write_varint(data_len);
+                        out.extend_from_slice(compressed);
+                    })
+                })??;
             }
             Some(_) => {
                 self.write_frame(1 + packet.len(), |out| {
@@ -296,17 +352,16 @@ impl<W: AsyncWrite + Unpin> PacketWriter<W> {
     fn write_frame(
         &mut self,
         len: usize,
-        body: impl FnOnce(&mut Vec<u8>),
+        body: impl FnOnce(&mut BytesMut),
     ) -> Result<(), ProtocolError> {
         if len > MAX_FRAME_LEN {
             return Err(ProtocolError::Encode(format!(
                 "packet of {len} bytes exceeds the maximum frame size"
             )));
         }
-        let mut frame = Vec::with_capacity(3 + len);
-        frame.write_varint(len as i32);
-        body(&mut frame);
-        self.out.extend_from_slice(&frame);
+        self.out.reserve(3 + len);
+        self.out.write_varint(len as i32);
+        body(&mut self.out);
         Ok(())
     }
 
@@ -483,7 +538,7 @@ mod tests {
         let mut frame = Vec::new();
         frame.write_varint(MAX_PACKET_DATA_LEN as i32 + 1);
         frame.extend_from_slice(
-            &ZlibEncoder::new(Vec::new(), Compression::fast())
+            &flate2::write::ZlibEncoder::new(Vec::new(), Compression::fast())
                 .finish()
                 .unwrap(),
         );

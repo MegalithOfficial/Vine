@@ -193,6 +193,16 @@ impl WriteExt for Vec<u8> {
     }
 }
 
+impl WriteExt for bytes::BytesMut {
+    fn write_u8(&mut self, value: u8) {
+        self.extend_from_slice(&[value]);
+    }
+
+    fn write_slice(&mut self, bytes: &[u8]) {
+        self.extend_from_slice(bytes);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
