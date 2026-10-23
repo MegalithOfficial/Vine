@@ -327,11 +327,6 @@ impl<W: AsyncWrite + Unpin> PacketWriter<W> {
         self.flush().await
     }
 
-    pub async fn send_frame(&mut self, frame: Bytes) -> Result<(), ProtocolError> {
-        self.queue_frame(&frame);
-        self.flush().await
-    }
-
     pub fn compression_threshold(&self) -> Option<usize> {
         self.compression.map(|(threshold, _)| threshold)
     }

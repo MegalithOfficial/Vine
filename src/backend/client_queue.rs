@@ -11,6 +11,8 @@ use crate::protocol::PacketWriter;
 // Caps memory buffered for a slow client; once full, reading from the backend pauses
 const CLIENT_QUEUE_BYTES: usize = 8 * 1024 * 1024;
 pub(super) const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+// What is already waiting is written in one go, up to about this much at a time
+const BATCH_BYTES: usize = 64 * 1024;
 
 pub(super) type Room = std::pin::Pin<
     Box<
@@ -104,38 +106,76 @@ impl ClientQueue {
     }
 }
 
+/// Writes what is queued for the client, flushing once for whatever is already waiting
 pub(super) async fn write_client<W: AsyncWrite + Unpin>(
     mut writer: PacketWriter<W>,
     mut rx: ClientQueueRx,
     budget: Arc<Semaphore>,
     username: String,
 ) {
-    while let Some(write) = rx.recv().await {
-        let (written, _permit) = match write {
-            ClientWrite::Packet(bytes, permit) => (
-                timeout(CLIENT_WRITE_TIMEOUT, writer.send(bytes)).await,
-                permit,
-            ),
-            ClientWrite::Frame(frame, permit) => (
-                timeout(CLIENT_WRITE_TIMEOUT, writer.send_frame(frame)).await,
-                Some(permit),
-            ),
-            ClientWrite::Written(done) => {
-                let _ = done.send(());
-                continue;
+    // The room a packet takes is given back once it is flushed
+    let mut permits = Vec::new();
+    while let Some(first) = rx.recv().await {
+        let mut next = Some(first);
+        let mut batched = 0;
+        let mut queued = false;
+        let mut written = None;
+        let mut failed = None;
+        let mut close = false;
+        while let Some(write) = next.take() {
+            match write {
+                ClientWrite::Packet(bytes, permit) => {
+                    if let Err(e) = writer.queue(&bytes) {
+                        failed = Some(e);
+                        break;
+                    }
+                    batched += bytes.len();
+                    queued = true;
+                    permits.extend(permit);
+                }
+                ClientWrite::Frame(frame, permit) => {
+                    writer.queue_frame(&frame);
+                    batched += frame.len();
+                    queued = true;
+                    permits.push(permit);
+                }
+                ClientWrite::Written(done) => {
+                    written = Some(done);
+                    break;
+                }
+                ClientWrite::Close => {
+                    close = true;
+                    break;
+                }
             }
-            ClientWrite::Close => break,
-        };
-        match written {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                debug!("Client write failed for '{}': {:?}", username, e);
+            if batched >= BATCH_BYTES {
                 break;
             }
-            Err(_) => {
-                warn!("Client '{}' stopped reading, disconnecting", username);
-                break;
+            next = rx.try_recv().ok();
+        }
+        if queued {
+            match timeout(CLIENT_WRITE_TIMEOUT, writer.flush()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    debug!("Client write failed for '{}': {:?}", username, e);
+                    break;
+                }
+                Err(_) => {
+                    warn!("Client '{}' stopped reading, disconnecting", username);
+                    break;
+                }
             }
+            permits.clear();
+        }
+        if let Some(e) = failed {
+            debug!("Client write failed for '{}': {:?}", username, e);
+            break;
+        }
+        if let Some(done) = written {
+            let _ = done.send(());
+        }
+        if close {
+            break;
         }
     }
     budget.close();
@@ -170,5 +210,37 @@ mod tests {
 
         drop(rx);
         assert!(!queue.send(Bytes::from_static(b"z")).await);
+    }
+
+    #[tokio::test]
+    async fn test_batched_writes_keep_room_and_acks_until_flushed() {
+        use tokio::io::AsyncReadExt;
+
+        let (queue, rx) = ClientQueue::new();
+        let (client, mut far) = tokio::io::duplex(1024);
+        for _ in 0..8 {
+            assert!(queue.send(Bytes::from(vec![7u8; 1000])).await);
+        }
+        let mut written = queue.written();
+        assert!(queue.push(Bytes::from_static(b"last"), None));
+        queue.close();
+        let writer = tokio::spawn(write_client(
+            PacketWriter::new(client),
+            rx,
+            Arc::clone(&queue.budget),
+            "test".into(),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(written.try_recv().is_err());
+        assert_eq!(queue.budget.available_permits(), CLIENT_QUEUE_BYTES - 8000);
+
+        let mut out = Vec::new();
+        far.read_to_end(&mut out).await.unwrap();
+        writer.await.unwrap();
+        assert!(written.await.is_ok());
+        assert_eq!(out.len(), 8 * 1002 + 5);
+        assert!(out.ends_with(b"\x04last"));
+        assert_eq!(queue.budget.available_permits(), CLIENT_QUEUE_BYTES);
     }
 }
