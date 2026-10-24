@@ -5,9 +5,11 @@ pub mod play;
 pub mod status;
 pub mod switch;
 
+use std::sync::OnceLock;
+
 use bytes::Bytes;
 
-use super::generated::PACKET_IDS;
+use super::generated::{PACKET_IDS, RELEASES};
 use super::wire::WriteExt;
 use super::{ProtocolError, ProtocolVersion};
 
@@ -73,22 +75,50 @@ pub enum PacketKind {
 
 impl PacketKind {
     pub fn id(self, version: ProtocolVersion) -> Option<i32> {
-        let (_, runs) = PACKET_IDS.iter().find(|(kind, _)| *kind == self)?;
-        if !version.is_known() {
-            // Packets whose ID never changed, like the status ping, still work with unknown versions
-            return match runs {
-                [(_, id)] if *id >= 0 => Some(*id),
-                _ => None,
-            };
+        match RELEASES.binary_search_by_key(&version.0, |(protocol, _)| *protocol) {
+            Ok(release) => known_ids()[release].get(self as usize).copied().flatten(),
+            Err(_) => {
+                // Packets whose ID never changed, like the status ping, still work with unknown versions
+                let (_, runs) = PACKET_IDS.iter().find(|(kind, _)| *kind == self)?;
+                match runs {
+                    [(_, id)] if *id >= 0 => Some(*id),
+                    _ => None,
+                }
+            }
         }
-        let idx = runs.partition_point(|(first, _)| *first <= version.0);
-        let (_, id) = runs.get(idx.checked_sub(1)?)?;
-        (*id >= 0).then_some(*id)
     }
 
     pub fn matches(self, id: i32, version: ProtocolVersion) -> bool {
         self.id(version) == Some(id)
     }
+}
+
+/// Every packet's id in every known version, by release and then by kind, worked out once: packets
+/// are looked up many times each
+fn known_ids() -> &'static [Vec<Option<i32>>] {
+    static IDS: OnceLock<Vec<Vec<Option<i32>>>> = OnceLock::new();
+    IDS.get_or_init(|| {
+        let kinds = PACKET_IDS
+            .iter()
+            .map(|(kind, _)| *kind as usize + 1)
+            .max()
+            .unwrap_or(0);
+        RELEASES
+            .iter()
+            .map(|(protocol, _)| {
+                let mut ids = vec![None; kinds];
+                for (kind, runs) in PACKET_IDS {
+                    let idx = runs.partition_point(|(first, _)| first <= protocol);
+                    ids[*kind as usize] = idx
+                        .checked_sub(1)
+                        .and_then(|i| runs.get(i))
+                        .map(|(_, id)| *id)
+                        .filter(|id| *id >= 0);
+                }
+                ids
+            })
+            .collect()
+    })
 }
 
 pub trait Packet: Sized {
