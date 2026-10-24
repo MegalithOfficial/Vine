@@ -12,6 +12,10 @@ pub const MAX_FRAME_LEN: usize = 2_097_151;
 pub const MAX_PACKET_DATA_LEN: usize = 8_388_608;
 // Larger packets grow the buffer as their bytes arrive instead of up front
 const MAX_PREALLOC: usize = 64 * 1024;
+// An emptied buffer bigger than this is let go, so a burst doesn't stay with every connection
+const BUFFER_KEEP: usize = 16 * 1024;
+// Writes that fit in BUFFER_KEEP in a row before a bigger write buffer is let go
+const QUIET_WRITES: u8 = 8;
 
 type Encryptor = cfb8::Encryptor<aes::Aes128>;
 type Decryptor = cfb8::Decryptor<aes::Aes128>;
@@ -26,6 +30,16 @@ thread_local! {
     // Setting up a deflate state costs more than compressing a small packet, and one per
     // connection would hold a few hundred KiB each, so each thread keeps one and resets it
     static DEFLATER: RefCell<Option<Deflater>> = const { RefCell::new(None) };
+    // Every packet is a zlib stream of its own, so inflating needs no state between them either
+    static INFLATER: RefCell<Option<Decompress>> = const { RefCell::new(None) };
+}
+
+fn with_inflater<T>(f: impl FnOnce(&mut Decompress) -> T) -> T {
+    INFLATER.with_borrow_mut(|slot| {
+        let inflater = slot.get_or_insert_with(|| Decompress::new(true));
+        inflater.reset(true);
+        f(inflater)
+    })
 }
 
 /// Compresses `data` as a zlib stream and hands the result to `f`
@@ -104,7 +118,6 @@ pub struct PacketReader<R> {
     decryptor: Option<Decryptor>,
     max_frame: usize,
     max_data: usize,
-    inflater: Option<Decompress>,
 }
 
 impl<R: AsyncRead + Unpin> PacketReader<R> {
@@ -116,7 +129,6 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
             decryptor: None,
             max_frame: MAX_FRAME_LEN,
             max_data: MAX_PACKET_DATA_LEN,
-            inflater: None,
         }
     }
 
@@ -166,6 +178,9 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
                     .reserve((header + len - self.buf.len()).min(MAX_PREALLOC));
             }
 
+            if self.buf.is_empty() && self.buf.capacity() > BUFFER_KEEP {
+                self.buf = BytesMut::with_capacity(4096);
+            }
             let start = self.buf.len();
             let n = self.inner.read_buf(&mut self.buf).await?;
             if n == 0 {
@@ -230,26 +245,26 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
             return RawPacket::parse(body);
         }
 
-        let inflater = self.inflater.get_or_insert_with(|| Decompress::new(true));
-        inflater.reset(true);
         // One byte past the announced length is enough to tell it was wrong
         let limit = data_len + 1;
         let mut data = Vec::with_capacity(data_len.min(MAX_PREALLOC));
-        loop {
-            if data.len() == data.capacity() {
-                data.reserve_exact((limit - data.len()).min(MAX_PREALLOC));
+        with_inflater(|inflater| -> Result<(), ProtocolError> {
+            loop {
+                if data.len() == data.capacity() {
+                    data.reserve_exact((limit - data.len()).min(MAX_PREALLOC));
+                }
+                let (read, written) = (inflater.total_in() as usize, data.len());
+                let status = inflater
+                    .decompress_vec(&body[read..], &mut data, FlushDecompress::None)
+                    .map_err(|e| ProtocolError::Malformed(format!("invalid zlib data: {e}")))?;
+                if status == Status::StreamEnd
+                    || data.len() >= limit
+                    || (inflater.total_in() as usize, data.len()) == (read, written)
+                {
+                    return Ok(());
+                }
             }
-            let (read, written) = (inflater.total_in() as usize, data.len());
-            let status = inflater
-                .decompress_vec(&body[read..], &mut data, FlushDecompress::None)
-                .map_err(|e| ProtocolError::Malformed(format!("invalid zlib data: {e}")))?;
-            if status == Status::StreamEnd
-                || data.len() >= limit
-                || (inflater.total_in() as usize, data.len()) == (read, written)
-            {
-                break;
-            }
-        }
+        })?;
         if data.len() != data_len {
             return Err(ProtocolError::Malformed(format!(
                 "decompressed {} bytes but the header announced {data_len}",
@@ -268,30 +283,31 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
             return (&body[..]).read_varint();
         }
 
-        let inflater = self.inflater.get_or_insert_with(|| Decompress::new(true));
-        inflater.reset(true);
         let mut id = [0u8; 5];
         let want = id.len().min(data_len);
-        loop {
-            let (read, written) = (inflater.total_in(), inflater.total_out());
-            let status = inflater
-                .decompress(
-                    &body[read as usize..],
-                    &mut id[written as usize..want],
-                    FlushDecompress::None,
-                )
-                .map_err(|e| ProtocolError::Malformed(format!("invalid zlib data: {e}")))?;
-            let done = inflater.total_out() as usize;
-            if done == want {
-                break;
+        with_inflater(|inflater| -> Result<(), ProtocolError> {
+            loop {
+                let (read, written) = (inflater.total_in(), inflater.total_out());
+                let status = inflater
+                    .decompress(
+                        &body[read as usize..],
+                        &mut id[written as usize..want],
+                        FlushDecompress::None,
+                    )
+                    .map_err(|e| ProtocolError::Malformed(format!("invalid zlib data: {e}")))?;
+                let done = inflater.total_out() as usize;
+                if done == want {
+                    return Ok(());
+                }
+                if status == Status::StreamEnd
+                    || (inflater.total_in(), done as u64) == (read, written)
+                {
+                    return Err(ProtocolError::Malformed(format!(
+                        "decompressed {done} bytes but the header announced {data_len}"
+                    )));
+                }
             }
-            if status == Status::StreamEnd || (inflater.total_in(), done as u64) == (read, written)
-            {
-                return Err(ProtocolError::Malformed(format!(
-                    "decompressed {done} bytes but the header announced {data_len}"
-                )));
-            }
-        }
+        })?;
         (&id[..want]).read_varint()
     }
 
@@ -318,6 +334,7 @@ pub struct PacketWriter<W> {
     out: BytesMut,
     compression: Option<(usize, u32)>,
     encryptor: Option<Encryptor>,
+    quiet: u8,
 }
 
 impl<W: AsyncWrite + Unpin> PacketWriter<W> {
@@ -327,6 +344,7 @@ impl<W: AsyncWrite + Unpin> PacketWriter<W> {
             out: BytesMut::with_capacity(4096),
             compression: None,
             encryptor: None,
+            quiet: 0,
         }
     }
 
@@ -384,12 +402,23 @@ impl<W: AsyncWrite + Unpin> PacketWriter<W> {
     }
 
     pub async fn flush(&mut self) -> Result<(), ProtocolError> {
+        let (allocated, queued) = (self.out.capacity(), self.out.len());
         while !self.out.is_empty() {
             let n = self.inner.write(&self.out).await?;
             if n == 0 {
                 return Err(ProtocolError::Io(std::io::ErrorKind::WriteZero.into()));
             }
             self.out.advance(n);
+        }
+        // Kept while big writes keep coming, so a busy connection doesn't allocate it every time
+        if queued > BUFFER_KEEP {
+            self.quiet = 0;
+        } else if allocated > BUFFER_KEEP {
+            self.quiet += 1;
+            if self.quiet >= QUIET_WRITES {
+                self.out = BytesMut::new();
+                self.quiet = 0;
+            }
         }
         self.inner.flush().await?;
         Ok(())
