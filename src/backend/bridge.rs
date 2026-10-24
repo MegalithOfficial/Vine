@@ -11,7 +11,7 @@ use tracing::{debug, info, warn};
 
 use super::client_queue::{CLIENT_WRITE_TIMEOUT, ClientQueue, write_client};
 use super::connection::Backend;
-use super::readers::{CLIENT_EVENTS, Session, read_client};
+use super::readers::{CLIENT_EVENTS, Handlings, Session, read_client};
 use super::suggestions::Suggesting;
 use super::switch::Switch;
 use super::task::Task;
@@ -275,6 +275,7 @@ impl BackendBridge {
             action_tx,
             client_out: client_out.clone(),
             client_compression,
+            handlings: Handlings::new(bridge.client_version),
         });
         let (served, served_rx) = watch::channel(Served {
             generation: 0,

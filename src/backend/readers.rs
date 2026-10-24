@@ -112,6 +112,7 @@ pub(super) struct Session {
     pub(super) client_out: ClientQueue,
     // The client's compression threshold; a backend using the same one has its frames passed on
     pub(super) client_compression: Option<usize>,
+    pub(super) handlings: Handlings,
 }
 
 /// What the client reader hands the tunnel, in the order the client sent it. `served` is the
@@ -560,7 +561,6 @@ pub(super) async fn read_backend(
     events: mpsc::Sender<BackendEvent>,
     mut stop: oneshot::Receiver<()>,
 ) {
-    let version = session.version;
     let passthrough = reader.compression() == session.client_compression;
     loop {
         let current = phase;
@@ -569,7 +569,7 @@ pub(super) async fn read_backend(
                 reader
                     .read_frame(|id| {
                         current != Phase::Login
-                            && classify(id, current, version) == Handling::PassOn
+                            && session.handlings.get(id, current) == Handling::PassOn
                     })
                     .await
             } else {
@@ -621,6 +621,37 @@ enum Handling {
     Commands,
     Watched(Watched),
     PassOn,
+}
+
+/// `classify` for the ids a backend sends, worked out once for the player's version: it is asked
+/// for every packet
+pub(super) struct Handlings {
+    version: ProtocolVersion,
+    config: Vec<Handling>,
+    play: Vec<Handling>,
+}
+
+impl Handlings {
+    pub(super) fn new(version: ProtocolVersion) -> Self {
+        let table = |phase| (0..256).map(|id| classify(id, phase, version)).collect();
+        Self {
+            version,
+            config: table(Phase::Config),
+            play: table(Phase::Play),
+        }
+    }
+
+    fn get(&self, id: i32, phase: Phase) -> Handling {
+        let table = match phase {
+            Phase::Config => &self.config,
+            Phase::Play => &self.play,
+            Phase::Login => return Handling::PassOn,
+        };
+        match usize::try_from(id).ok().and_then(|id| table.get(id)) {
+            Some(handling) => *handling,
+            None => classify(id, phase, self.version),
+        }
+    }
 }
 
 /// Backend packets the tunnel itself has to see
@@ -689,7 +720,7 @@ impl Session {
         let version = self.version;
         let current = *phase;
         let mut packet = None;
-        match classify(raw_packet.id, current, version) {
+        match self.handlings.get(raw_packet.id, current) {
             Handling::Disconnect => {
                 let reason = if current == Phase::Config {
                     decode_packet::<ConfigDisconnect>(&raw_packet.payload, version)
