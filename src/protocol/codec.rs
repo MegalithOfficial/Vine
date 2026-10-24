@@ -85,7 +85,8 @@ impl RawPacket {
     }
 }
 
-/// A packet as read: decoded, or kept as the frame it arrived in, length prefix included
+/// A packet as read: decoded, or kept as the frame it arrived in, length prefix included, possibly
+/// with more kept frames behind it
 pub enum Frame {
     Packet(RawPacket),
     Raw(Bytes),
@@ -125,26 +126,44 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
     }
 
     pub async fn read_packet(&mut self) -> Result<RawPacket, ProtocolError> {
-        let (frame, header) = self.next_frame().await?;
+        let (header, len) = self.next_frame().await?;
+        let frame = self.buf.split_to(header + len).freeze();
         self.decode_frame(frame.slice(header..))
     }
 
     /// Like `read_packet`, but a packet whose id `keep` accepts is returned as the frame it arrived
-    /// in, without decompressing more of it than its id
+    /// in, without decompressing more of it than its id. Kept frames right behind it that have
+    /// arrived too come along in the same piece, up to about `MAX_PREALLOC` bytes.
     pub async fn read_frame(&mut self, keep: impl Fn(i32) -> bool) -> Result<Frame, ProtocolError> {
-        let (frame, header) = self.next_frame().await?;
-        let body = frame.slice(header..);
-        if keep(self.peek_id(&body)?) {
-            return Ok(Frame::Raw(frame));
+        let (header, len) = self.next_frame().await?;
+        if !keep(self.peek_id(0, header + len)?) {
+            let frame = self.buf.split_to(header + len).freeze();
+            return self.decode_frame(frame.slice(header..)).map(Frame::Packet);
         }
-        self.decode_frame(body).map(Frame::Packet)
+        let mut end = header + len;
+        while end < MAX_PREALLOC {
+            // Anything wrong with the next frame is for the next read to report
+            let Ok(Some((header, len))) = self.frame_header(end) else {
+                break;
+            };
+            let next = end + header + len;
+            if next > self.buf.len() || !self.peek_id(end, next).is_ok_and(&keep) {
+                break;
+            }
+            end = next;
+        }
+        Ok(Frame::Raw(self.buf.split_to(end).freeze()))
     }
 
-    /// The next whole frame and the length of its length prefix
-    async fn next_frame(&mut self) -> Result<(Bytes, usize), ProtocolError> {
+    /// Reads until a whole frame is buffered; the length of its length prefix and its own length
+    async fn next_frame(&mut self) -> Result<(usize, usize), ProtocolError> {
         loop {
-            if let Some(frame) = self.buffered_frame()? {
-                return Ok(frame);
+            if let Some((header, len)) = self.frame_header(0)? {
+                if self.buf.len() >= header + len {
+                    return Ok((header, len));
+                }
+                self.buf
+                    .reserve((header + len - self.buf.len()).min(MAX_PREALLOC));
             }
 
             let start = self.buf.len();
@@ -162,37 +181,32 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
         }
     }
 
-    fn buffered_frame(&mut self) -> Result<Option<(Bytes, usize)>, ProtocolError> {
-        let mut cur = &self.buf[..];
+    /// The length prefix of the frame buffered from `at`: its own length and the frame's
+    fn frame_header(&self, at: usize) -> Result<Option<(usize, usize)>, ProtocolError> {
+        let mut cur = &self.buf[at..];
         let len = match cur.read_varint() {
             Ok(len) => len,
-            Err(_) if self.buf.len() < 3 => return Ok(None),
+            Err(_) if self.buf.len() - at < 3 => return Ok(None),
             Err(e) => return Err(e),
         };
         let len = usize::try_from(len)
             .ok()
             .filter(|len| (1..=self.max_frame).contains(len))
             .ok_or_else(|| ProtocolError::Malformed(format!("invalid frame length {len}")))?;
-        let header = self.buf.len() - cur.len();
-        if cur.len() < len {
-            self.buf
-                .reserve((header + len - self.buf.len()).min(MAX_PREALLOC));
-            return Ok(None);
-        }
-        Ok(Some((self.buf.split_to(header + len).freeze(), header)))
+        Ok(Some((self.buf.len() - at - cur.len(), len)))
     }
 
-    /// The packet's announced length and its data, compressed unless that length is 0
-    fn unwrap_frame(&self, frame: Bytes) -> Result<(usize, Bytes), ProtocolError> {
+    /// The packet's announced length, 0 if it is not compressed, and where its data starts
+    fn unwrap_frame(&self, frame: &[u8]) -> Result<(usize, usize), ProtocolError> {
         let Some(threshold) = self.compression else {
-            return Ok((0, frame));
+            return Ok((0, 0));
         };
 
-        let mut cur = &frame[..];
+        let mut cur = frame;
         let data_len = cur.read_varint()?;
-        let body = frame.slice(frame.len() - cur.len()..);
+        let at = frame.len() - cur.len();
         if data_len == 0 {
-            return Ok((0, body));
+            return Ok((0, at));
         }
 
         let data_len = usize::try_from(data_len)
@@ -206,11 +220,12 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
                 "compressed packet of {data_len} bytes is below the threshold of {threshold}"
             )));
         }
-        Ok((data_len, body))
+        Ok((data_len, at))
     }
 
     fn decode_frame(&mut self, frame: Bytes) -> Result<RawPacket, ProtocolError> {
-        let (data_len, body) = self.unwrap_frame(frame)?;
+        let (data_len, at) = self.unwrap_frame(&frame)?;
+        let body = frame.slice(at..);
         if data_len == 0 {
             return RawPacket::parse(body);
         }
@@ -244,8 +259,11 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
         RawPacket::parse(data.into())
     }
 
-    fn peek_id(&mut self, frame: &Bytes) -> Result<i32, ProtocolError> {
-        let (data_len, body) = self.unwrap_frame(frame.clone())?;
+    /// The id of the packet in the frame buffered from `start` to `end`
+    fn peek_id(&mut self, start: usize, end: usize) -> Result<i32, ProtocolError> {
+        let header = self.frame_header(start)?.map_or(0, |(header, _)| header);
+        let (data_len, at) = self.unwrap_frame(&self.buf[start + header..end])?;
+        let body = &self.buf[start + header + at..end];
         if data_len == 0 {
             return (&body[..]).read_varint();
         }
@@ -513,7 +531,9 @@ mod tests {
         client.set_compression(256, 6);
         client.enable_encryption(&[9u8; 16]).unwrap();
         let mut raw = Vec::new();
-        for _ in &packets {
+        let mut pieces = 0;
+        while raw.len() < sent.len() {
+            pieces += 1;
             match proxy.read_frame(|id| id != 0x2A).await.unwrap() {
                 Frame::Raw(frame) => {
                     raw.extend_from_slice(&frame);
@@ -527,6 +547,8 @@ mod tests {
             }
         }
         assert_eq!(raw, sent);
+        // the two frames behind the decoded packet arrive as one piece
+        assert_eq!(pieces, 3);
 
         let mut reader = PacketReader::new(&client.out[..]);
         reader.set_compression(256);

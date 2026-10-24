@@ -26,7 +26,7 @@ pub(super) type Room = std::pin::Pin<
 pub(super) enum ClientWrite {
     // Packets of the proxy's own carry no permit, so they never wait for room
     Packet(Bytes, Option<OwnedSemaphorePermit>),
-    // A backend frame written as it arrived
+    // Backend frames written as they arrived
     Frame(Bytes, OwnedSemaphorePermit),
     // Answered once everything queued before it is written
     Written(oneshot::Sender<()>),
@@ -80,7 +80,7 @@ impl ClientQueue {
         }
     }
 
-    /// Queues a backend frame once there is room for it
+    /// Queues backend frames once there is room for them
     pub(super) async fn send_frame(&self, frame: Bytes) -> bool {
         match self.reserve(frame.len()).await {
             Some(permit) => self.tx.send(ClientWrite::Frame(frame, permit)).is_ok(),
