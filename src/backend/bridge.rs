@@ -116,10 +116,56 @@ impl BackendBridge {
     pub async fn run<R, W>(
         self,
         client_reader: PacketReader<R>,
-        mut client_writer: PacketWriter<W>,
+        client_writer: PacketWriter<W>,
         action_tx: mpsc::Sender<PlayerAction>,
         action_rx: mpsc::Receiver<PlayerAction>,
     ) -> Result<(), BridgeError>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let Some((mut tunnel, writer)) =
+            Box::pin(self.prepare(client_reader, client_writer, action_tx, action_rx)).await?
+        else {
+            return Ok(());
+        };
+        let bridge = tunnel.bridge.clone();
+        match tunnel.run().await {
+            End::Kicked(reason) => {
+                info!("Kicking player '{}': {}", bridge.player.username, reason);
+                tunnel.disconnect_client(writer, &reason).await;
+            }
+            End::Closed => debug!(
+                "Player '{}' disconnected from client side",
+                bridge.player.username
+            ),
+        }
+        let last_server = tunnel.backend.name.clone();
+        let plugin_events = tunnel.plugin_events.take();
+        drop(tunnel);
+        if let Some(events) = plugin_events {
+            let _ = events.await;
+        }
+        bridge.fire_disconnect(Some(last_server)).await;
+
+        bridge.online_players.fetch_sub(1, Ordering::Relaxed);
+        info!(
+            "Player '{}' disconnected from proxy. Online players: {}",
+            bridge.player.username,
+            bridge.online_players.load(Ordering::Relaxed)
+        );
+
+        Ok(())
+    }
+
+    // Drop the login future and its temporary state before the long-lived tunnel starts.
+    async fn prepare<R, W>(
+        self,
+        client_reader: PacketReader<R>,
+        mut client_writer: PacketWriter<W>,
+        action_tx: mpsc::Sender<PlayerAction>,
+        action_rx: mpsc::Receiver<PlayerAction>,
+    ) -> Result<Option<(Tunnel, Task)>, BridgeError>
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
@@ -163,7 +209,7 @@ impl BackendBridge {
                 let _ = timeout(CLIENT_WRITE_TIMEOUT, client_writer.send(kick)).await;
             }
             self.fire_disconnect(None).await;
-            return Ok(());
+            return Ok(None);
         }
         let initial_backend_cfg = if connect_event.target_server == self.server_name {
             self.config.clone()
@@ -306,7 +352,7 @@ impl BackendBridge {
             },
             Vec::new(),
         );
-        let mut tunnel = Tunnel {
+        let tunnel = Tunnel {
             bridge: bridge.clone(),
             session,
             link,
@@ -328,32 +374,7 @@ impl BackendBridge {
             _client_reader: client_reader,
         };
 
-        match tunnel.run().await {
-            End::Kicked(reason) => {
-                info!("Kicking player '{}': {}", bridge.player.username, reason);
-                tunnel.disconnect_client(writer, &reason).await;
-            }
-            End::Closed => debug!(
-                "Player '{}' disconnected from client side",
-                bridge.player.username
-            ),
-        }
-        let last_server = tunnel.backend.name.clone();
-        let plugin_events = tunnel.plugin_events.take();
-        drop(tunnel);
-        if let Some(events) = plugin_events {
-            let _ = events.await;
-        }
-        bridge.fire_disconnect(Some(last_server)).await;
-
-        bridge.online_players.fetch_sub(1, Ordering::Relaxed);
-        info!(
-            "Player '{}' disconnected from proxy. Online players: {}",
-            bridge.player.username,
-            bridge.online_players.load(Ordering::Relaxed)
-        );
-
-        Ok(())
+        Ok(Some((tunnel, writer)))
     }
 
     /// Every player that got past PlayerLogin gets a PlayerDisconnect, even if no backend took them

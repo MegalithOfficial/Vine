@@ -235,7 +235,7 @@ struct MojangProperty {
 }
 
 pub struct Authenticator {
-    client: reqwest::Client,
+    client: std::sync::OnceLock<reqwest::Client>,
 }
 
 impl Default for Authenticator {
@@ -246,12 +246,9 @@ impl Default for Authenticator {
 
 impl Authenticator {
     pub fn new() -> Self {
-        let client = pumpkin_auth::client_builder()
-            .timeout(Duration::from_secs(10))
-            .connect_timeout(Duration::from_secs(5))
-            .build()
-            .unwrap_or_default();
-        Self { client }
+        Self {
+            client: std::sync::OnceLock::new(),
+        }
     }
 
     fn has_joined_url(
@@ -286,7 +283,14 @@ impl Authenticator {
         let url = Self::has_joined_url(username, server_hash, client_ip, prevent_proxy_connections);
 
         debug!("Querying Mojang authentication service for '{}'", username);
-        let resp = self.client.get(url).send().await?;
+        let client = self.client.get_or_init(|| {
+            pumpkin_auth::client_builder()
+                .timeout(Duration::from_secs(10))
+                .connect_timeout(Duration::from_secs(5))
+                .build()
+                .unwrap_or_default()
+        });
+        let resp = client.get(url).send().await?;
 
         if resp.status() == reqwest::StatusCode::NO_CONTENT {
             return Err(AuthError::NotJoined);

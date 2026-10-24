@@ -8,13 +8,16 @@ use wasm_host::state::ProxyPluginContext;
 pub use wasm_host::{PluginLimits, PluginRuntime, WasmPlugin};
 
 pub struct WasmPluginLoader {
-    runtime: PluginRuntime,
+    runtime: tokio::sync::OnceCell<PluginRuntime>,
+    limits: PluginLimits,
 }
 
 impl WasmPluginLoader {
     pub fn new(limits: PluginLimits) -> Result<Self, wasm_host::PluginInitError> {
-        let runtime = PluginRuntime::new(limits)?;
-        Ok(Self { runtime })
+        Ok(Self {
+            runtime: tokio::sync::OnceCell::new(),
+            limits,
+        })
     }
 
     pub fn can_load(&self, path: &Path) -> bool {
@@ -29,6 +32,10 @@ impl WasmPluginLoader {
         path: &Path,
         proxy: Option<ProxyPluginContext>,
     ) -> Result<(Arc<WasmPlugin>, PluginMetadata), wasm_host::PluginInitError> {
-        self.runtime.init_plugin(path, proxy).await
+        let runtime = self
+            .runtime
+            .get_or_try_init(|| async { PluginRuntime::new(self.limits) })
+            .await?;
+        runtime.init_plugin(path, proxy).await
     }
 }

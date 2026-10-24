@@ -12,10 +12,8 @@ pub const MAX_FRAME_LEN: usize = 2_097_151;
 pub const MAX_PACKET_DATA_LEN: usize = 8_388_608;
 // Larger packets grow the buffer as their bytes arrive instead of up front
 const MAX_PREALLOC: usize = 64 * 1024;
-// An emptied buffer bigger than this is let go, so a burst doesn't stay with every connection
-const BUFFER_KEEP: usize = 16 * 1024;
-// Writes that fit in BUFFER_KEEP in a row before a bigger write buffer is let go
-const QUIET_WRITES: u8 = 8;
+const INITIAL_BUFFER_CAPACITY: usize = 512;
+const MAX_RETAINED_BUFFER_CAPACITY: usize = 8 * 1024;
 
 type Encryptor = cfb8::Encryptor<aes::Aes128>;
 type Decryptor = cfb8::Decryptor<aes::Aes128>;
@@ -114,6 +112,7 @@ fn cipher_error() -> ProtocolError {
 pub struct PacketReader<R> {
     inner: R,
     buf: BytesMut,
+    buf_capacity: usize,
     compression: Option<usize>,
     decryptor: Option<Decryptor>,
     max_frame: usize,
@@ -124,7 +123,8 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
     pub fn new(reader: R) -> Self {
         Self {
             inner: reader,
-            buf: BytesMut::with_capacity(4096),
+            buf: BytesMut::with_capacity(INITIAL_BUFFER_CAPACITY),
+            buf_capacity: INITIAL_BUFFER_CAPACITY,
             compression: None,
             decryptor: None,
             max_frame: MAX_FRAME_LEN,
@@ -139,7 +139,7 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
 
     pub async fn read_packet(&mut self) -> Result<RawPacket, ProtocolError> {
         let (header, len) = self.next_frame().await?;
-        let frame = self.buf.split_to(header + len).freeze();
+        let frame = self.take_frame(header + len);
         self.decode_frame(frame.slice(header..))
     }
 
@@ -149,7 +149,7 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
     pub async fn read_frame(&mut self, keep: impl Fn(i32) -> bool) -> Result<Frame, ProtocolError> {
         let (header, len) = self.next_frame().await?;
         if !keep(self.peek_id(0, header + len)?) {
-            let frame = self.buf.split_to(header + len).freeze();
+            let frame = self.take_frame(header + len);
             return self.decode_frame(frame.slice(header..)).map(Frame::Packet);
         }
         let mut end = header + len;
@@ -164,7 +164,20 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
             }
             end = next;
         }
-        Ok(Frame::Raw(self.buf.split_to(end).freeze()))
+        Ok(Frame::Raw(self.take_frame(end)))
+    }
+
+    fn take_frame(&mut self, len: usize) -> Bytes {
+        let frame = self.buf.split_to(len).freeze();
+        if self.buf_capacity > MAX_RETAINED_BUFFER_CAPACITY
+            && self.buf.len() <= INITIAL_BUFFER_CAPACITY
+        {
+            let mut buf = BytesMut::with_capacity(INITIAL_BUFFER_CAPACITY);
+            buf.extend_from_slice(&self.buf);
+            self.buf = buf;
+            self.buf_capacity = INITIAL_BUFFER_CAPACITY;
+        }
+        frame
     }
 
     /// Reads until a whole frame is buffered; the length of its length prefix and its own length
@@ -178,11 +191,9 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
                     .reserve((header + len - self.buf.len()).min(MAX_PREALLOC));
             }
 
-            if self.buf.is_empty() && self.buf.capacity() > BUFFER_KEEP {
-                self.buf = BytesMut::with_capacity(4096);
-            }
             let start = self.buf.len();
             let n = self.inner.read_buf(&mut self.buf).await?;
+            self.buf_capacity = self.buf_capacity.max(self.buf.capacity());
             if n == 0 {
                 return Err(if start == 0 {
                     ProtocolError::ConnectionClosed
@@ -332,19 +343,19 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
 pub struct PacketWriter<W> {
     inner: W,
     out: BytesMut,
+    out_capacity: usize,
     compression: Option<(usize, u32)>,
     encryptor: Option<Encryptor>,
-    quiet: u8,
 }
 
 impl<W: AsyncWrite + Unpin> PacketWriter<W> {
     pub fn new(writer: W) -> Self {
         Self {
             inner: writer,
-            out: BytesMut::with_capacity(4096),
+            out: BytesMut::with_capacity(INITIAL_BUFFER_CAPACITY),
+            out_capacity: INITIAL_BUFFER_CAPACITY,
             compression: None,
             encryptor: None,
-            quiet: 0,
         }
     }
 
@@ -368,6 +379,7 @@ impl<W: AsyncWrite + Unpin> PacketWriter<W> {
             }
             None => self.write_frame(packet.len(), |out| out.extend_from_slice(packet))?,
         }
+        self.out_capacity = self.out_capacity.max(self.out.capacity());
         self.encrypt_from(start);
         Ok(())
     }
@@ -376,6 +388,7 @@ impl<W: AsyncWrite + Unpin> PacketWriter<W> {
     pub fn queue_frame(&mut self, frame: &[u8]) {
         let start = self.out.len();
         self.out.extend_from_slice(frame);
+        self.out_capacity = self.out_capacity.max(self.out.capacity());
         self.encrypt_from(start);
     }
 
@@ -402,7 +415,6 @@ impl<W: AsyncWrite + Unpin> PacketWriter<W> {
     }
 
     pub async fn flush(&mut self) -> Result<(), ProtocolError> {
-        let (allocated, queued) = (self.out.capacity(), self.out.len());
         while !self.out.is_empty() {
             let n = self.inner.write(&self.out).await?;
             if n == 0 {
@@ -410,15 +422,9 @@ impl<W: AsyncWrite + Unpin> PacketWriter<W> {
             }
             self.out.advance(n);
         }
-        // Kept while big writes keep coming, so a busy connection doesn't allocate it every time
-        if queued > BUFFER_KEEP {
-            self.quiet = 0;
-        } else if allocated > BUFFER_KEEP {
-            self.quiet += 1;
-            if self.quiet >= QUIET_WRITES {
-                self.out = BytesMut::new();
-                self.quiet = 0;
-            }
+        if self.out_capacity > MAX_RETAINED_BUFFER_CAPACITY {
+            self.out = BytesMut::with_capacity(INITIAL_BUFFER_CAPACITY);
+            self.out_capacity = INITIAL_BUFFER_CAPACITY;
         }
         self.inner.flush().await?;
         Ok(())
@@ -463,7 +469,7 @@ mod tests {
             _cx: &mut Context<'_>,
             buf: &mut ReadBuf<'_>,
         ) -> Poll<std::io::Result<()>> {
-            let end = (self.pos + self.chunk).min(self.data.len());
+            let end = (self.pos + self.chunk.min(buf.remaining())).min(self.data.len());
             let start = self.pos;
             buf.put_slice(&self.data[start..end]);
             self.pos = end;
@@ -555,6 +561,7 @@ mod tests {
         let sent = backend.inner;
 
         let mut proxy = PacketReader::new(&sent[..]);
+        proxy.buf.reserve(sent.len());
         proxy.set_compression(256);
         let mut client = PacketWriter::new(Vec::new());
         client.set_compression(256, 6);
@@ -637,6 +644,56 @@ mod tests {
             reader.read_packet().await,
             Err(ProtocolError::Malformed(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn test_large_read_buffer_is_released_after_many_buffered_small_packets() {
+        let big = packet(300, &vec![7u8; 70_000]);
+        let small = packet(5, b"next packet");
+        let mut writer = PacketWriter::new(Vec::new());
+        writer.queue(&big).unwrap();
+        for _ in 0..1000 {
+            writer.queue(&small).unwrap();
+        }
+        writer.flush().await.unwrap();
+
+        let mut reader = PacketReader::new(&writer.inner[..]);
+        reader.buf.reserve(writer.inner.len());
+        assert_eq!(reader.read_packet().await.unwrap().to_bytes(), big);
+        assert!(reader.buf.len() > INITIAL_BUFFER_CAPACITY);
+        for _ in 0..1000 {
+            assert_eq!(reader.read_packet().await.unwrap().to_bytes(), small);
+        }
+        assert!(reader.buf.capacity() <= MAX_RETAINED_BUFFER_CAPACITY);
+        assert!(reader.buf_capacity <= MAX_RETAINED_BUFFER_CAPACITY);
+    }
+
+    #[tokio::test]
+    async fn test_large_encrypted_write_survives_cancelled_flush_and_releases_capacity() {
+        let big = packet(300, &vec![7u8; 70_000]);
+        let small = packet(5, b"next packet");
+        let (client, server) = tokio::io::duplex(64);
+        let mut writer = PacketWriter::new(server);
+        writer.enable_encryption(&[9u8; 16]).unwrap();
+        writer.queue(&big).unwrap();
+        let pending =
+            tokio::time::timeout(std::time::Duration::from_millis(20), writer.flush()).await;
+        assert!(pending.is_err());
+
+        let mut reader = PacketReader::new(client);
+        reader.enable_encryption(&[9u8; 16]).unwrap();
+        tokio::join!(
+            async {
+                assert_eq!(reader.read_packet().await.unwrap().to_bytes(), big);
+                assert_eq!(reader.read_packet().await.unwrap().to_bytes(), small);
+            },
+            async {
+                writer.flush().await.unwrap();
+                assert!(writer.out_capacity <= MAX_RETAINED_BUFFER_CAPACITY);
+                writer.queue(&small).unwrap();
+                writer.flush().await.unwrap();
+            }
+        );
     }
 
     #[tokio::test]

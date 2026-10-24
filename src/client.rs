@@ -34,7 +34,7 @@ use crate::protocol::{
     encode_packet,
 };
 use crate::security::Sanitizer;
-use crate::session::{PlayerSession, SessionManager};
+use crate::session::{LoginGuard, PlayerAction, PlayerSession, SessionGuard, SessionManager};
 use crate::status::StatusHandler;
 
 #[derive(Error, Debug)]
@@ -57,10 +57,20 @@ pub const LOGIN_PACKET_LIMIT: usize = 8 * 1024;
 type ClientReader = PacketReader<PrefixedRead<OwnedReadHalf>>;
 type ClientWriter = PacketWriter<OwnedWriteHalf>;
 
+struct Login {
+    bridge: BackendBridge,
+    reader: ClientReader,
+    writer: ClientWriter,
+    action_tx: tokio::sync::mpsc::Sender<PlayerAction>,
+    action_rx: tokio::sync::mpsc::Receiver<PlayerAction>,
+    _session_guard: SessionGuard,
+    _login_guard: LoginGuard,
+}
+
 pub struct ClientHandler {
     peer_addr: SocketAddr,
     config: Arc<Config>,
-    keystore: Arc<KeyStore>,
+    keystore: Option<Arc<KeyStore>>,
     authenticator: Arc<Authenticator>,
     status_handler: Arc<StatusHandler>,
     router: Arc<Router>,
@@ -75,7 +85,7 @@ impl ClientHandler {
     pub fn new(
         peer_addr: SocketAddr,
         config: Arc<Config>,
-        keystore: Arc<KeyStore>,
+        keystore: impl Into<Option<Arc<KeyStore>>>,
         authenticator: Arc<Authenticator>,
         status_handler: Arc<StatusHandler>,
         router: Arc<Router>,
@@ -87,7 +97,7 @@ impl ClientHandler {
         Self {
             peer_addr,
             config,
-            keystore,
+            keystore: keystore.into(),
             authenticator,
             status_handler,
             router,
@@ -125,7 +135,11 @@ impl ClientHandler {
             self.peer_addr, client_version, clean_host, handshake.intent
         );
 
-        match handshake.intent {
+        let intent = handshake.intent;
+        drop(handshake);
+        drop(raw_handshake);
+
+        match intent {
             HandshakeIntent::Status => {
                 if self.config.network.log_pings {
                     info!(
@@ -137,19 +151,28 @@ impl ClientHandler {
                     .await
             }
             HandshakeIntent::Login => {
-                self.handle_login(
+                let Some(login) = Box::pin(self.handle_login(
                     reader,
                     writer,
                     client_version,
                     clean_host,
                     self.peer_addr.ip(),
-                )
-                .await
+                ))
+                .await?
+                else {
+                    return Ok(());
+                };
+                // The partially moved login keeps both registration guards until disconnect.
+                login
+                    .bridge
+                    .run(login.reader, login.writer, login.action_tx, login.action_rx)
+                    .await?;
+                Ok(())
             }
             HandshakeIntent::Transfer => {
                 debug!(
                     "[{}] Unsupported handshake intent: {:?}",
-                    self.peer_addr, handshake.intent
+                    self.peer_addr, intent
                 );
                 Ok(())
             }
@@ -216,7 +239,7 @@ impl ClientHandler {
         client_version: ProtocolVersion,
         virtual_host: String,
         client_ip: IpAddr,
-    ) -> Result<(), ClientError> {
+    ) -> Result<Option<Login>, ClientError> {
         let login_timeout = Duration::from_secs(self.config.network.client_login_timeout_secs);
 
         if !client_version.is_known() {
@@ -230,7 +253,7 @@ impl ClientHandler {
                 &[&ProtocolVersion::supported_range()],
             );
             Self::kick(&mut writer, client_version, &reason).await?;
-            return Ok(());
+            return Ok(None);
         }
 
         let raw_login_start = timeout(login_timeout, reader.read_packet())
@@ -256,7 +279,7 @@ impl ClientHandler {
                     &translate(None, "vine.login.invalid_key_signature", &[]),
                 )
                 .await?;
-                return Ok(());
+                return Ok(None);
             }
             let valid = match key.revision {
                 KeyRevision::LinkedV2 => key.add_holder(login_start.uuid),
@@ -273,7 +296,7 @@ impl ClientHandler {
                     &translate(None, "vine.login.invalid_key", &[]),
                 )
                 .await?;
-                return Ok(());
+                return Ok(None);
             }
         } else if (ProtocolVersion::V1_19..ProtocolVersion::V1_19_3).contains(&client_version)
             && self.config.server.online_mode
@@ -285,7 +308,7 @@ impl ClientHandler {
                 &translate(None, "vine.login.missing_key", &[]),
             )
             .await?;
-            return Ok(());
+            return Ok(None);
         }
 
         let mut pre_login_event = PlayerPreLoginEvent {
@@ -309,7 +332,7 @@ impl ClientHandler {
                 self.peer_addr, username, reason
             );
             Self::kick(&mut writer, client_version, &reason).await?;
-            return Ok(());
+            return Ok(None);
         }
 
         if self.config.security.validate_usernames && !Sanitizer::is_valid_username(&username) {
@@ -323,7 +346,7 @@ impl ClientHandler {
                 &translate(None, "vine.login.invalid_username", &[]),
             )
             .await?;
-            return Ok(());
+            return Ok(None);
         }
 
         info!(
@@ -332,10 +355,13 @@ impl ClientHandler {
         );
 
         let mut authenticated_player = if self.config.server.online_mode {
+            let keystore = self.keystore.as_ref().ok_or_else(|| {
+                ClientError::AuthError("proxy encryption key is unavailable".to_string())
+            })?;
             let verify_token: [u8; 4] = rand::random();
             let encryption_request = EncryptionRequest {
                 server_id: String::new(),
-                public_key: self.keystore.public_key_der().to_vec(),
+                public_key: keystore.public_key_der().to_vec(),
                 verify_token: verify_token.to_vec(),
                 should_authenticate: true,
             };
@@ -350,8 +376,7 @@ impl ClientHandler {
             let enc_resp: EncryptionResponse =
                 decode_packet(&raw_enc_resp.payload, client_version)?;
 
-            let shared_secret = self
-                .keystore
+            let shared_secret = keystore
                 .decrypt(&enc_resp.shared_secret)
                 .map_err(|e| ClientError::AuthError(e.to_string()))?;
 
@@ -377,8 +402,7 @@ impl ClientHandler {
             writer.enable_encryption(&aes_key)?;
 
             let token_valid = match &enc_resp.verification {
-                Verification::Token(encrypted) => self
-                    .keystore
+                Verification::Token(encrypted) => keystore
                     .decrypt(encrypted)
                     .is_ok_and(|token| token == verify_token),
                 Verification::Signature { salt, signature } => {
@@ -402,7 +426,7 @@ impl ClientHandler {
                 return Err(ClientError::AuthError("Token mismatch".to_string()));
             }
 
-            let server_hash = self.keystore.auth_digest("", &shared_secret);
+            let server_hash = keystore.auth_digest("", &shared_secret);
 
             let auth_player = match self
                 .authenticator
@@ -454,7 +478,7 @@ impl ClientHandler {
                     &translate(None, "vine.login.invalid_key", &[]),
                 )
                 .await?;
-                return Ok(());
+                return Ok(None);
             }
             if !linked {
                 warn!(
@@ -481,7 +505,7 @@ impl ClientHandler {
                 &translate(None, "vine.login.already_connected", &[]),
             )
             .await?;
-            return Ok(());
+            return Ok(None);
         };
 
         let mut login_event = PlayerLoginEvent {
@@ -504,7 +528,7 @@ impl ClientHandler {
                 self.peer_addr, authenticated_player.username, reason
             );
             Self::kick(&mut writer, client_version, &reason).await?;
-            return Ok(());
+            return Ok(None);
         }
 
         let comp_threshold = self.config.server.compression_threshold;
@@ -545,7 +569,7 @@ impl ClientHandler {
                         last_server: None,
                     })
                     .await;
-                return Ok(());
+                return Ok(None);
             }
         };
 
@@ -586,7 +610,7 @@ impl ClientHandler {
                 &translate(None, "vine.login.already_connected", &[]),
             )
             .await?;
-            return Ok(());
+            return Ok(None);
         };
 
         let bridge = BackendBridge::new(
@@ -607,8 +631,15 @@ impl ClientHandler {
             self.plugin_manager.clone(),
         );
 
-        bridge.run(reader, writer, action_tx, action_rx).await?;
-        Ok(())
+        Ok(Some(Login {
+            bridge,
+            reader,
+            writer,
+            action_tx,
+            action_rx,
+            _session_guard,
+            _login_guard,
+        }))
     }
 
     async fn kick(

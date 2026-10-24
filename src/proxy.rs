@@ -21,7 +21,7 @@ use crate::telemetry;
 
 pub struct ProxyServer {
     config: Arc<Config>,
-    keystore: Arc<KeyStore>,
+    keystore: Option<Arc<KeyStore>>,
     authenticator: Arc<Authenticator>,
     rate_limiter: Arc<ConnectionRateLimiter>,
     status_handler: Arc<StatusHandler>,
@@ -35,7 +35,11 @@ pub struct ProxyServer {
 impl ProxyServer {
     pub fn new(config: Config) -> Result<Self, Box<dyn std::error::Error>> {
         let config = Arc::new(config);
-        let keystore = Arc::new(KeyStore::new()?);
+        let keystore = if config.server.online_mode {
+            Some(Arc::new(KeyStore::new()?))
+        } else {
+            None
+        };
         let authenticator = Arc::new(Authenticator::new());
 
         let rate_limiter = Arc::new(ConnectionRateLimiter::new(
