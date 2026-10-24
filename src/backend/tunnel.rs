@@ -246,9 +246,18 @@ impl Tunnel {
             content: component_json(&parse_message(&text), version),
             overlay: false,
         };
-        match encode_packet(&message, version) {
-            Ok(bytes) => self.send_play(bytes, None),
-            Err(e) => debug!("Skipping a notice for {}: {}", version, e),
+        let bytes = match encode_packet(&message, version) {
+            Ok(bytes) => bytes,
+            Err(e) => return debug!("Skipping a notice for {}: {}", version, e),
+        };
+        // A client this far behind can do without it, and a plugin repeating a request
+        // could otherwise queue notices without end
+        match self.client_out.try_room(bytes.len()) {
+            Some(permit) => self.send_play(bytes, Some(permit)),
+            None => debug!(
+                "Dropping a notice for '{}', who is not reading",
+                self.session.username
+            ),
         }
     }
 

@@ -60,6 +60,13 @@ impl ClientQueue {
             .ok()
     }
 
+    /// Room for a packet of this size, if there is some now
+    pub(super) fn try_room(&self, len: usize) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.budget)
+            .try_acquire_many_owned(Self::cost(len))
+            .ok()
+    }
+
     /// Resolves once there is room for a packet of this size
     pub(super) fn room(&self, len: usize) -> Room {
         Box::pin(Arc::clone(&self.budget).acquire_many_owned(Self::cost(len)))
